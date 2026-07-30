@@ -236,8 +236,8 @@ impl EmitDefaults for SystemEmitDefaults {
 }
 
 pub fn resolve_omp_runtime_default() -> Result<OmpRuntime> {
-    if let Some(selector) = nonempty_env("SESSIONS_OMP_MODEL")
-        .or_else(|| nonempty_env("OMP_DEFAULT_MODEL"))
+    if let Some(selector) =
+        nonempty_env("SESSIONS_OMP_MODEL").or_else(|| nonempty_env("OMP_DEFAULT_MODEL"))
     {
         return OmpRuntime::parse(&selector);
     }
@@ -264,12 +264,15 @@ pub fn resolve_omp_runtime_default() -> Result<OmpRuntime> {
 }
 
 pub fn resolve_codex_runtime_default() -> Result<CodexRuntime> {
-    let doctor = command_output_with_timeout(
-        "codex",
-        &["doctor", "--json"],
-        Duration::from_secs(15),
-    )
-    .context("running codex doctor --json")?;
+    if let (Some(provider), Some(model)) = (
+        nonempty_env("SESSIONS_CODEX_PROVIDER"),
+        nonempty_env("SESSIONS_CODEX_MODEL"),
+    ) {
+        return Ok(CodexRuntime { provider, model });
+    }
+    let doctor =
+        command_output_with_timeout("codex", &["doctor", "--json"], Duration::from_secs(15))
+            .context("running codex doctor --json")?;
     if !doctor.status.success() {
         let detail = String::from_utf8_lossy(&doctor.stderr).trim().to_owned();
         if detail.is_empty() {
@@ -302,12 +305,9 @@ pub fn resolve_codex_runtime_default() -> Result<CodexRuntime> {
             anyhow!("cannot resolve Codex runtime state: doctor report missing model")
         })?;
 
-    let catalog = command_output_with_timeout(
-        "codex",
-        &["debug", "models"],
-        Duration::from_secs(15),
-    )
-    .context("running codex debug models")?;
+    let catalog =
+        command_output_with_timeout("codex", &["debug", "models"], Duration::from_secs(15))
+            .context("running codex debug models")?;
     if !catalog.status.success() {
         let detail = String::from_utf8_lossy(&catalog.stderr).trim().to_owned();
         if detail.is_empty() {
@@ -325,9 +325,7 @@ pub fn resolve_codex_runtime_default() -> Result<CodexRuntime> {
         .iter()
         .any(|entry| entry.get("slug").and_then(Value::as_str) == Some(model))
     {
-        bail!(
-            "cannot resolve Codex runtime state: configured model {model:?} is not available"
-        );
+        bail!("cannot resolve Codex runtime state: configured model {model:?} is not available");
     }
     Ok(CodexRuntime {
         provider: provider.to_owned(),
@@ -335,11 +333,7 @@ pub fn resolve_codex_runtime_default() -> Result<CodexRuntime> {
     })
 }
 
-pub fn emit_default(
-    session: &Session,
-    target: TargetTool,
-    home: &Path,
-) -> Result<EmittedSession> {
+pub fn emit_default(session: &Session, target: TargetTool, home: &Path) -> Result<EmittedSession> {
     emit(session, target, &EmitContext::new(home))
 }
 
@@ -382,12 +376,17 @@ pub fn emit_with_defaults<D: EmitDefaults>(
         .cwd
         .to_str()
         .ok_or_else(|| anyhow!("session cwd is not valid UTF-8: {}", session.cwd.display()))?;
-    if target.uses_grok_storage() {
-        validate_grok_cwd_component(cwd)?;
-    }
+    let grok_cwd = target.uses_grok_storage().then(|| encode_grok_cwd(cwd));
     let output = match &context.output {
         Some(output) => normalize_output_path(target, output),
-        None => target_path(target, cwd, &session_id, start, context)?,
+        None => target_path(
+            target,
+            cwd,
+            grok_cwd.as_deref(),
+            &session_id,
+            start,
+            context,
+        )?,
     };
 
     match target {
@@ -425,8 +424,8 @@ pub fn emit_with_defaults<D: EmitDefaults>(
                 .grok_model
                 .clone()
                 .unwrap_or_else(|| defaults.grok_model());
-            let bundle = emit_grok(session, target, cwd, &session_id, start, &model);
-            write_grok_bundle(&output, &bundle, defaults)?;
+            let bundle = emit_grok(session, cwd, &session_id, start, &model);
+            write_grok_bundle(&output, cwd, &bundle, defaults)?;
         }
     }
 
@@ -491,7 +490,10 @@ fn emit_pi<D: EmitDefaults>(
             payload.insert("stopReason".to_owned(), json!("stop"));
             payload.insert(
                 "responseId".to_owned(),
-                json!(format!("converted-{}", compact_id(defaults.next_uuid(), 12))),
+                json!(format!(
+                    "converted-{}",
+                    compact_id(defaults.next_uuid(), 12)
+                )),
             );
         }
         records.push(json!({
@@ -517,7 +519,13 @@ fn emit_omp<D: EmitDefaults>(
     let (provider, model) = runtime.provider_and_model()?;
     let model_id = short_id(defaults.next_uuid());
     let thinking_id = short_id(defaults.next_uuid());
+    // Native OMP files begin with a fixed-width title-slot record. The native
+    // reader splits the first line as the slot regardless of byte width, so a
+    // plain JSONL record with an empty `pad` is native-readable; the slot's
+    // non-empty title overrides the `session` header title on load.
+    let title_slot = omp_title_slot(session.summary.as_str(), fmt_iso(start));
     let mut records = vec![
+        title_slot,
         json!({
             "type": "session",
             "version": 3,
@@ -525,7 +533,6 @@ fn emit_omp<D: EmitDefaults>(
             "timestamp": fmt_iso(start),
             "cwd": cwd,
             "title": session.summary,
-            "convertedFrom": session.tool.as_str(),
         }),
         json!({
             "type": "model_change",
@@ -561,7 +568,10 @@ fn emit_omp<D: EmitDefaults>(
             payload.insert("stopReason".to_owned(), json!("stop"));
             payload.insert(
                 "responseId".to_owned(),
-                json!(format!("converted-{}", compact_id(defaults.next_uuid(), 12))),
+                json!(format!(
+                    "converted-{}",
+                    compact_id(defaults.next_uuid(), 12)
+                )),
             );
         }
         records.push(json!({
@@ -574,6 +584,23 @@ fn emit_omp<D: EmitDefaults>(
         parent_id = message_id;
     }
     Ok(records)
+}
+
+/// Build the native OMP leading title-slot record.
+///
+/// Mirrors `src/session/title-slot.ts::TitleSlotObject`: `type:"title"`,
+/// `v:1`, a non-empty `title`, an ISO `updatedAt`, and a `pad` string. The
+/// native reader validates only that these are strings, so an empty `pad`
+/// is accepted; the fixed 256-byte width is a filesystem optimization, not a
+/// parse requirement, and is intentionally not reproduced here.
+fn omp_title_slot(title: &str, updated_at: String) -> Value {
+    json!({
+        "type": "title",
+        "v": 1,
+        "title": title,
+        "updatedAt": updated_at,
+        "pad": "",
+    })
 }
 
 fn emit_droid<D: EmitDefaults>(
@@ -634,15 +661,12 @@ fn emit_codex(
             "type": "session_meta",
             "payload": {
                 "id": session_id,
-                "session_id": session_id,
                 "timestamp": timestamp,
                 "cwd": cwd,
-                "originator": "codex-tui",
+                "originator": "codex",
                 "source": "cli",
-                "thread_source": "user",
-                "cli_version": "sessions-convert",
+                "cli_version": env!("CARGO_PKG_VERSION"),
                 "model_provider": runtime.provider,
-                "history_mode": "legacy",
             },
         }),
         json!({
@@ -650,7 +674,6 @@ fn emit_codex(
             "type": "turn_context",
             "payload": {
                 "cwd": cwd,
-                "workspace_roots": [cwd],
                 "approval_policy": "never",
                 "sandbox_policy": { "type": "read-only" },
                 "model": runtime.model,
@@ -717,7 +740,8 @@ fn emit_claude<D: EmitDefaults>(
     start: DateTime<Utc>,
     defaults: &mut D,
 ) -> Vec<Value> {
-    let mut records = Vec::with_capacity(session.messages.len() + usize::from(!session.messages.is_empty()));
+    let mut records =
+        Vec::with_capacity(session.messages.len() + usize::from(!session.messages.is_empty()));
     let mut parent_uuid: Option<String> = None;
     let mut last_user_text = "";
     for (index, message) in session.messages.iter().enumerate() {
@@ -780,7 +804,6 @@ struct GrokBundle {
 
 fn emit_grok(
     session: &Session,
-    target: TargetTool,
     cwd: &str,
     session_id: &str,
     start: DateTime<Utc>,
@@ -847,7 +870,6 @@ fn emit_grok(
             "num_chat_messages": chat.len(),
             "current_model_id": model,
             "chat_format_version": 1,
-            "agent_name": target.as_str(),
         }),
         chat,
         updates,
@@ -865,6 +887,7 @@ fn normalize_output_path(target: TargetTool, output: &Path) -> PathBuf {
 fn target_path(
     target: TargetTool,
     cwd: &str,
+    grok_cwd: Option<&str>,
     session_id: &str,
     start: DateTime<Utc>,
     context: &EmitContext,
@@ -874,7 +897,11 @@ fn target_path(
             .roots
             .pi
             .join(crate::formats::pi::encode_cwd(Path::new(cwd))?)
-            .join(format!("{}_{}.jsonl", file_safe_timestamp(start), session_id)),
+            .join(format!(
+                "{}_{}.jsonl",
+                file_safe_timestamp(start),
+                session_id
+            )),
         TargetTool::Omp => context
             .roots
             .omp
@@ -883,7 +910,11 @@ fn target_path(
                 &context.home,
                 &env::temp_dir(),
             ))
-            .join(format!("{}_{}.jsonl", file_safe_timestamp(start), session_id)),
+            .join(format!(
+                "{}_{}.jsonl",
+                file_safe_timestamp(start),
+                session_id
+            )),
         TargetTool::Droid => context
             .roots
             .droid
@@ -910,7 +941,7 @@ fn target_path(
         TargetTool::Grok | TargetTool::Hyper => context
             .roots
             .grok
-            .join(encode_grok_cwd(cwd))
+            .join(grok_cwd.expect("Grok cwd computed before target path"))
             .join(session_id)
             .join("summary.json"),
     };
@@ -928,6 +959,7 @@ fn write_jsonl(path: &Path, records: &[Value]) -> Result<()> {
 
 fn write_grok_bundle<D: EmitDefaults>(
     summary_path: &Path,
+    cwd: &str,
     bundle: &GrokBundle,
     defaults: &mut D,
 ) -> Result<()> {
@@ -940,11 +972,17 @@ fn write_grok_bundle<D: EmitDefaults>(
     fs::create_dir_all(cwd_dir)
         .with_context(|| format!("creating Grok cwd directory {}", cwd_dir.display()))?;
     if session_dir.exists() {
-        bail!("refusing to replace existing Grok session directory {}", session_dir.display());
+        bail!(
+            "refusing to replace existing Grok session directory {}",
+            session_dir.display()
+        );
     }
     let staging = cwd_dir.join(format!(
         ".{}.{}.tmp",
-        session_dir.file_name().and_then(|name| name.to_str()).unwrap_or("session"),
+        session_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("session"),
         defaults.next_uuid()
     ));
     validate_component(
@@ -957,7 +995,10 @@ fn write_grok_bundle<D: EmitDefaults>(
     fs::create_dir(&staging)
         .with_context(|| format!("creating Grok staging directory {}", staging.display()))?;
     let result = (|| -> Result<()> {
-        atomic_write_jsonl(&staging.join("summary.json"), std::slice::from_ref(&bundle.summary))?;
+        atomic_write_jsonl(
+            &staging.join("summary.json"),
+            std::slice::from_ref(&bundle.summary),
+        )?;
         atomic_write_jsonl(&staging.join("chat_history.jsonl"), &bundle.chat)?;
         atomic_write_jsonl(&staging.join("updates.jsonl"), &bundle.updates)?;
         fs::rename(&staging, session_dir).with_context(|| {
@@ -967,6 +1008,15 @@ fn write_grok_bundle<D: EmitDefaults>(
                 session_dir.display()
             )
         })?;
+        let encoded = utf8_percent_encode(cwd, URL_PATH_ENCODE_SET).to_string();
+        if encoded != encode_grok_cwd(cwd) {
+            let cwd_sidecar = cwd_dir.join(".cwd");
+            if !cwd_sidecar.exists() {
+                fs::write(&cwd_sidecar, cwd).with_context(|| {
+                    format!("writing Grok cwd sidecar {}", cwd_sidecar.display())
+                })?;
+            }
+        }
         fs::File::open(cwd_dir)
             .and_then(|directory| directory.sync_all())
             .with_context(|| format!("syncing Grok cwd directory {}", cwd_dir.display()))?;
@@ -1069,19 +1119,33 @@ fn encode_single_dash_cwd(cwd: &str) -> String {
 }
 
 fn encode_grok_cwd(cwd: &str) -> String {
-    utf8_percent_encode(cwd, URL_PATH_ENCODE_SET).to_string()
+    let encoded = utf8_percent_encode(cwd, URL_PATH_ENCODE_SET).to_string();
+    if encoded.len() <= MAX_FILESYSTEM_COMPONENT_BYTES {
+        return encoded;
+    }
+    let leaf = Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    let slug = grok_slug(leaf, 40);
+    let slug = if slug.is_empty() { "workspace" } else { &slug };
+    let hash = blake3::hash(cwd.as_bytes()).to_hex();
+    format!("{slug}-{}", &hash[..16])
 }
 
-fn validate_grok_cwd_component(cwd: &str) -> Result<()> {
-    let encoded = encode_grok_cwd(cwd);
-    if encoded.len() > MAX_FILESYSTEM_COMPONENT_BYTES {
-        bail!(
-            "percent-encoded cwd component is {} bytes, exceeding filesystem limit of {} bytes; native slug fallback is intentionally not guessed",
-            encoded.len(),
-            MAX_FILESYSTEM_COMPONENT_BYTES
-        );
+fn grok_slug(value: &str, limit: usize) -> String {
+    let mut slug = String::with_capacity(value.len());
+    let mut previous_dash = false;
+    for character in value.to_lowercase().chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            previous_dash = false;
+        } else if !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
     }
-    Ok(())
+    slug.trim_matches('-').chars().take(limit).collect()
 }
 
 fn validate_component(label: &str, component: &str) -> Result<()> {
@@ -1191,9 +1255,7 @@ mod tests {
 
     impl FixedDefaults {
         fn new() -> Self {
-            let uuids = (1_u128..=64)
-                .map(Uuid::from_u128)
-                .collect::<VecDeque<_>>();
+            let uuids = (1_u128..=64).map(Uuid::from_u128).collect::<VecDeque<_>>();
             Self {
                 uuids,
                 now: Utc.with_ymd_and_hms(2026, 7, 30, 1, 2, 3).unwrap(),
@@ -1318,11 +1380,8 @@ mod tests {
             &mut FixedDefaults::new(),
         )
         .unwrap();
-        let native_dir = crate::formats::omp::encode_omp_cwd_with(
-            &session.cwd,
-            &real_home,
-            &env::temp_dir(),
-        );
+        let native_dir =
+            crate::formats::omp::encode_omp_cwd_with(&session.cwd, &real_home, &env::temp_dir());
         assert_eq!(native_dir, "-project");
         assert_eq!(
             emitted.path.parent().unwrap(),
@@ -1348,11 +1407,8 @@ mod tests {
             &mut FixedDefaults::new(),
         )
         .unwrap();
-        let native_dir = crate::formats::omp::encode_omp_cwd_with(
-            &session.cwd,
-            &real_home,
-            &env::temp_dir(),
-        );
+        let native_dir =
+            crate::formats::omp::encode_omp_cwd_with(&session.cwd, &real_home, &env::temp_dir());
         assert!(native_dir.starts_with("-tmp-"));
         assert_eq!(
             emitted.path.parent().unwrap(),
@@ -1393,11 +1449,15 @@ mod tests {
         )
         .unwrap();
         let omp_records = read_jsonl(&omp.path);
-        assert_eq!(omp_records[0]["convertedFrom"], "claude");
-        assert_eq!(omp_records[1]["model"], "provider/model");
-        assert_eq!(omp_records[2]["thinkingLevel"], "xhigh");
-        assert_eq!(omp_records[4]["message"]["provider"], "provider");
-        assert_eq!(omp_records[4]["message"]["model"], "model");
+        // Record 0 is the native leading title slot; record 1 is the session
+        // header; record 2 is the model-change bootstrap.
+        assert_eq!(omp_records[0]["type"], "title");
+        assert_eq!(omp_records[0]["v"], 1);
+        assert!(omp_records[1].get("convertedFrom").is_none());
+        assert_eq!(omp_records[2]["model"], "provider/model");
+        assert_eq!(omp_records[3]["thinkingLevel"], "xhigh");
+        assert_eq!(omp_records[5]["message"]["provider"], "provider");
+        assert_eq!(omp_records[5]["message"]["model"], "model");
     }
 
     #[test]
@@ -1419,7 +1479,10 @@ mod tests {
         .unwrap();
         let records = read_jsonl(&emitted.path);
         assert_eq!(records[0]["payload"]["model_provider"], "provider");
-        assert_eq!(records[1]["payload"]["workspace_roots"][0], session.cwd.to_str().unwrap());
+        assert!(records[0]["payload"].get("session_id").is_none());
+        assert!(records[0]["payload"].get("thread_source").is_none());
+        assert!(records[0]["payload"].get("history_mode").is_none());
+        assert!(records[1]["payload"].get("workspace_roots").is_none());
         assert_eq!(records[1]["payload"]["sandbox_policy"]["type"], "read-only");
         assert_eq!(records[2]["type"], "response_item");
         assert_eq!(records[3]["payload"]["type"], "user_message");
@@ -1469,13 +1532,13 @@ mod tests {
     }
 
     #[test]
-    fn grok_and_hyper_share_storage_but_stamp_distinct_agent_names() {
+    fn grok_and_hyper_emit_shared_native_summary() {
         let temporary = TempDir::new().unwrap();
         let home = temporary.path();
         let session = fixture(home);
-        for (target, id, expected_agent) in [
-            (TargetTool::Grok, "grok-session", "grok"),
-            (TargetTool::Hyper, "hyper-session", "hyper"),
+        for (target, id) in [
+            (TargetTool::Grok, "grok-session"),
+            (TargetTool::Hyper, "hyper-session"),
         ] {
             let emitted = emit_with_defaults(
                 &session,
@@ -1487,8 +1550,9 @@ mod tests {
             )
             .unwrap();
             assert!(emitted.path.starts_with(home.join(".grok/sessions")));
-            let summary: Value = serde_json::from_str(&fs::read_to_string(&emitted.path).unwrap()).unwrap();
-            assert_eq!(summary["agent_name"], expected_agent);
+            let summary: Value =
+                serde_json::from_str(&fs::read_to_string(&emitted.path).unwrap()).unwrap();
+            assert!(summary.get("agent_name").is_none());
             assert_eq!(summary["current_model_id"], "grok-runtime-model");
             let chat = read_jsonl(&emitted.path.with_file_name("chat_history.jsonl"));
             assert!(chat[0]["content"].is_array());
@@ -1496,7 +1560,11 @@ mod tests {
             assert_eq!(chat[0]["prompt_index"], 0);
             let updates = read_jsonl(&emitted.path.with_file_name("updates.jsonl"));
             assert_eq!(updates[0]["params"]["update"]["_meta"]["promptIndex"], 0);
-            assert!(updates[1]["params"]["update"]["_meta"].get("promptIndex").is_none());
+            assert!(
+                updates[1]["params"]["update"]["_meta"]
+                    .get("promptIndex")
+                    .is_none()
+            );
         }
     }
 
@@ -1538,21 +1606,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_percent_encoded_cwd_before_writing() {
+    fn long_grok_cwd_uses_slug_and_sidecar() {
         let temporary = TempDir::new().unwrap();
         let home = temporary.path();
         let mut session = fixture(home);
-        session.cwd = PathBuf::from(format!("/{}", "界".repeat(100)));
+        let cwd = format!("/{}", "界".repeat(100));
+        session.cwd = PathBuf::from(&cwd);
         let context = EmitContext::new(home).with_session_id("grok-session");
-        let error = emit_with_defaults(
+        let emitted = emit_with_defaults(
             &session,
             TargetTool::Grok,
             &context,
             &mut FixedDefaults::new(),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("exceeding filesystem limit"));
-        assert!(!home.join(".grok").exists());
+        .unwrap();
+        let cwd_directory = emitted.path.parent().unwrap().parent().unwrap();
+        assert!(cwd_directory.file_name().unwrap().len() <= MAX_FILESYSTEM_COMPONENT_BYTES);
+        assert_eq!(fs::read_to_string(cwd_directory.join(".cwd")).unwrap(), cwd);
     }
 
     #[test]
@@ -1604,5 +1674,4 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 131_072);
     }
-
 }

@@ -1,37 +1,20 @@
 //! OMP session adapter.
 //!
-//! OMP (`@oh-my-pi/pi-coding-agent`) shares Pi's append-only JSONL tree
-//! format — a `session` header followed by entries chained via `id`/
-//! `parentId` — but diverges in two places this adapter honors:
-//!
-//! 1. An optional fixed-width **title slot** may occupy the first physical
-//!    line: `{"type":"title","v":1,"title":…,"source?":"auto"|"user",
-//!    "updatedAt":…,"pad":…}`, padded to 256 bytes. When present and valid
-//!    its title is peeled and takes precedence over the header title for the
-//!    session summary; otherwise the line is parsed as an ordinary record.
-//! 2. The per-cwd encoded directory name uses OMP's home/tmp-relative scheme
-//!    (`-`, `-Projects-x`, `-tmp-foo`) for paths under `$HOME`/`$TMPDIR`,
-//!    falling back to the absolute `--…--` form elsewhere. Legacy `--…--`
-//!    home directories (pre-migration) are accepted on discovery, not
-//!    rejected.
-//!
-//! Parsing is intentionally lossy and lenient, matching the `al` contract:
-//! malformed JSONL lines are skipped, the active branch is reconstructed from
-//! the last-appended entry, and only `user`/`assistant` first text along that
-//! branch is projected — using the outer entry timestamp, not the inner
-//! message epoch. Unknown entry types still participate in the tree through
-//! their `id`/`parentId` so the active-branch walk stays correct.
+//! OMP shares Pi's append-only JSONL conversation tree, adding a fixed-width
+//! leading title-slot record and home/tmp-relative session directory encoding.
+//! The first logical record of the body must be the native `session` header;
+//! legacy v1 entries are migrated to a linear tree before active-branch
+//! resolution; the latest compaction bounds projected user/assistant text.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use serde_json::{Map, Value};
+use thiserror::Error;
 
 use crate::domain::{Message, Session, SourceTool};
-use crate::formats::{normalize, read_jsonl_values, summarize_messages, tree};
 use crate::formats::tree::TreeNode;
+use crate::formats::{normalize, read_jsonl_values, summarize_messages, tree};
 
 /// Why an OMP session file is unloadable, surfaced through `parse`'s
 /// `anyhow::Result` (downcastable via `error.downcast_ref::<OmpParseError>()`)
@@ -52,80 +35,102 @@ pub enum OmpParseError {
 
 /// Parse an OMP session export into a lossy `Session`.
 pub fn parse(path: &Path) -> Result<Session> {
-    let values = read_jsonl_values(path)?;
+    let mut values = read_jsonl_values(path)?;
     let modified_epoch = file_mtime(path);
 
-    // The optional title slot is the first physical record. Peel it only when
-    // it validates as a v1 title slot; a title-typed record that fails
-    // validation stays as the first logical record, which then fails the
-    // strict session-header requirement below (unloadable).
-    let mut slot_title: Option<String> = None;
+    // Native OMP session files begin with a fixed-width title-slot record:
+    //   {"type":"title","v":1,"title":"…","updatedAt":"…","pad":"…"[,"source":"auto"|"user"]}
+    // (`src/session/title-slot.ts::parseTitleSlotObject`). The slot is split off
+    // before the JSONL body is parsed; its non-empty title overrides the
+    // `session` header title, and an empty slot title deletes it. The session
+    // header must then be the first logical record of the remaining body.
     let mut start = 0;
-    if let Some(first) = values.first().and_then(Value::as_object) {
-        if first.get("type").and_then(Value::as_str) == Some("title") {
-            if let Some(slot) = parse_title_slot(first) {
-                slot_title = Some(slot.title);
+    let mut slot_title: Option<String> = None;
+    let mut slot_present = false;
+    if let Some(object) = values.first().and_then(Value::as_object) {
+        if object.get("type").and_then(Value::as_str) == Some("title")
+            && object.get("v").and_then(Value::as_i64) == Some(1)
+            && object.get("title").and_then(Value::as_str).is_some()
+        {
+            // `updatedAt` and `pad` are required strings in the native schema;
+            // validate them so an unrelated `{"type":"title"}` object is not
+            // mistaken for a slot.
+            let valid = object.get("updatedAt").and_then(Value::as_str).is_some()
+                && object.get("pad").and_then(Value::as_str).is_some()
+                && object
+                    .get("source")
+                    .is_none_or(|src| src.as_str().is_some_and(|s| s == "auto" || s == "user"));
+            if valid {
+                slot_present = true;
+                slot_title = object
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.is_empty())
+                    .map(str::to_owned);
                 start = 1;
             }
         }
     }
 
     // Strict load (native OMP `loadEntriesFromFile`): the first logical
-    // record after the optional title slot MUST be a valid `session` header
-    // with a string id. A missing or invalid header makes the file
-    // unloadable — surfaced as a typed `OmpParseError` so the listing layer
-    // can distinguish a truly empty file from a nonempty headerless/corrupt
-    // one, never papered over by scanning for a later header.
+    // record MUST be a valid `session` header with a string id. An invalid
+    // header is unloadable; the typed error distinguishes a truly empty file
+    // from a nonempty headerless or corrupt one without scanning later lines.
     //
     // `read_jsonl_values` silently drops malformed lines, so an empty `Vec`
     // alone is ambiguous: it can mean a 0-byte file or a nonempty file whose
     // every line is malformed. The physical file size disambiguates.
-    let header_object = values
+    let (session_id, raw_cwd, raw_timestamp, header_title) = values
         .get(start)
         .and_then(Value::as_object)
-        .filter(|object| object.get("type").and_then(Value::as_str) == Some("session"));
-    let header_object = match header_object {
-        Some(object) => object,
-        None => {
-            let err = if file_is_empty(path).unwrap_or(false) {
+        .filter(|object| object.get("type").and_then(Value::as_str) == Some("session"))
+        .and_then(|object| {
+            object
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(|id| {
+                    (
+                        id.to_owned(),
+                        object
+                            .get("cwd")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        object
+                            .get("timestamp")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        object
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .filter(|title| !title.is_empty())
+                            .map(str::to_owned),
+                    )
+                })
+        })
+        .ok_or_else(|| {
+            anyhow::Error::new(if file_is_empty(path).unwrap_or(false) {
                 OmpParseError::Empty
             } else {
                 OmpParseError::NoSessionHeader
-            };
-            return Err(anyhow::Error::new(err));
-        }
-    };
-    let Some(session_id) = header_object
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-    else {
-        // A `session`-typed record with no string id: the file is nonempty
-        // but its header is invalid → headerless, not empty.
-        return Err(anyhow::Error::new(OmpParseError::NoSessionHeader));
-    };
-    let session_id = session_id.to_owned();
-    let raw_cwd = header_object
-        .get("cwd")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    let raw_timestamp = header_object
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    let header_title = header_object
-        .get("title")
-        .and_then(Value::as_str)
-        .filter(|title| !title.is_empty())
-        .map(str::to_owned);
+            })
+        })?;
 
-    // Remaining records form the append-only tree. Every entry type —
-    // `message`, `model_change`, `compaction`, unknown future types —
-    // participates via id/parentId so the active-branch walk stays correct;
-    // only `message` entries carry a conversation payload that projects.
-    // Further `session` records are not entries and are skipped.
+    // Native `applyTitleSlot`: a present slot title overrides the header title;
+    // a present but empty slot title deletes the header title. Absent slot
+    // leaves the header title in place.
+    let effective_title = if slot_present {
+        slot_title
+    } else {
+        header_title
+    };
+
+    crate::formats::pi::migrate_legacy_entries(&mut values[start..]);
+
+    // Remaining records form the append-only tree. Every entry type participates
+    // via id/parentId; only native user/assistant message payloads project.
     let mut nodes: Vec<TreeNode<'_>> = Vec::with_capacity(values.len().saturating_sub(start + 1));
     for record in &values[start + 1..] {
         let Some(object) = record.as_object() else {
@@ -137,33 +142,41 @@ pub fn parse(path: &Path) -> Result<Session> {
         let id = object.get("id").and_then(Value::as_str).unwrap_or("");
         let parent_id = object.get("parentId").and_then(Value::as_str);
         let entry_timestamp = object.get("timestamp").and_then(Value::as_str);
+        let entry_type = object.get("type").and_then(Value::as_str);
         let (role, content) = message_payload(object);
         nodes.push(TreeNode {
             id,
             parent_id: parent_id.filter(|value| !value.is_empty()),
+            entry_type,
             role,
             content,
             timestamp: entry_timestamp,
+            summary: object.get("summary").and_then(Value::as_str),
+            short_summary: object.get("shortSummary").and_then(Value::as_str),
+            first_kept_entry_id: object.get("firstKeptEntryId").and_then(Value::as_str),
         });
     }
 
-    let messages: Vec<Message> = tree::project_messages(&tree::active_path(&nodes));
+    let active_path = tree::active_path(&nodes);
+    let messages: Vec<Message> = tree::project_native_messages(&active_path);
+    let compaction_title = active_path
+        .iter()
+        .filter(|node| node.entry_type == Some("compaction"))
+        .filter_map(|node| node.short_summary)
+        .next_back();
 
-    let cwd = if raw_cwd.is_empty() {
-        fallback_cwd(path)
-    } else {
-        PathBuf::from(raw_cwd)
-    };
+    let cwd = PathBuf::from(raw_cwd);
     let start_timestamp = if raw_timestamp.is_empty() {
         None
     } else {
         Some(raw_timestamp)
     };
 
-    // Summary priority: title slot > header title > first user/assistant text.
-    let summary = slot_title
+    // Summary priority: effective title slot/header title, latest compaction
+    // short summary, then first projected user/assistant text.
+    let summary = effective_title
         .as_deref()
-        .or(header_title.as_deref())
+        .or(compaction_title)
         .map(|title| normalize(title, 100))
         .unwrap_or_else(|| summarize_messages(&messages));
 
@@ -176,58 +189,6 @@ pub fn parse(path: &Path) -> Result<Session> {
         messages,
         path: path.to_path_buf(),
         modified_epoch,
-    })
-}
-
-/// A peeled OMP title slot, preserving all extension data via `raw`.
-///
-/// Validation mirrors OMP's `parseTitleSlotObject`: `type == "title"`,
-/// `v == 1`, string `title`, string `updatedAt`, string `pad`, and an
-/// optional `source` that must be `"auto"` or `"user"` when present.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TitleSlot {
-    pub title: String,
-    #[serde(default)]
-    pub source: Option<String>,
-    pub updated_at: String,
-    pub pad: String,
-    /// The full record, kept verbatim for round-trip fidelity of any
-    /// future/extension fields beyond the typed ones above.
-    #[serde(skip)]
-    pub raw: Value,
-}
-
-/// Validate and peel a title slot from a first-record object.
-///
-/// Returns `None` when the object does not validate as a title slot, in which
-/// case the caller treats the record as an ordinary entry.
-pub fn parse_title_slot(object: &Map<String, Value>) -> Option<TitleSlot> {
-    let kind = object.get("type").and_then(Value::as_str)?;
-    if kind != "title" {
-        return None;
-    }
-    let v = object.get("v").and_then(Value::as_i64)?;
-    if v != 1 {
-        return None;
-    }
-    let title = object.get("title").and_then(Value::as_str)?.to_owned();
-    let updated_at = object.get("updatedAt").and_then(Value::as_str)?.to_owned();
-    let pad = object.get("pad").and_then(Value::as_str)?.to_owned();
-    if let Some(source) = object.get("source").and_then(Value::as_str) {
-        if source != "auto" && source != "user" {
-            return None;
-        }
-    }
-    let source = object
-        .get("source")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    Some(TitleSlot {
-        title,
-        source,
-        updated_at,
-        pad,
-        raw: Value::Object(object.clone()),
     })
 }
 
@@ -245,15 +206,6 @@ fn message_payload(object: &Map<String, Value>) -> (Option<&str>, Option<&Value>
     let role = message_obj.get("role").and_then(Value::as_str);
     let content = message_obj.get("content");
     (role, content)
-}
-
-/// Derive the working directory from the file's parent when no header cwd is
-/// present (or it is empty).
-fn fallback_cwd(path: &Path) -> PathBuf {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// File mtime as a POSIX epoch second, when statable.
@@ -403,8 +355,7 @@ mod tests {
         file
     }
 
-    const HEADER: &str =
-        r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#;
+    const HEADER: &str = r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#;
 
     fn msg(id: &str, parent_id: Option<&str>, role: &str, content: &str) -> String {
         let parent = match parent_id {
@@ -416,90 +367,59 @@ mod tests {
         )
     }
 
-    /// Build a 256-byte title-slot line (incl. trailing newline).
-    fn title_slot_line(title: &str, source: &str) -> String {
-        let core = format!(
-            r#"{{"type":"title","v":1,"title":"{title}","source":"{source}","updatedAt":"2026-01-01T00:00:00.000Z","pad":""#
-        );
-        // total line incl. trailing newline == 256 bytes; pad fills the gap.
-        let closer = "\"}";
-        let without_pad = core.len() + closer.len();
-        let pad_len = 256usize.saturating_sub(without_pad + 1);
-        format!("{}{}{}\n", core, " ".repeat(pad_len), closer)
-    }
-
     /// Downcast a parse error to its typed `OmpParseError` variant, if any.
     fn unloadable_kind(result: Result<Session>) -> Option<OmpParseError> {
         result
             .err()
             .and_then(|err| err.downcast_ref::<OmpParseError>().copied())
     }
-
     #[test]
-    fn title_slot_is_peeled_and_wins_summary() {
-        let slot = title_slot_line("Extract archive documents", "auto");
-        assert_eq!(slot.len(), 256);
+    fn leading_title_slot_is_native_and_overrides_header_title() {
+        let header = r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","title":"Header Title"}"#;
         let file = write_session(&[
-            &slot,
-            HEADER,
+            r#"{"type":"title","v":1,"title":"Slot Title","updatedAt":"2026-01-01T00:00:00.000Z","pad":""}"#,
+            header,
             &msg("a", None, "user", r#""first user text""#),
-            &msg("b", Some("a"), "assistant", r#"[{"type":"text","text":"reply"}]"#),
         ]);
         let session = parse(file.path()).expect("parse");
-        assert_eq!(session.tool, SourceTool::Omp);
         assert_eq!(session.session_id, "s1");
-        assert_eq!(session.summary, "Extract archive documents");
-        // Messages still project from the active branch.
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.messages[0].text, "first user text");
-        assert_eq!(session.messages[1].text, "reply");
+        assert_eq!(session.summary, "Slot Title");
+    }
+
+    #[test]
+    fn empty_title_slot_deletes_header_title() {
+        let header = r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","title":"Header Title"}"#;
+        let file = write_session(&[
+            r#"{"type":"title","v":1,"title":"","updatedAt":"2026-01-01T00:00:00.000Z","pad":""}"#,
+            header,
+            &msg("a", None, "user", r#""first user text""#),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        // No slot/header title and no compaction: summary falls back to text.
+        assert_eq!(session.summary, "first user text");
+    }
+
+    #[test]
+    fn non_title_typed_first_record_is_rejected() {
+        // An unrelated leading {"type":"title"} object without the required
+        // updatedAt/pad fields is not a native title slot, so it must not be
+        // consumed and the missing session header stays unloadable.
+        let file = write_session(&[
+            r#"{"type":"title","v":1,"title":"X"}"#,
+            &msg("a", None, "user", r#""first user text""#),
+        ]);
+        assert_eq!(
+            unloadable_kind(parse(file.path())),
+            Some(OmpParseError::NoSessionHeader)
+        );
     }
 
     #[test]
     fn header_title_used_when_no_slot() {
         let header = r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","title":"Header Title Here"}"#;
-        let file = write_session(&[
-            header,
-            &msg("a", None, "user", r#""ignored for summary""#),
-        ]);
+        let file = write_session(&[header, &msg("a", None, "user", r#""ignored for summary""#)]);
         let session = parse(file.path()).expect("parse");
         assert_eq!(session.summary, "Header Title Here");
-    }
-
-    #[test]
-    fn slot_title_takes_precedence_over_header_title() {
-        let slot = title_slot_line("Slot Title", "user");
-        let header = r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","title":"Header Title"}"#;
-        let file = write_session(&[&slot, header, &msg("a", None, "user", r#""x""#)]);
-        let session = parse(file.path()).expect("parse");
-        assert_eq!(session.summary, "Slot Title");
-    }
-    #[test]
-    fn invalid_title_slot_makes_file_unloadable() {
-        // type=="title" but missing `pad` → not a valid slot, so it stays as
-        // the first logical record. Since it is not a `session` header the
-        // file is unloadable (native returns []). The valid header on the
-        // next line is NOT used as a fallback.
-        let bad_slot = r#"{"type":"title","v":1,"title":"No Pad","updatedAt":"2026-01-01T00:00:00.000Z"}"#;
-        let file = write_session(&[
-            bad_slot,
-            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","title":"Header Title"}"#,
-            &msg("a", None, "user", r#""q""#),
-        ]);
-        assert!(parse(file.path()).is_err());
-    }
-
-    #[test]
-    fn invalid_slot_source_makes_file_unloadable() {
-        // `source` present but not auto/user → slot rejected, so the title
-        // record is the first logical (non-session) entry → unloadable.
-        let bad = r#"{"type":"title","v":1,"title":"Bad","source":"weird","updatedAt":"2026-01-01T00:00:00.000Z","pad":""}"#;
-        let file = write_session(&[
-            bad,
-            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","title":"Header"}"#,
-            &msg("a", None, "user", r#""q""#),
-        ]);
-        assert!(parse(file.path()).is_err());
     }
 
     #[test]
@@ -510,7 +430,12 @@ mod tests {
             HEADER,
             &msg("a", None, "user", r#""branch-a""#),
             &msg("b", None, "user", r#""branch-b""#),
-            &msg("c", Some("b"), "assistant", r#"[{"type":"text","text":"c"}]"#),
+            &msg(
+                "c",
+                Some("b"),
+                "assistant",
+                r#"[{"type":"text","text":"c"}]"#,
+            ),
         ]);
         let session = parse(file.path()).expect("parse");
         let texts: Vec<&str> = session.messages.iter().map(|m| m.text.as_str()).collect();
@@ -520,10 +445,7 @@ mod tests {
     #[test]
     fn active_branch_cycle_guard_terminates() {
         // a.p = a (self-cycle) → walk stops, returning just [a].
-        let file = write_session(&[
-            HEADER,
-            &msg("a", Some("a"), "user", r#""cyclic""#),
-        ]);
+        let file = write_session(&[HEADER, &msg("a", Some("a"), "user", r#""cyclic""#)]);
         let session = parse(file.path()).expect("parse");
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].text, "cyclic");
@@ -552,7 +474,12 @@ mod tests {
             HEADER,
             &msg("a", None, "user", r#""hi""#),
             r#"{"type":"future_thing","id":"u1","parentId":"a","timestamp":"2026-01-01T00:00:02.000Z","weird":1}"#,
-            &msg("b", Some("u1"), "assistant", r#"[{"type":"text","text":"hey"}]"#),
+            &msg(
+                "b",
+                Some("u1"),
+                "assistant",
+                r#"[{"type":"text","text":"hey"}]"#,
+            ),
         ]);
         let session = parse(file.path()).expect("parse");
         let texts: Vec<&str> = session.messages.iter().map(|m| m.text.as_str()).collect();
@@ -564,8 +491,18 @@ mod tests {
         let file = write_session(&[
             HEADER,
             &msg("m1", None, "user", r#""q""#),
-            &msg("m2", Some("m1"), "assistant", r#"[{"type":"text","text":"ans"}]"#),
-            &msg("m3", Some("m2"), "toolResult", r#"[{"type":"text","text":"tool"}]"#),
+            &msg(
+                "m2",
+                Some("m1"),
+                "assistant",
+                r#"[{"type":"text","text":"ans"}]"#,
+            ),
+            &msg(
+                "m3",
+                Some("m2"),
+                "toolResult",
+                r#"[{"type":"text","text":"tool"}]"#,
+            ),
             &msg("m4", Some("m3"), "developer", r#""dev""#),
         ]);
         let session = parse(file.path()).expect("parse");
@@ -586,6 +523,51 @@ mod tests {
             session.messages[0].timestamp.as_deref(),
             Some("2026-07-14T06:49:26.401Z")
         );
+    }
+
+    #[test]
+    fn compaction_drops_older_messages_and_uses_short_summary() {
+        let file = write_session(&[
+            HEADER,
+            &msg("a", None, "user", r#""old""#),
+            &msg(
+                "b",
+                Some("a"),
+                "assistant",
+                r#"[{"type":"text","text":"kept"}]"#,
+            ),
+            r#"{"type":"compaction","id":"c","parentId":"b","timestamp":"2026-01-01T00:00:03.000Z","summary":"full summary","shortSummary":"compact title","firstKeptEntryId":"b","tokensBefore":100}"#,
+            &msg(
+                "d",
+                Some("c"),
+                "assistant",
+                r#"[{"type":"text","text":"done"}]"#,
+            ),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["kept", "done"]);
+        assert_eq!(session.summary, "compact title");
+    }
+
+    #[test]
+    fn version_one_entries_are_migrated_to_linear_tree() {
+        let file = write_session(&[
+            r#"{"type":"session","id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+            r#"{"type":"message","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"message","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["hi", "hello"]);
     }
 
     #[test]
@@ -636,7 +618,10 @@ mod tests {
     fn encode_home_relative() {
         let home = Path::new("/workspace/user");
         let tmp = Path::new("/tmp");
-        assert_eq!(encode_omp_cwd_with(Path::new("/workspace/user"), home, tmp), "-");
+        assert_eq!(
+            encode_omp_cwd_with(Path::new("/workspace/user"), home, tmp),
+            "-"
+        );
         assert_eq!(
             encode_omp_cwd_with(Path::new("/workspace/user/Projects/x"), home, tmp),
             "-Projects-x"

@@ -82,8 +82,12 @@ pub fn parse(path: &Path, grok_root: &Path) -> Result<Session> {
     let session_directory = path
         .parent()
         .with_context(|| format!("Grok summary has no parent: {}", path.display()))?;
-    let directory = open_directory_under_root(session_directory, grok_root)
-        .with_context(|| format!("opening Grok session directory {}", session_directory.display()))?;
+    let directory = open_directory_under_root(session_directory, grok_root).with_context(|| {
+        format!(
+            "opening Grok session directory {}",
+            session_directory.display()
+        )
+    })?;
     let (mut summary_file, summary_metadata) = open_regular_file_at(&directory, "summary.json")
         .with_context(|| format!("opening Grok summary {}", path.display()))?;
     let mut summary_json = String::new();
@@ -108,16 +112,7 @@ pub fn parse(path: &Path, grok_root: &Path) -> Result<Session> {
         summary.info.id.clone()
     };
     let cwd: PathBuf = if summary.info.cwd.is_empty() {
-        // info.cwd is authoritative; this fallback only fires when it is absent.
-        // Reverse percent-decode the encoded-cwd directory component. Slug-fallback
-        // dirs (<slug>-<blake3-hex16>) would need the sibling .cwd sidecar and are
-        // not exercised on this host; decoding is still strictly better than the
-        // raw percent-encoded name.
-        session_directory
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .and_then(|name| name.to_str())
-            .map(|encoded| percent_decode_str(encoded).decode_utf8_lossy().into_owned())
+        decode_cwd_fallback(session_directory, grok_root)
             .unwrap_or_default()
             .into()
     } else {
@@ -131,11 +126,14 @@ pub fn parse(path: &Path, grok_root: &Path) -> Result<Session> {
     .into_iter()
     .find(|value| !value.is_empty())
     .map(str::to_owned);
-    let summary_text = [summary.generated_title.as_str(), summary.session_summary.as_str()]
-        .into_iter()
-        .find(|value| !value.is_empty())
-        .map(|value| normalize(value, 100))
-        .unwrap_or_else(|| summarize_messages(&messages));
+    let summary_text = [
+        summary.generated_title.as_str(),
+        summary.session_summary.as_str(),
+    ]
+    .into_iter()
+    .find(|value| !value.is_empty())
+    .map(|value| normalize(value, 100))
+    .unwrap_or_else(|| summarize_messages(&messages));
 
     Ok(Session {
         tool: SourceTool::Grok,
@@ -147,6 +145,21 @@ pub fn parse(path: &Path, grok_root: &Path) -> Result<Session> {
         path: path.to_path_buf(),
         modified_epoch: Some(metadata_epoch(&summary_metadata)),
     })
+}
+
+fn decode_cwd_fallback(session_directory: &Path, grok_root: &Path) -> Option<String> {
+    let cwd_directory = session_directory.parent()?;
+    let encoded = cwd_directory.file_name()?.to_str()?;
+    let decoded = percent_decode_str(encoded).decode_utf8().ok()?.into_owned();
+    if decoded.starts_with('/') || (cfg!(windows) && decoded.chars().nth(1) == Some(':')) {
+        return Some(decoded);
+    }
+    let directory = open_directory_under_root(cwd_directory, grok_root).ok()?;
+    let (mut cwd_file, _) = open_regular_file_at(&directory, ".cwd")?;
+    let mut cwd = String::new();
+    cwd_file.read_to_string(&mut cwd).ok()?;
+    let cwd = cwd.trim();
+    (!cwd.is_empty()).then(|| cwd.to_owned())
 }
 
 fn parse_chat_history(file: File, messages: &mut Vec<Message>) {
@@ -249,10 +262,28 @@ mod tests {
         let root = home.path().join(".grok/sessions");
         fs::create_dir_all(&root).expect("create grok root");
         // No info.cwd -> must reverse percent-decode the encoded-cwd component.
-        let summary = r#"{"info":{"id":"sid"},"session_summary":"t","created_at":"2026-01-01T00:00:00Z"}"#;
+        let summary =
+            r#"{"info":{"id":"sid"},"session_summary":"t","created_at":"2026-01-01T00:00:00Z"}"#;
         let path = write_session(&root, "%2Ftmp%2Fdecoded-cwd", "sid", summary, "");
         let session = parse(&path, &root).expect("parse");
         assert_eq!(session.cwd, PathBuf::from("/tmp/decoded-cwd"));
+    }
+
+    #[test]
+    fn slug_directory_falls_back_to_cwd_sidecar() {
+        let home = TempDir::new().expect("temp home");
+        let root = home.path().join(".grok/sessions");
+        fs::create_dir_all(&root).expect("create grok root");
+        let summary =
+            r#"{"info":{"id":"sid"},"session_summary":"t","created_at":"2026-01-01T00:00:00Z"}"#;
+        let path = write_session(&root, "workspace-1234567890abcdef", "sid", summary, "");
+        fs::write(
+            path.parent().unwrap().parent().unwrap().join(".cwd"),
+            "/real/long/workspace",
+        )
+        .expect("write cwd sidecar");
+        let session = parse(&path, &root).expect("parse");
+        assert_eq!(session.cwd, PathBuf::from("/real/long/workspace"));
     }
 
     #[test]
@@ -293,8 +324,11 @@ mod tests {
         // Real session dir living outside root, linked in by a symlink component.
         let real = home.path().join("real-enc/sid");
         fs::create_dir_all(&real).expect("create real session dir");
-        fs::write(real.join("summary.json"), r#"{"info":{"id":"sid","cwd":"/tmp"}}"#)
-            .expect("write summary");
+        fs::write(
+            real.join("summary.json"),
+            r#"{"info":{"id":"sid","cwd":"/tmp"}}"#,
+        )
+        .expect("write summary");
         let link = root.join("link-enc");
         symlink(home.path().join("real-enc"), &link).expect("symlink component");
         let path = link.join("sid/summary.json");
@@ -308,14 +342,22 @@ mod tests {
         fs::create_dir_all(&root).expect("create grok root");
         let summary = r#"{"info":{"id":"sid","cwd":"/tmp/grok"},"session_summary":"t","created_at":"2026-01-01T00:00:00Z"}"#;
         let chat = concat!(
-            r#"{"type":"system","content":"system prompt"}"#, "\n",
-            r#"{"type":"user","content":[{"type":"text","text":"hello user"}]}"#, "\n",
-            r#"{"type":"assistant","content":"hi assistant","tool_calls":[{"id":"call-1","name":"WebSearch","arguments":"{}"}],"model_id":"m"}"#, "\n",
-            r#"{"type":"reasoning","id":"rs_1","status":"completed","summary":[{"type":"summary_text","text":"thinking"}],"encrypted_content":"abc"}"#, "\n",
-            r#"{"type":"tool_result","tool_call_id":"call-1","content":"result"}"#, "\n",
-            r#"{not valid json"#, "\n",
-            r#"{"type":"user","content":[{"type":"image","url":"x"},{"type":"text","text":"second text"}]}"#, "\n",
-            r#"{"type":"assistant","content":""}"#, "\n",
+            r#"{"type":"system","content":"system prompt"}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"hello user"}]}"#,
+            "\n",
+            r#"{"type":"assistant","content":"hi assistant","tool_calls":[{"id":"call-1","name":"WebSearch","arguments":"{}"}],"model_id":"m"}"#,
+            "\n",
+            r#"{"type":"reasoning","id":"rs_1","status":"completed","summary":[{"type":"summary_text","text":"thinking"}],"encrypted_content":"abc"}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_call_id":"call-1","content":"result"}"#,
+            "\n",
+            r#"{not valid json"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"image","url":"x"},{"type":"text","text":"second text"}]}"#,
+            "\n",
+            r#"{"type":"assistant","content":""}"#,
+            "\n",
         );
         let path = write_session(&root, "%2Ftmp%2Fgrok", "sid", summary, chat);
         let session = parse(&path, &root).expect("parse");

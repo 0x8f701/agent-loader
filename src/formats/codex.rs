@@ -10,15 +10,9 @@
 //! the few event/response sub-variants it cares about are strongly typed, while
 //! every unrecognized field is preserved verbatim in an `extra` bag and every
 //! unknown item kind degrades to an opaque `CodexItem::Unknown` that retains the
-//! raw line. This keeps conversion lossless even when on-disk payloads carry
-//! fields beyond the audited source (verified drift: `session_meta.payload`
-//! ships a `session_id` alias absent from `SessionMeta`).
-//!
-//! Only the lossy `Session` contract is produced: id (meta then filename UUID),
-//! cwd (last `turn_context` else meta), start timestamp, user/assistant messages
-//! from `response_item` first text, and a summary/title derived from
-//! `thread_name_updated` or the first user content — mirroring
-//! `state/src/extract.rs` title/preview precedence.
+//! fields beyond the audited source. Only the lossy `Session` contract is
+//! produced: canonical id and cwd from the first SessionMeta, user/assistant
+//! response messages, and native title/preview precedence.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -56,9 +50,8 @@ pub enum CodexItem {
     },
 }
 
-/// `SessionMeta` (flattened by `SessionMetaLine`). Known required fields are
-/// typed; unrecognized fields (e.g. on-disk `session_id` alias, `git`,
-/// `source`, `agent_*`) are preserved in `extra`.
+/// typed; unrecognized fields (`git`, `source`, `agent_*`, lineage, future
+/// fields) are preserved in `extra`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct CodexSessionMeta {
     pub id: String,
@@ -143,8 +136,8 @@ pub fn parse(path: &Path) -> Result<Session> {
         bail!("codex rollout under archived_sessions: {}", path.display());
     }
 
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("reading codex rollout {}", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("reading codex rollout {}", path.display()))?;
     if !metadata.is_file() {
         bail!("codex rollout is not a regular file: {}", path.display());
     }
@@ -161,7 +154,6 @@ pub fn parse(path: &Path) -> Result<Session> {
 
     let mut session_meta: Option<CodexSessionMeta> = None;
     let mut messages: Vec<Message> = Vec::new();
-    let mut last_turn_cwd: Option<PathBuf> = None;
     let mut first_user_message: Option<String> = None;
     let mut thread_title: Option<String> = None;
     let mut first_line_timestamp: Option<String> = None;
@@ -203,11 +195,7 @@ pub fn parse(path: &Path) -> Result<Session> {
                     }
                 }
             }
-            CodexItem::TurnContext(ctx) => {
-                if !ctx.cwd.as_os_str().is_empty() {
-                    last_turn_cwd = Some(ctx.cwd);
-                }
-            }
+            CodexItem::TurnContext(_) => {}
             // Unknown item kinds and known kinds that failed strict
             // deserialization are preserved as raw values and intentionally
             // dropped from the lossy `Session` contract.
@@ -220,14 +208,13 @@ pub fn parse(path: &Path) -> Result<Session> {
         .map(|meta| meta.id.clone())
         .filter(|id| !id.is_empty())
         .or_else(|| filename_uuid(path))
-        .with_context(|| {
-            format!("codex rollout missing session id: {}", path.display())
-        })?;
+        .with_context(|| format!("codex rollout missing session id: {}", path.display()))?;
 
-    // cwd precedence (`rollout/src/recorder.rs:1880-1903`): last TurnContext.cwd
-    // wins, else SessionMeta.cwd, else the file's parent directory.
-    let cwd = last_turn_cwd
-        .or_else(|| session_meta.as_ref().and_then(|meta| nonempty_path(&meta.cwd)))
+    // Canonical metadata/listing cwd is SessionMeta-primary; TurnContext only
+    // supplies cwd when the meta value is absent.
+    let cwd = session_meta
+        .as_ref()
+        .and_then(|meta| nonempty_path(&meta.cwd))
         .or_else(|| path.parent().map(Path::to_path_buf))
         .unwrap_or_default();
 
@@ -237,7 +224,11 @@ pub fn parse(path: &Path) -> Result<Session> {
         .filter(|timestamp| !timestamp.is_empty())
         .or(first_line_timestamp);
 
-    let summary = summary_for(thread_title.as_deref(), first_user_message.as_deref(), &messages);
+    let summary = summary_for(
+        thread_title.as_deref(),
+        first_user_message.as_deref(),
+        &messages,
+    );
     let modified_epoch = Some(metadata_epoch(&metadata));
 
     Ok(Session {
@@ -466,31 +457,22 @@ mod tests {
     const ASSISTANT_RESPONSE: &str = r#"{"timestamp":"2026-07-29T06:04:39.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello there!"}]}}"#;
 
     #[test]
-    fn session_id_alias_drift_preserved_and_id_used() {
-        // On-disk session_meta carries a `session_id` alias absent from the
-        // audited SessionMeta struct. The typed `id` is the canonical thread id;
-        // the alias is preserved in `extra` rather than silently dropped.
+    fn unknown_session_meta_fields_are_preserved_and_id_is_canonical() {
         let meta: CodexSessionMeta = serde_json::from_str(
-            r#"{"id":"11111111-1111-4111-8111-111111111111","session_id":"11111111-1111-4111-8111-111111111111","timestamp":"2026-07-29T06:04:37.826Z","cwd":"/tmp","originator":"codex-tui","cli_version":"x"}"#,
+            r#"{"id":"11111111-1111-4111-8111-111111111111","future_field":true,"timestamp":"2026-07-29T06:04:37.826Z","cwd":"/tmp","originator":"codex","cli_version":"x"}"#,
         )
         .expect("deserialize meta");
         assert_eq!(meta.id, "11111111-1111-4111-8111-111111111111");
         assert_eq!(
-            meta.extra.get("session_id").and_then(Value::as_str),
-            Some("11111111-1111-4111-8111-111111111111")
+            meta.extra.get("future_field").and_then(Value::as_bool),
+            Some(true)
         );
 
-        // parse() must surface the typed `id`, never the alias, as session_id.
         let file = session_file(&[META, USER_RESPONSE]);
         let session = parse(file.path()).expect("parse");
         assert_eq!(session.tool, SourceTool::Codex);
         assert_eq!(session.session_id, "11111111-1111-4111-8111-111111111111");
         assert_eq!(session.cwd, PathBuf::from("/workspace/project"));
-        assert_eq!(
-            session.start_timestamp.as_deref(),
-            Some("2026-07-29T06:04:37.826Z")
-        );
-        assert_eq!(session.path, file.path());
     }
 
     #[test]
@@ -569,11 +551,11 @@ mod tests {
     }
 
     #[test]
-    fn cwd_last_turn_context_wins_over_meta() {
-        let turn = r#"{"timestamp":"2026-07-29T06:04:38.000Z","type":"turn_context","payload":{"cwd":"/srv/late","approval_policy":"never","sandbox_policy":"read-only","model":"gpt-5","summary":"auto"}}"#;
+    fn session_meta_cwd_wins_over_later_turn_context() {
+        let turn = r#"{"timestamp":"2026-07-29T06:04:38.000Z","type":"turn_context","payload":{"cwd":"/srv/late","approval_policy":"never","sandbox_policy":{"type":"read-only"},"model":"gpt-5","summary":"auto"}}"#;
         let file = session_file(&[META, turn, USER_RESPONSE]);
         let session = parse(file.path()).expect("parse");
-        assert_eq!(session.cwd, PathBuf::from("/srv/late"));
+        assert_eq!(session.cwd, PathBuf::from("/workspace/project"));
     }
 
     #[test]

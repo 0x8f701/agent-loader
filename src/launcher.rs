@@ -1,11 +1,12 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::SystemTime;
 
+use chrono::{DateTime, FixedOffset};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::Value;
 use thiserror::Error;
@@ -160,10 +161,7 @@ pub enum LauncherError {
         code: i32,
     },
     #[error("{launcher}: --wt requires --host")]
-    WorktreeRequiresHost {
-        launcher: &'static str,
-        code: i32,
-    },
+    WorktreeRequiresHost { launcher: &'static str, code: i32 },
     #[error("invalid worktree name {name:?}: {reason}")]
     InvalidWorktreeName {
         name: OsString,
@@ -324,7 +322,9 @@ pub fn resolve_tool_executable(target: TargetTool, home: &Path) -> Result<OsStri
 pub fn resolve_executable(program: &OsStr) -> Option<PathBuf> {
     let program_path = Path::new(program);
     if program_path.is_absolute()
-        || program_path.parent().is_some_and(|parent| !parent.as_os_str().is_empty())
+        || program_path
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
     {
         return is_executable_file(program_path).then(|| program_path.to_owned());
     }
@@ -340,8 +340,8 @@ pub fn resolve_executable_in(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
         }
         #[cfg(windows)]
         if candidate.extension().is_none() {
-            let extensions = env::var_os("PATHEXT")
-                .unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+            let extensions =
+                env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
             for extension in extensions.to_string_lossy().split(';') {
                 let extension = extension.trim_start_matches('.');
                 let candidate = candidate.with_extension(extension);
@@ -395,11 +395,8 @@ fn parse_remote_path_maps(value: Option<OsString>) -> Result<Vec<(PathBuf, PathB
     let value = value
         .into_string()
         .map_err(|_| LauncherError::NonUtf8RemotePathMaps { code: 2 })?;
-    let mappings: Vec<[String; 2]> =
-        serde_json::from_str(&value).map_err(|source| LauncherError::InvalidRemotePathMapsJson {
-            source,
-            code: 2,
-        })?;
+    let mappings: Vec<[String; 2]> = serde_json::from_str(&value)
+        .map_err(|source| LauncherError::InvalidRemotePathMapsJson { source, code: 2 })?;
 
     mappings
         .into_iter()
@@ -478,7 +475,11 @@ pub fn tmux_session_name(tool: &str, repo_root: Option<&Path>, cwd: &Path) -> St
         }
     }
     let sanitized = sanitized.trim_start_matches(['-', '_']);
-    let project = if sanitized.is_empty() { "root" } else { sanitized };
+    let project = if sanitized.is_empty() {
+        "root"
+    } else {
+        sanitized
+    };
     format!("{tool}-{project}")
 }
 
@@ -1005,10 +1006,7 @@ fn normalize_hyper_fork_args(args: &[OsString]) -> (Vec<OsString>, bool, bool) {
             worktree = true;
             normalized.push(arg.clone());
         } else {
-            if arg == "-p"
-                || arg == "--single"
-                || arg == "--prompt-file"
-                || arg == "--prompt-json"
+            if arg == "-p" || arg == "--single" || arg == "--prompt-file" || arg == "--prompt-json"
             {
                 headless = true;
             }
@@ -1042,32 +1040,76 @@ fn latest_grok_session(
     kind: LauncherKind,
 ) -> Result<Option<OsString>> {
     let root = grok_session_root(home, repo_root, kind)?;
-    let mut latest: Option<(SystemTime, OsString)> = None;
+    let mut latest: Option<(DateTime<FixedOffset>, OsString)> = None;
     let Ok(entries) = fs::read_dir(root) else {
         return Ok(None);
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() || !is_uuid(entry.file_name().as_os_str()) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() || !is_uuid(entry.file_name().as_os_str())
+        {
             continue;
         }
         let summary = path.join("summary.json");
-        let Ok(modified) = summary.metadata().and_then(|metadata| metadata.modified()) else {
+        let Ok(metadata) = fs::symlink_metadata(&summary) else {
             continue;
         };
-        if latest.as_ref().is_none_or(|(time, _)| modified > *time) {
-            latest = Some((modified, entry.file_name()));
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(mut file) = File::open(&summary) else {
+            continue;
+        };
+        let mut contents = String::new();
+        if file.read_to_string(&mut contents).is_err() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&contents) else {
+            continue;
+        };
+        if value.get("hidden").and_then(Value::as_bool) == Some(true)
+            || value
+                .get("session_kind")
+                .and_then(Value::as_str)
+                .is_some_and(|session_kind| session_kind.starts_with("subagent"))
+        {
+            continue;
+        }
+        let Some(timestamp) = value
+            .get("last_active_at")
+            .and_then(Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .or_else(|| {
+                value
+                    .get("updated_at")
+                    .and_then(Value::as_str)
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            })
+        else {
+            continue;
+        };
+        if latest.as_ref().is_none_or(|(current, id)| {
+            timestamp > *current
+                || (timestamp == *current
+                    && entry.file_name().to_string_lossy() < id.to_string_lossy())
+        }) {
+            latest = Some((timestamp, entry.file_name()));
         }
     }
     Ok(latest.map(|(_, id)| id))
 }
 
 fn grok_session_root(home: &Path, repo_root: &Path, kind: LauncherKind) -> Result<PathBuf> {
-    let text = repo_root.to_str().ok_or_else(|| LauncherError::NonUtf8Path {
-        launcher: kind.as_str(),
-        path: repo_root.to_owned(),
-        code: 1,
-    })?;
+    let text = repo_root
+        .to_str()
+        .ok_or_else(|| LauncherError::NonUtf8Path {
+            launcher: kind.as_str(),
+            path: repo_root.to_owned(),
+            code: 1,
+        })?;
     let base = if kind == LauncherKind::Hyper {
         env::var_os("GROK_HOME")
             .filter(|value| !value.is_empty())
@@ -1087,14 +1129,14 @@ fn latest_required_droid(home: &Path, repo_root: Option<&Path>) -> Result<OsStri
         cwd: PathBuf::from("."),
         code: 1,
     })?;
-    let text = repo_root.to_str().ok_or_else(|| LauncherError::NonUtf8Path {
-        launcher: LauncherKind::Droid.as_str(),
-        path: repo_root.to_owned(),
-        code: 1,
-    })?;
-    let root = home
-        .join(".factory/sessions")
-        .join(text.replace('/', "-"));
+    let text = repo_root
+        .to_str()
+        .ok_or_else(|| LauncherError::NonUtf8Path {
+            launcher: LauncherKind::Droid.as_str(),
+            path: repo_root.to_owned(),
+            code: 1,
+        })?;
+    let root = home.join(".factory/sessions").join(text.replace('/', "-"));
     let mut latest: Option<(SystemTime, OsString)> = None;
     let Ok(entries) = fs::read_dir(&root) else {
         return Err(LauncherError::NoSession {
@@ -1121,13 +1163,11 @@ fn latest_required_droid(home: &Path, repo_root: Option<&Path>) -> Result<OsStri
             latest = Some((modified, stem.to_owned()));
         }
     }
-    latest
-        .map(|(_, id)| id)
-        .ok_or(LauncherError::NoSession {
-            launcher: LauncherKind::Droid.as_str(),
-            root,
-            code: 1,
-        })
+    latest.map(|(_, id)| id).ok_or(LauncherError::NoSession {
+        launcher: LauncherKind::Droid.as_str(),
+        root,
+        code: 1,
+    })
 }
 
 fn latest_jsonl(root: &Path, recursive: bool) -> Option<PathBuf> {
@@ -1157,7 +1197,10 @@ fn latest_jsonl(root: &Path, recursive: bool) -> Option<PathBuf> {
 
 fn read_pi_session_id(path: &Path) -> Option<OsString> {
     let file = File::open(path).ok()?;
-    for line in BufReader::new(file).lines().map_while(std::result::Result::ok) {
+    for line in BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+    {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -1167,7 +1210,11 @@ fn read_pi_session_id(path: &Path) -> Option<OsString> {
         if object.get("type").is_some_and(|kind| kind != "session") {
             continue;
         }
-        if let Some(id) = object.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+        if let Some(id) = object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
             return Some(os(id));
         }
     }
@@ -1185,16 +1232,20 @@ fn find_repo_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 fn worktree_path(repo: &Path, name: &OsStr, kind: LauncherKind) -> Result<PathBuf> {
-    let parent = repo.parent().ok_or_else(|| LauncherError::NotGitRepository {
-        launcher: kind.as_str(),
-        cwd: repo.to_owned(),
-        code: 1,
-    })?;
-    let repo_name = repo.file_name().ok_or_else(|| LauncherError::NotGitRepository {
-        launcher: kind.as_str(),
-        cwd: repo.to_owned(),
-        code: 1,
-    })?;
+    let parent = repo
+        .parent()
+        .ok_or_else(|| LauncherError::NotGitRepository {
+            launcher: kind.as_str(),
+            cwd: repo.to_owned(),
+            code: 1,
+        })?;
+    let repo_name = repo
+        .file_name()
+        .ok_or_else(|| LauncherError::NotGitRepository {
+            launcher: kind.as_str(),
+            cwd: repo.to_owned(),
+            code: 1,
+        })?;
     let mut worktree_name = repo_name.to_owned();
     worktree_name.push("-");
     worktree_name.push(name);
@@ -1344,7 +1395,14 @@ pub fn execute_plan(plan: &LaunchPlan) -> Result<i32> {
             worktree,
             launcher,
             argv,
-        } => execute_remote(host, repo_root, workdir, worktree.as_deref(), *launcher, argv),
+        } => execute_remote(
+            host,
+            repo_root,
+            workdir,
+            worktree.as_deref(),
+            *launcher,
+            argv,
+        ),
     }
 }
 
@@ -1375,11 +1433,7 @@ fn execute_code_with_stderr(spec: &CommandSpec, stderr: Stdio) -> Result<i32> {
     Ok(exit_status_code(status))
 }
 
-fn execute_tmux(
-    session: &str,
-    spec: &CommandSpec,
-    fallback: Option<&CommandSpec>,
-) -> Result<i32> {
+fn execute_tmux(session: &str, spec: &CommandSpec, fallback: Option<&CommandSpec>) -> Result<i32> {
     crate::tmux::run_exact_fallback(session, spec, fallback).map_err(|error| {
         LauncherError::Execute {
             program: os("al tmux-run"),
@@ -1467,8 +1521,11 @@ fn execute_remote_worktree(
     }
 }
 
-
-fn remote_command_string(workdir: &Path, argv: &[OsString], interactive_fish: bool) -> Result<String> {
+fn remote_command_string(
+    workdir: &Path,
+    argv: &[OsString],
+    interactive_fish: bool,
+) -> Result<String> {
     let mut agent = String::from("cd ");
     agent.push_str(&posix_quote(workdir.as_os_str(), "remote", workdir)?);
     agent.push_str("; and");
@@ -1479,7 +1536,10 @@ fn remote_command_string(workdir: &Path, argv: &[OsString], interactive_fish: bo
     if interactive_fish {
         agent.push_str("; set -l __al_status $status; if test $__al_status -eq 0; exec fish -li; else exit $__al_status; end");
     }
-    Ok(format!("fish -lic {}", posix_quote(OsStr::new(&agent), "remote", workdir)?))
+    Ok(format!(
+        "fish -lic {}",
+        posix_quote(OsStr::new(&agent), "remote", workdir)?
+    ))
 }
 
 fn posix_quote(value: &OsStr, launcher: &'static str, path: &Path) -> Result<String> {
@@ -1519,11 +1579,7 @@ fn exit_status_code(status: ExitStatus) -> i32 {
     }
 }
 
-
-fn command(
-    program: impl Into<OsString>,
-    args: impl IntoIterator<Item = OsString>,
-) -> CommandSpec {
+fn command(program: impl Into<OsString>, args: impl IntoIterator<Item = OsString>) -> CommandSpec {
     CommandSpec::new(program, args.into_iter().collect())
 }
 
@@ -1593,10 +1649,7 @@ mod tests {
             let executable = target.as_str();
             assert_eq!(
                 native_fork(target, path, "sid", home),
-                command(
-                    executable,
-                    strings(&["--fork-session", "--resume", "sid"]),
-                )
+                command(executable, strings(&["--fork-session", "--resume", "sid"]),)
             );
         }
         assert_eq!(
@@ -1659,15 +1712,40 @@ mod tests {
     }
 
     #[test]
+    fn latest_grok_session_uses_native_summary_time() {
+        let home = TempDir::new().unwrap();
+        let repo = home.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let root = grok_session_root(home.path(), &repo, LauncherKind::Grok).unwrap();
+        let older_id = "11111111-1111-4111-8111-111111111111";
+        let newer_id = "22222222-2222-4222-8222-222222222222";
+        for (id, updated, active) in [
+            (older_id, "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"),
+            (newer_id, "2026-01-04T00:00:00Z", "2026-01-01T00:00:00Z"),
+        ] {
+            let directory = root.join(id);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("summary.json"),
+                serde_json::json!({
+                    "info": {"id": id, "cwd": repo.to_string_lossy()},
+                    "updated_at": updated,
+                    "last_active_at": active,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            latest_grok_session(home.path(), &repo, LauncherKind::Grok).unwrap(),
+            Some(os(older_id))
+        );
+    }
+
+    #[test]
     fn codex_has_exact_default_flags() {
         let command = assert_command(
-            build_launcher(
-                LauncherKind::Codex,
-                &[],
-                &test_home(),
-                Path::new("/tmp"),
-            )
-            .unwrap(),
+            build_launcher(LauncherKind::Codex, &[], &test_home(), Path::new("/tmp")).unwrap(),
         );
         assert_eq!(
             command.args,
@@ -1689,13 +1767,7 @@ mod tests {
         let home = test_home();
         let settings = home.join(".factory").join("settings.json");
         let command = assert_command(
-            build_launcher(
-                LauncherKind::Droid,
-                &[],
-                &home,
-                Path::new("/tmp"),
-            )
-            .unwrap(),
+            build_launcher(LauncherKind::Droid, &[], &home, Path::new("/tmp")).unwrap(),
         );
         assert_eq!(
             command.args,
@@ -1711,13 +1783,8 @@ mod tests {
 
     #[test]
     fn cclo_default_is_continue_then_permission_default_fallback() {
-        let plan = build_launcher(
-            LauncherKind::Claude,
-            &[],
-            &test_home(),
-            Path::new("/tmp"),
-        )
-        .unwrap();
+        let plan =
+            build_launcher(LauncherKind::Claude, &[], &test_home(), Path::new("/tmp")).unwrap();
         let LaunchPlan::Fallback { primary, fallback } = plan else {
             panic!("expected fallback plan");
         };
@@ -1725,10 +1792,7 @@ mod tests {
             primary.args,
             strings(&["--dangerously-skip-permissions", "-c"])
         );
-        assert_eq!(
-            fallback.args,
-            strings(&["--dangerously-skip-permissions"])
-        );
+        assert_eq!(fallback.args, strings(&["--dangerously-skip-permissions"]));
     }
 
     #[test]
@@ -1802,9 +1866,7 @@ mod tests {
         )
         .unwrap();
         let LaunchPlan::Tmux {
-            command,
-            fallback,
-            ..
+            command, fallback, ..
         } = plan
         else {
             panic!("expected tmux plan");
@@ -1897,13 +1959,8 @@ mod tests {
             LauncherKind::Codex,
             LauncherKind::Claude,
         ] {
-            let error = build_launcher(
-                kind,
-                &[os("--host=")],
-                &test_home(),
-                Path::new("/tmp"),
-            )
-            .unwrap_err();
+            let error = build_launcher(kind, &[os("--host=")], &test_home(), Path::new("/tmp"))
+                .unwrap_err();
             assert_eq!(error.exit_code(), 2, "{kind:?}: empty --host= exits 2");
         }
     }
@@ -1932,7 +1989,11 @@ mod tests {
     #[test]
     fn tmux_session_name_matches_fish_sanitization() {
         assert_eq!(
-            tmux_session_name("omlo", Some(Path::new("/work/--my.project:one")), Path::new("/")),
+            tmux_session_name(
+                "omlo",
+                Some(Path::new("/work/--my.project:one")),
+                Path::new("/")
+            ),
             "omlo-my_project_one"
         );
         assert_eq!(tmux_session_name("pilo", None, Path::new("/")), "pilo-root");
@@ -2077,10 +2138,9 @@ mod tests {
 
     #[test]
     fn configured_darwin_mapping_is_component_aware() {
-        let mappings = parse_remote_path_maps(Some(os(
-            r#"[["/Volumes/workspace","/srv/workspace"]]"#,
-        )))
-        .unwrap();
+        let mappings =
+            parse_remote_path_maps(Some(os(r#"[["/Volumes/workspace","/srv/workspace"]]"#)))
+                .unwrap();
         let user = OsStr::new("alice");
         assert_eq!(
             darwin_remote_path_with_mappings(
@@ -2104,7 +2164,11 @@ mod tests {
     fn remote_path_maps_reject_malformed_json() {
         let error = parse_remote_path_maps(Some(os("not-json"))).unwrap_err();
         assert_eq!(error.exit_code(), 2);
-        assert!(error.to_string().contains("invalid AL_REMOTE_PATH_MAPS JSON"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid AL_REMOTE_PATH_MAPS JSON")
+        );
     }
 
     #[test]
@@ -2135,7 +2199,7 @@ mod tests {
             let error = validate_worktree_name(OsStr::new(name)).unwrap_err();
             assert_eq!(error.exit_code(), 2);
         }
-        validate_worktree_name(OsStr::new("feature.one" )).unwrap();
+        validate_worktree_name(OsStr::new("feature.one")).unwrap();
     }
 
     #[test]
@@ -2143,7 +2207,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let directory = temp.path().join("project");
         fs::create_dir(&directory).unwrap();
-        assert_eq!(local_recorded_cwd(&directory), Some(directory.canonicalize().unwrap()));
+        assert_eq!(
+            local_recorded_cwd(&directory),
+            Some(directory.canonicalize().unwrap())
+        );
         assert_eq!(local_recorded_cwd(&temp.path().join("missing")), None);
         assert_eq!(local_recorded_cwd(Path::new("")), None);
     }
@@ -2181,10 +2248,10 @@ mod tests {
         assert_eq!(host, "host-b");
         assert_eq!(
             workdir,
-            temp.path()
-                .parent()
-                .unwrap()
-                .join(format!("{}-feature", temp.path().file_name().unwrap().to_string_lossy()))
+            temp.path().parent().unwrap().join(format!(
+                "{}-feature",
+                temp.path().file_name().unwrap().to_string_lossy()
+            ))
         );
         assert_eq!(
             argv,
@@ -2257,7 +2324,10 @@ mod tests {
             panic!("expected remote plan, got {plan:?}");
         };
         assert_eq!(host, "host-a");
-        assert_eq!(argv, strings(&["al", "omlo", "--", "--host", "host-shadow"]));
+        assert_eq!(
+            argv,
+            strings(&["al", "omlo", "--", "--host", "host-shadow"])
+        );
     }
 
     #[test]
@@ -2277,10 +2347,7 @@ mod tests {
         let LaunchPlan::Remote { argv, .. } = plan else {
             panic!("expected remote plan, got {plan:?}");
         };
-        assert_eq!(
-            argv,
-            strings(&["al", "omlo", "--session", "sid", "prompt"])
-        );
+        assert_eq!(argv, strings(&["al", "omlo", "--session", "sid", "prompt"]));
         assert!(!argv.iter().any(|arg| arg == "--"));
     }
 
@@ -2298,25 +2365,17 @@ mod tests {
         let mut argv = strings(&["--host", "host-a", "--"]);
         argv.push(non_utf8.to_owned());
 
-        let plan = build_launcher(
-            LauncherKind::Omp,
-            &argv,
-            &test_home(),
-            temp.path(),
-        )
-        .unwrap();
+        let plan = build_launcher(LauncherKind::Omp, &argv, &test_home(), temp.path()).unwrap();
         let LaunchPlan::Remote {
             argv: remote_argv, ..
-        } = plan else {
+        } = plan
+        else {
             panic!("expected remote plan, got {plan:?}");
         };
         assert_eq!(remote_argv.len(), 4);
         assert_eq!(remote_argv[0], os("al"));
         assert_eq!(remote_argv[1], os("omlo"));
         assert_eq!(remote_argv[2], os("--"));
-        assert_eq!(
-            OsStr::new(&remote_argv[3]).as_bytes(),
-            non_utf8.as_bytes()
-        );
+        assert_eq!(OsStr::new(&remote_argv[3]).as_bytes(), non_utf8.as_bytes());
     }
 }

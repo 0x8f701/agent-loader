@@ -1,29 +1,20 @@
 //! Pi session adapter.
 //!
-//! Pi (and OMP) stores a session as an append-only JSONL tree. The first
-//! record is a `session` header (`{type:"session", id, cwd, timestamp, …}`);
-//! every subsequent record is an entry (`{type, id, parentId, timestamp, …}`)
-//! forming a tree via `parentId`. The file holds every branch ever appended;
-//! the active branch is the last-appended non-header entry and its ancestor
-//! chain. Only `user`/`assistant` messages along that chain are projected.
-//!
-//! Parsing follows the native load contract: the first logical line (the
-//! first valid JSON object) MUST be a `session` header with a string id; a
-//! nonempty, headerless file is unloadable and rejected (returned as `Err`)
-//! so the catalog skips it. An empty file is tolerated with filename/parent
-//! fallbacks so a freshly created (not-yet-flushed) session still resolves.
-//! Parsing is otherwise intentionally lossy: malformed JSONL lines are skipped,
-//! unrecognized entry roles are dropped, and only the active branch's
-//! `user`/`assistant` first text is projected.
+//! Pi stores a session as an append-only JSONL tree. The first record is a
+//! `session` header; subsequent entries form branches through `id`/`parentId`.
+//! Native v1 records are migrated to a linear tree before the active branch is
+//! resolved. The latest compaction replaces older context, while recognized
+//! message, custom-message, and branch-summary entries feed the intentionally
+//! lossy user/assistant projection.
 
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value};
 
 use crate::domain::{Message, Session, SourceTool};
-use crate::formats::{read_jsonl_values, summarize_messages, tree};
 use crate::formats::tree::TreeNode;
+use crate::formats::{read_jsonl_values, summarize_messages, tree};
 
 /// Parse a Pi/OMP session export into a lossy `Session`.
 ///
@@ -43,7 +34,7 @@ pub fn parse(path: &Path) -> Result<Session> {
         return Ok(empty_session(path, modified_epoch));
     }
 
-    let values = read_jsonl_values(path)?;
+    let mut values = read_jsonl_values(path)?;
 
     // Native contract: the first logical line (first valid JSON object) must
     // be a `session` header carrying a non-empty string id. A nonempty,
@@ -51,7 +42,7 @@ pub fn parse(path: &Path) -> Result<Session> {
     // no valid JSON object exists — is unloadable and rejected so the catalog
     // skips it. `values.first()` is used (not indexing) so an all-malformed
     // file yields `None` here rather than panicking.
-    let (header_object, session_id) = values
+    let (session_id, raw_cwd, raw_timestamp) = values
         .first()
         .and_then(Value::as_object)
         .filter(|object| object.get("type").and_then(Value::as_str) == Some("session"))
@@ -60,7 +51,21 @@ pub fn parse(path: &Path) -> Result<Session> {
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
-                .map(|id| (object, id))
+                .map(|id| {
+                    (
+                        id.to_owned(),
+                        object
+                            .get("cwd")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        object
+                            .get("timestamp")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                    )
+                })
         })
         .ok_or_else(|| {
             anyhow!(
@@ -69,19 +74,8 @@ pub fn parse(path: &Path) -> Result<Session> {
             )
         })?;
 
-    let raw_cwd = header_object
-        .get("cwd")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let raw_timestamp = header_object
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    migrate_legacy_entries(&mut values);
 
-    // Remaining records form the append-only entry tree. Every entry type
-    // (message, model_change, compaction, …) participates via id/parentId;
-    // only `message`-type entries carry a conversation payload nested under
-    // `message`, so the rest shape the tree without emitting a message.
     let mut nodes: Vec<TreeNode<'_>> = Vec::with_capacity(values.len().saturating_sub(1));
     for record in &values[1..] {
         let Some(object) = record.as_object() else {
@@ -90,17 +84,22 @@ pub fn parse(path: &Path) -> Result<Session> {
         let id = object.get("id").and_then(Value::as_str).unwrap_or("");
         let parent_id = object.get("parentId").and_then(Value::as_str);
         let entry_timestamp = object.get("timestamp").and_then(Value::as_str);
+        let entry_type = object.get("type").and_then(Value::as_str);
         let (role, content) = message_payload(object);
         nodes.push(TreeNode {
             id,
             parent_id: parent_id.filter(|value| !value.is_empty()),
+            entry_type,
             role,
-            content,
+            content: content.or_else(|| object.get("content")),
             timestamp: entry_timestamp,
+            summary: object.get("summary").and_then(Value::as_str),
+            short_summary: None,
+            first_kept_entry_id: object.get("firstKeptEntryId").and_then(Value::as_str),
         });
     }
 
-    let messages: Vec<Message> = tree::project_messages(&tree::active_path(&nodes));
+    let messages: Vec<Message> = tree::project_native_messages(&tree::active_path(&nodes));
     let summary = summarize_messages(&messages);
 
     // The header's cwd is used verbatim — even when empty (ancient v1 files) —
@@ -108,12 +107,12 @@ pub fn parse(path: &Path) -> Result<Session> {
     // below falls back to the parent directory.
     Ok(Session {
         tool: SourceTool::Pi,
-        session_id: session_id.to_owned(),
+        session_id,
         cwd: PathBuf::from(raw_cwd),
         start_timestamp: if raw_timestamp.is_empty() {
             None
         } else {
-            Some(raw_timestamp.to_owned())
+            Some(raw_timestamp)
         },
         summary,
         messages,
@@ -203,6 +202,62 @@ fn replace_separators(value: &std::ffi::OsStr) -> String {
         .collect()
 }
 
+pub(crate) fn migrate_legacy_entries(values: &mut [Value]) {
+    let version = values
+        .first()
+        .and_then(Value::as_object)
+        .and_then(|header| header.get("version"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    if version < 2 {
+        let record_count = values.len();
+        let mut previous_id: Option<String> = None;
+        for (index, record) in values.iter_mut().enumerate().skip(1) {
+            let Some(object) = record.as_object_mut() else {
+                continue;
+            };
+            let id = format!("legacy-{index}");
+            object.insert("id".to_owned(), Value::String(id.clone()));
+            object.insert(
+                "parentId".to_owned(),
+                previous_id
+                    .as_ref()
+                    .map_or(Value::Null, |parent| Value::String(parent.clone())),
+            );
+            if object.get("type").and_then(Value::as_str) == Some("compaction") {
+                if let Some(first_kept_index) = object
+                    .remove("firstKeptEntryIndex")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    if first_kept_index > 0 && first_kept_index < record_count {
+                        object.insert(
+                            "firstKeptEntryId".to_owned(),
+                            Value::String(format!("legacy-{first_kept_index}")),
+                        );
+                    }
+                }
+            }
+            previous_id = Some(id);
+        }
+    }
+    if version < 3 {
+        for record in values.iter_mut().skip(1) {
+            let Some(message) = record
+                .as_object_mut()
+                .filter(|object| object.get("type").and_then(Value::as_str) == Some("message"))
+                .and_then(|object| object.get_mut("message"))
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            if message.get("role").and_then(Value::as_str) == Some("hookMessage") {
+                message.insert("role".to_owned(), Value::String("custom".to_owned()));
+            }
+        }
+    }
+}
+
 /// Extract the conversation payload from a `message`-type entry.
 ///
 /// The role/content live nested under a `message` object; other entry types
@@ -280,8 +335,8 @@ fn file_mtime(path: &Path) -> Option<f64> {
 /// loadable), not as an empty-file fallback.
 fn is_logically_empty(path: &Path) -> Result<bool> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("opening session {}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening session {}", path.display()))?;
     let mut buffer = [0u8; 8192];
     loop {
         let read = file
@@ -317,8 +372,7 @@ mod tests {
         file
     }
 
-    const HEADER: &str =
-        r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#;
+    const HEADER: &str = r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#;
 
     fn msg(id: &str, parent_id: Option<&str>, role: &str, content: &str) -> String {
         let parent = match parent_id {
@@ -335,7 +389,12 @@ mod tests {
         let file = write_session(&[
             HEADER,
             &msg("a", None, "user", r#""hi""#),
-            &msg("b", Some("a"), "assistant", r#"[{"type":"text","text":"hello"}]"#),
+            &msg(
+                "b",
+                Some("a"),
+                "assistant",
+                r#"[{"type":"text","text":"hello"}]"#,
+            ),
         ]);
         let session = parse(file.path()).expect("parse");
         assert_eq!(session.tool, SourceTool::Pi);
@@ -483,7 +542,12 @@ mod tests {
             HEADER,
             &msg("a", None, "user", r#""branch-a""#),
             &msg("b", None, "user", r#""branch-b""#),
-            &msg("c", Some("b"), "assistant", r#"[{"type":"text","text":"c"}]"#),
+            &msg(
+                "c",
+                Some("b"),
+                "assistant",
+                r#"[{"type":"text","text":"c"}]"#,
+            ),
         ]);
         let session = parse(file.path()).expect("parse");
         let texts: Vec<&str> = session.messages.iter().map(|m| m.text.as_str()).collect();
@@ -497,8 +561,18 @@ mod tests {
         let file = write_session(&[
             HEADER,
             &msg("m1", None, "user", r#""q""#),
-            &msg("m2", Some("m1"), "assistant", r#"[{"type":"text","text":"ans"}]"#),
-            &msg("m3", Some("m2"), "toolResult", r#"[{"type":"text","text":"tool"}]"#),
+            &msg(
+                "m2",
+                Some("m1"),
+                "assistant",
+                r#"[{"type":"text","text":"ans"}]"#,
+            ),
+            &msg(
+                "m3",
+                Some("m2"),
+                "toolResult",
+                r#"[{"type":"text","text":"tool"}]"#,
+            ),
             &msg("m4", Some("m3"), "custom", r#""custom""#),
             &msg("m5", Some("m4"), "developer", r#""dev""#),
         ]);
@@ -519,7 +593,12 @@ mod tests {
             &msg("m1", None, "user", r#""hi""#),
             r#"{"type":"model_change","id":"c1","parentId":"m1","timestamp":"2026-01-01T00:00:02.000Z","provider":"local","modelId":"x"}"#,
             r#"{"type":"thinking_level_change","id":"c2","parentId":"c1","timestamp":"2026-01-01T00:00:03.000Z","thinkingLevel":"off"}"#,
-            &msg("m2", Some("c2"), "assistant", r#"[{"type":"text","text":"hey"}]"#),
+            &msg(
+                "m2",
+                Some("c2"),
+                "assistant",
+                r#"[{"type":"text","text":"hey"}]"#,
+            ),
         ]);
         let session = parse(file.path()).expect("parse");
         let texts: Vec<&str> = session.messages.iter().map(|m| m.text.as_str()).collect();
@@ -527,8 +606,55 @@ mod tests {
     }
 
     #[test]
+    fn version_one_entries_are_migrated_to_linear_tree() {
+        let file = write_session(&[
+            r#"{"type":"session","id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+            r#"{"type":"message","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"message","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["hi", "hello"]);
+    }
+
+    #[test]
+    fn compaction_drops_messages_before_first_kept_entry() {
+        let file = write_session(&[
+            HEADER,
+            &msg("a", None, "user", r#""old""#),
+            &msg(
+                "b",
+                Some("a"),
+                "assistant",
+                r#"[{"type":"text","text":"kept"}]"#,
+            ),
+            r#"{"type":"compaction","id":"c","parentId":"b","timestamp":"2026-01-01T00:00:03.000Z","summary":"prior context","firstKeptEntryId":"b","tokensBefore":100}"#,
+            &msg(
+                "d",
+                Some("c"),
+                "assistant",
+                r#"[{"type":"text","text":"done"}]"#,
+            ),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["kept", "done"]);
+    }
+
+    #[test]
     fn encode_cwd_matches_real_pi_directory_names() {
-        assert_eq!(encode_cwd(Path::new("/workspace/user")).unwrap(), "--workspace-user--");
+        assert_eq!(
+            encode_cwd(Path::new("/workspace/user")).unwrap(),
+            "--workspace-user--"
+        );
         assert_eq!(
             encode_cwd(Path::new("/workspace/user/Projects/dotfiles")).unwrap(),
             "--workspace-user-Projects-dotfiles--"
@@ -540,7 +666,10 @@ mod tests {
             "--workspace-user-Projects-llama.cpp--"
         );
         assert_eq!(
-            encode_cwd(Path::new("/workspace/user/Projects/parth-generic-v1/client_prover")).unwrap(),
+            encode_cwd(Path::new(
+                "/workspace/user/Projects/parth-generic-v1/client_prover"
+            ))
+            .unwrap(),
             "--workspace-user-Projects-parth-generic-v1-client_prover--"
         );
         assert_eq!(encode_cwd(Path::new("/tmp")).unwrap(), "--tmp--");

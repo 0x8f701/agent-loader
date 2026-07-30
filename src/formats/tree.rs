@@ -9,10 +9,8 @@
 //!
 //! Resolution is defensive: a cycle in the chain is guarded so the walk
 //! terminates, and a parent id that is absent from the entry set truncates the
-//! path to the reachable suffix. Projection is lossy — only recognized
-//! `user`/`assistant` first text survives, via the shared `parsed_message`
-//! helper, so non-message entries (model/thinking changes, compactions, …)
-//! shape the tree without emitting a message.
+//! path to the adapter-specific projector. This module resolves graph shape;
+//! Pi/OMP adapters apply compaction and supported entry semantics afterward.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,18 +19,18 @@ use serde_json::Value;
 use crate::domain::Message;
 use crate::formats::parsed_message;
 
-/// One non-header entry projected for tree resolution and message projection.
-///
-/// `role`/`content`/`timestamp` are extracted up front by the adapter. Only
-/// entries yielding a recognized `Role` survive projection, so non-message
-/// entries simply contribute to the tree shape without emitting a message.
+/// One non-header entry used for tree resolution and adapter projection.
 #[derive(Debug, Clone, Copy)]
 pub struct TreeNode<'a> {
     pub id: &'a str,
     pub parent_id: Option<&'a str>,
+    pub entry_type: Option<&'a str>,
     pub role: Option<&'a str>,
     pub content: Option<&'a Value>,
     pub timestamp: Option<&'a str>,
+    pub summary: Option<&'a str>,
+    pub short_summary: Option<&'a str>,
+    pub first_kept_entry_id: Option<&'a str>,
 }
 
 /// Resolve the active branch as an ordered slice of nodes, root → leaf.
@@ -85,6 +83,28 @@ pub fn project_messages<'a>(path: &[&'a TreeNode<'a>]) -> Vec<Message> {
         .collect()
 }
 
+/// Project a native Pi/OMP active path, honoring the latest compaction and
+/// extension-injected conversation entries before applying the lossy contract.
+pub fn project_native_messages<'a>(path: &[&'a TreeNode<'a>]) -> Vec<Message> {
+    let Some((index, compaction)) = path
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, node)| node.entry_type == Some("compaction"))
+    else {
+        return project_messages(path);
+    };
+    let start = compaction
+        .first_kept_entry_id
+        .and_then(|id| path[..index].iter().position(|node| node.id == id))
+        .unwrap_or(index);
+    path[start..index]
+        .iter()
+        .chain(path[index + 1..].iter())
+        .filter_map(|node| parsed_message(node.role, node.content, node.timestamp))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -101,9 +121,13 @@ mod tests {
         TreeNode {
             id,
             parent_id,
+            entry_type: role.map(|_| "message"),
             role,
             content,
             timestamp,
+            summary: None,
+            short_summary: None,
+            first_kept_entry_id: None,
         }
     }
 
@@ -195,7 +219,13 @@ mod tests {
         // Leaf `c` points at a parent `ghost` absent from the entry set; the
         // path is the single reachable node `c`.
         let cc = json!([{"type": "text", "text": "c"}]);
-        let nodes = [node("c", Some("ghost"), Some("user"), Some(&cc), Some("t1"))];
+        let nodes = [node(
+            "c",
+            Some("ghost"),
+            Some("user"),
+            Some(&cc),
+            Some("t1"),
+        )];
         let path = active_path(&nodes);
         assert_eq!(ids(&path), ["c"]);
     }
@@ -269,6 +299,36 @@ mod tests {
         let messages = project_messages(&path);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text, "plain string content");
+    }
+
+    #[test]
+    fn native_projection_drops_pre_compaction_messages() {
+        let old = json!("old");
+        let kept = json!([{"type": "text", "text": "kept"}]);
+        let final_answer = json!([{"type": "text", "text": "done"}]);
+        let mut nodes = [
+            node("u0", None, Some("user"), Some(&old), Some("t0")),
+            node("a1", Some("u0"), Some("assistant"), Some(&kept), Some("t1")),
+            node("c1", Some("a1"), None, None, Some("t2")),
+            node(
+                "a2",
+                Some("c1"),
+                Some("assistant"),
+                Some(&final_answer),
+                Some("t3"),
+            ),
+        ];
+        nodes[2].entry_type = Some("compaction");
+        nodes[2].first_kept_entry_id = Some("a1");
+        let path = active_path(&nodes);
+        let messages = project_native_messages(&path);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            ["kept", "done"]
+        );
     }
 
     #[test]

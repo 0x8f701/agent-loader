@@ -140,14 +140,21 @@ fn collect_jsonl(root: &Path, output: &mut Vec<PathBuf>) {
 }
 
 fn first_json_id(path: &Path, pointer: &str) -> String {
+    // OMP files begin with a native title-slot record (no `id`); scan for the
+    // first line whose JSON object exposes the requested pointer.
     let contents = fs::read_to_string(path).unwrap();
-    let first = contents.lines().next().unwrap();
-    let value: Value = serde_json::from_str(first).unwrap();
-    value
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .unwrap()
-        .to_owned()
+    for line in contents.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(id) = value.pointer(pointer).and_then(Value::as_str) {
+            return id.to_owned();
+        }
+    }
+    panic!("no record with pointer {pointer} in {}", path.display());
 }
 
 fn write_omp_fixture(home: &Path, id: &str, legacy: bool) -> PathBuf {

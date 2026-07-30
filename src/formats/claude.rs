@@ -1,37 +1,23 @@
 //! Claude Code session adapter.
 //!
-//! Claude stores a session as an append-only JSONL log at
-//! `~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl`, one JSON object
-//! per line. Every line is a JSON object keyed by `type`. Graph records
-//! (`user`, `assistant`, `system`, `attachment`) carry a `uuid` and an
-//! optional `parentUuid` forming a lineage forest; auxiliary/state records
-//! (`last-prompt`, `mode`, `permission-mode`, `ai-title`,
-//! `file-history-snapshot`, `queue-operation`) carry no lineage edges.
-//!
-//! The active conversation path is reconstructed exactly as the reference
-//! implementation (`scripts/sessions`): the leaf is the most recent
-//! `last-prompt.leafUuid`, falling back to the last `user`/`assistant` record
-//! by file order; the chain is rebuilt by following `parentUuid` upward to
-//! the root with a cycle guard, then reversed to chronological order. UUID
-//! -bearing `system`/`attachment` nodes participate in the traversal as graph
-//! hops, but only non-sidechain, non-meta `user`/`assistant` first-text is
-//! projected.
-//!
-//! Parsing is typed and forward-compatible: known record types deserialize
-//! into strongly typed structs with extension maps for unknown envelope
-//! fields, and unknown record/attachment/block variants are retained
-//! verbatim alongside their typed view. Malformed JSONL lines are skipped
-//! without aborting the parse (delegated to the shared `read_jsonl_values`).
+//! Claude stores a session as an append-only JSONL graph at
+//! `~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl`. This adapter
+//! follows the native 2.1.220 loader's active-leaf, compaction, parent recovery,
+//! and parallel-response rules before projecting the intentionally lossy
+//! user/assistant text contract.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::domain::{Message, Session, SourceTool};
-use crate::formats::{normalize, parsed_message, read_jsonl_values, summarize_messages};
+use crate::domain::{Message, Role, Session, SourceTool};
+use crate::formats::{normalize, read_jsonl_values, summarize_messages};
+
+const PARENT_TIMESTAMP_FALLBACK_MS: i64 = 5_000;
 
 /// Parse a Claude Code session transcript into a lossy `Session`.
 pub fn parse(path: &Path) -> Result<Session> {
@@ -39,33 +25,26 @@ pub fn parse(path: &Path) -> Result<Session> {
     let modified_epoch = file_mtime(path);
     let records: Vec<Record> = values.iter().map(Record::from_value).collect();
 
-    // Metadata scan — mirrors `parse_claude` (`scripts/sessions`): session id
-    // and cwd default to filename/parent-dir and are overwritten by the last
-    // non-empty in-record value; the start timestamp is the first non-empty
-    // timestamp; the summary is the last record contributing any of
-    // `aiTitle`/`summary`/`title` (priority order within that record).
     let mut session_id = fallback_id(path);
     let mut cwd = fallback_cwd(path);
-    let mut start_timestamp: Option<String> = None;
     let mut summary: Option<String> = None;
     for record in &records {
-        if let Some(sid) = record.session_id() {
-            session_id = sid;
+        if let Some(value) = record.session_id() {
+            session_id = value;
         }
         if let Some(value) = record.cwd() {
             cwd = PathBuf::from(value);
-        }
-        if start_timestamp.is_none() {
-            if let Some(timestamp) = record.timestamp() {
-                start_timestamp = Some(timestamp);
-            }
         }
         if let Some(source) = record.summary_source() {
             summary = Some(normalize(&source, 100));
         }
     }
 
-    let messages = project_active_messages(&records);
+    let active_path = reconstruct_active_path(&records);
+    let start_timestamp = active_path
+        .first()
+        .and_then(|index| records[*index].timestamp());
+    let messages = project_messages(&records, &active_path);
     let summary = summary.unwrap_or_else(|| summarize_messages(&messages));
 
     Ok(Session {
@@ -80,74 +59,527 @@ pub fn parse(path: &Path) -> Result<Session> {
     })
 }
 
-/// Project the active lineage chain into first-text `Message`s.
-///
-/// The leaf is the most recent `last-prompt.leafUuid` resolvable to a graph
-/// node, else the last non-sidechain, non-meta `user`/`assistant` record by
-/// file order. The chain is walked upward via `parentUuid` (cycle-guarded),
-/// reversed to chronological order, then projected: sidechain/meta nodes and
-/// non-`user`/`assistant` payloads are dropped, leaving only the lossy
-/// first-text conversation.
-fn project_active_messages(records: &[Record]) -> Vec<Message> {
-    // Graph nodes indexed by uuid (last occurrence wins, matching the
-    // reference dict comprehension).
-    let mut by_uuid: HashMap<String, usize> = HashMap::new();
-    for (index, record) in records.iter().enumerate() {
-        if let Some(uuid) = record.uuid() {
-            by_uuid.insert(uuid, index);
+#[derive(Debug, Clone)]
+struct GraphNode {
+    record_index: usize,
+    parent_uuid: Option<String>,
+    is_sidechain: bool,
+    timestamp_ms: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct GraphIndex {
+    nodes: HashMap<String, GraphNode>,
+    order: Vec<String>,
+}
+
+impl GraphIndex {
+    fn from_records(records: &[Record]) -> Self {
+        let mut graph = Self::default();
+        for (record_index, record) in records.iter().enumerate() {
+            let Some(uuid) = record.uuid() else { continue };
+            if !graph.nodes.contains_key(&uuid) {
+                graph.order.push(uuid.clone());
+            }
+            graph.nodes.insert(
+                uuid,
+                GraphNode {
+                    record_index,
+                    parent_uuid: record.parent_uuid(),
+                    is_sidechain: record.is_sidechain(),
+                    timestamp_ms: record.timestamp().as_deref().and_then(parse_timestamp_ms),
+                },
+            );
         }
+        graph
     }
 
-    // Leaf = most recent `last-prompt.leafUuid`.
-    let leaf_uuid = records.iter().rev().find_map(|record| match &record.kind {
-        RecordKind::LastPrompt(last_prompt) => {
-            last_prompt.leaf_uuid.clone().filter(|value| !value.is_empty())
-        }
-        _ => None,
-    });
+    fn foreground(&self, uuid: &str) -> bool {
+        self.nodes.get(uuid).is_some_and(|node| !node.is_sidechain)
+    }
+}
 
-    // Fallback: last non-sidechain, non-meta user/assistant by file order.
-    // (The reference fallback does not filter, but sidechain/meta records must
-    // not anchor the resume chain — `filtered from /resume: isSidechain=true`.)
-    let leaf_uuid = match leaf_uuid {
-        Some(uuid) if by_uuid.contains_key(&uuid) => Some(uuid),
-        _ => records.iter().rev().find_map(|record| {
-            let is_message_record =
-                matches!(record.type_tag(), Some("user") | Some("assistant"));
-            if is_message_record && !record.is_sidechain() && !record.is_meta() {
-                record.uuid()
-            } else {
-                None
-            }
-        }),
+#[derive(Debug, Default)]
+struct LeafState {
+    preferred_uuid: Option<String>,
+    latest_foreground_uuid: Option<String>,
+    is_preferred_explicit: bool,
+    is_cleared: bool,
+}
+
+fn reconstruct_active_path(records: &[Record]) -> Vec<usize> {
+    let leaf_state = scan_leaf_state(records);
+    if leaf_state.is_cleared {
+        return Vec::new();
+    }
+
+    let mut graph = GraphIndex::from_records(records);
+    let compacted_tail = apply_latest_compaction(records, &mut graph);
+    let Some(leaf_uuid) = select_leaf(&leaf_state, compacted_tail, &graph) else {
+        return Vec::new();
     };
 
-    // Walk parentUuid upward to the root, cycle-guarded, then reverse.
-    let mut path_indices: Vec<usize> = Vec::new();
-    let mut visited: HashMap<String, ()> = HashMap::new();
-    let mut cursor = leaf_uuid;
+    let mut path = walk_parent_chain(records, &graph, &leaf_uuid);
+    recover_parallel_responses(records, &graph, &mut path);
+    append_non_message_descendants(records, &graph, &leaf_uuid, &mut path);
+    path
+}
+
+fn scan_leaf_state(records: &[Record]) -> LeafState {
+    let mut state = LeafState::default();
+    for record in records {
+        if let Some(uuid) = record.uuid().filter(|_| !record.is_sidechain()) {
+            state.latest_foreground_uuid = Some(uuid);
+            state.is_preferred_explicit = false;
+            state.is_cleared = false;
+        }
+        if record.type_tag() != Some("last-prompt") {
+            continue;
+        }
+        let explicit = record.raw_bool("explicit");
+        match record.raw.get("leafUuid") {
+            Some(Value::String(uuid)) if !uuid.is_empty() => {
+                state.is_preferred_explicit = explicit
+                    || (state.is_preferred_explicit
+                        && state.preferred_uuid.as_deref() == Some(uuid));
+                state.preferred_uuid = Some(uuid.clone());
+                state.is_cleared = false;
+            }
+            Some(Value::Null) if explicit => {
+                state.preferred_uuid = None;
+                state.is_preferred_explicit = false;
+                state.is_cleared = true;
+            }
+            _ => {}
+        }
+    }
+    state
+}
+
+fn select_leaf(
+    state: &LeafState,
+    compacted_tail: Option<String>,
+    graph: &GraphIndex,
+) -> Option<String> {
+    let preferred = state
+        .preferred_uuid
+        .as_ref()
+        .filter(|uuid| graph.foreground(uuid));
+    if state.is_preferred_explicit && preferred.is_some() {
+        return preferred.cloned();
+    }
+    if let Some(preferred) = preferred {
+        if let Some(latest) = state
+            .latest_foreground_uuid
+            .as_ref()
+            .filter(|uuid| graph.foreground(uuid))
+        {
+            if latest != preferred && is_descendant(graph, latest, preferred) {
+                return Some(latest.clone());
+            }
+        }
+        return Some(preferred.clone());
+    }
+    state
+        .latest_foreground_uuid
+        .as_ref()
+        .filter(|uuid| graph.foreground(uuid))
+        .cloned()
+        .or_else(|| compacted_tail.filter(|uuid| graph.foreground(uuid)))
+        .or_else(|| {
+            graph
+                .order
+                .iter()
+                .rev()
+                .find(|uuid| graph.foreground(uuid))
+                .cloned()
+        })
+}
+
+fn is_descendant(graph: &GraphIndex, descendant: &str, ancestor: &str) -> bool {
+    let mut cursor = Some(descendant);
+    let mut visited = HashSet::new();
     while let Some(uuid) = cursor {
-        let Some(&index) = by_uuid.get(&uuid) else { break };
-        if visited.insert(uuid.clone(), ()).is_some() {
+        if uuid == ancestor {
+            return true;
+        }
+        if !visited.insert(uuid.to_owned()) {
+            return false;
+        }
+        cursor = graph
+            .nodes
+            .get(uuid)
+            .and_then(|node| node.parent_uuid.as_deref());
+    }
+    false
+}
+
+#[derive(Debug)]
+struct PreservedMessages {
+    anchor_uuid: String,
+    uuids: Vec<String>,
+}
+
+fn apply_latest_compaction(records: &[Record], graph: &mut GraphIndex) -> Option<String> {
+    let (boundary_index, boundary) = records
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, record)| record.is_compact_boundary())?;
+    let preserved = compact_preserved_messages(boundary, graph).filter(|preserved| {
+        preserved
+            .uuids
+            .iter()
+            .all(|uuid| graph.nodes.contains_key(uuid))
+    });
+    if let Some(preserved) = preserved.as_ref() {
+        relink_preserved_messages(graph, preserved);
+    }
+    remove_pre_compaction_nodes(records, graph, boundary_index, preserved.as_ref())
+}
+
+fn compact_preserved_messages(boundary: &Record, graph: &GraphIndex) -> Option<PreservedMessages> {
+    let metadata = boundary.raw.get("compactMetadata")?.as_object()?;
+    if let Some(preserved) = metadata.get("preservedMessages").and_then(Value::as_object) {
+        let anchor_uuid = preserved.get("anchorUuid")?.as_str()?.to_owned();
+        let uuids = preserved
+            .get("uuids")?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        return Some(PreservedMessages { anchor_uuid, uuids });
+    }
+    let segment = metadata.get("preservedSegment")?.as_object()?;
+    preserved_segment(segment, graph)
+}
+
+fn preserved_segment(
+    segment: &Map<String, Value>,
+    graph: &GraphIndex,
+) -> Option<PreservedMessages> {
+    let anchor_uuid = segment.get("anchorUuid")?.as_str()?.to_owned();
+    let head_uuid = segment.get("headUuid")?.as_str()?;
+    let mut cursor = segment.get("tailUuid")?.as_str()?;
+    let mut visited = HashSet::new();
+    let mut uuids = Vec::new();
+    loop {
+        if !visited.insert(cursor.to_owned()) {
+            return None;
+        }
+        uuids.push(cursor.to_owned());
+        if cursor == head_uuid {
+            uuids.reverse();
+            return Some(PreservedMessages { anchor_uuid, uuids });
+        }
+        cursor = graph.nodes.get(cursor)?.parent_uuid.as_deref()?;
+    }
+}
+
+fn relink_preserved_messages(graph: &mut GraphIndex, preserved: &PreservedMessages) {
+    let mut parent_uuid = preserved.anchor_uuid.clone();
+    for uuid in &preserved.uuids {
+        if let Some(node) = graph.nodes.get_mut(uuid) {
+            node.parent_uuid = Some(parent_uuid);
+        }
+        parent_uuid = uuid.clone();
+    }
+    let (Some(first), Some(last)) = (preserved.uuids.first(), preserved.uuids.last()) else {
+        return;
+    };
+    for uuid in graph.order.clone() {
+        let Some(node) = graph.nodes.get_mut(&uuid) else {
+            continue;
+        };
+        if node.parent_uuid.as_deref() == Some(&preserved.anchor_uuid) && &uuid != first {
+            node.parent_uuid = Some(last.clone());
+        }
+    }
+}
+
+fn remove_pre_compaction_nodes(
+    records: &[Record],
+    graph: &mut GraphIndex,
+    boundary_index: usize,
+    preserved: Option<&PreservedMessages>,
+) -> Option<String> {
+    let preserved_uuids: HashSet<&str> = preserved
+        .into_iter()
+        .flat_map(|messages| messages.uuids.iter().map(String::as_str))
+        .collect();
+    let deleted: HashSet<String> = graph
+        .order
+        .iter()
+        .filter(|uuid| {
+            graph.nodes.get(*uuid).is_some_and(|node| {
+                node.record_index < boundary_index && !preserved_uuids.contains(uuid.as_str())
+            })
+        })
+        .cloned()
+        .collect();
+    for uuid in &deleted {
+        graph.nodes.remove(uuid);
+    }
+
+    let tail = preserved
+        .and_then(|messages| messages.uuids.last())
+        .cloned()
+        .or_else(|| records[boundary_index].uuid())?;
+    for uuid in graph.order.clone() {
+        let Some(node) = graph.nodes.get_mut(&uuid) else {
+            continue;
+        };
+        if node.record_index <= boundary_index
+            || !records[node.record_index].is_conversation_record()
+        {
+            continue;
+        }
+        if node
+            .parent_uuid
+            .as_ref()
+            .is_some_and(|parent| deleted.contains(parent))
+        {
+            node.parent_uuid = Some(tail.clone());
+        }
+    }
+    Some(tail)
+}
+
+fn walk_parent_chain(records: &[Record], graph: &GraphIndex, leaf_uuid: &str) -> Vec<usize> {
+    let mut reversed = Vec::new();
+    let mut visited = HashSet::new();
+    let mut cursor = Some(leaf_uuid.to_owned());
+    while let Some(uuid) = cursor {
+        let Some(node) = graph.nodes.get(&uuid) else {
+            break;
+        };
+        if !visited.insert(uuid.clone()) {
             break;
         }
-        path_indices.push(index);
-        let parent = records[index].parent_uuid();
-        cursor = parent.filter(|value| by_uuid.contains_key(value));
+        reversed.push(node.record_index);
+        let Some(parent_uuid) = node.parent_uuid.as_ref() else {
+            break;
+        };
+        cursor = if graph.nodes.contains_key(parent_uuid) && !visited.contains(parent_uuid) {
+            Some(parent_uuid.clone())
+        } else {
+            nearest_timestamp_parent(graph, node, &visited)
+        };
     }
-    path_indices.reverse();
+    reversed.reverse();
+    let _ = records;
+    reversed
+}
 
-    // Project: skip sidechain/meta, then keep recognized user/assistant
-    // first-text via the shared `parsed_message` helper.
-    path_indices
+fn nearest_timestamp_parent(
+    graph: &GraphIndex,
+    current: &GraphNode,
+    visited: &HashSet<String>,
+) -> Option<String> {
+    let current_timestamp = current.timestamp_ms?;
+    let mut best: Option<(i64, String)> = None;
+    for uuid in &graph.order {
+        let Some(candidate) = graph.nodes.get(uuid) else {
+            continue;
+        };
+        if visited.contains(uuid) || candidate.is_sidechain != current.is_sidechain {
+            continue;
+        }
+        let Some(candidate_timestamp) = candidate.timestamp_ms else {
+            continue;
+        };
+        let delta = current_timestamp - candidate_timestamp;
+        if !(0..=PARENT_TIMESTAMP_FALLBACK_MS).contains(&delta) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best_delta, _)| delta < *best_delta)
+        {
+            best = Some((delta, uuid.clone()));
+        }
+    }
+    best.map(|(_, uuid)| uuid)
+}
+
+fn recover_parallel_responses(records: &[Record], graph: &GraphIndex, path: &mut Vec<usize>) {
+    let mut canonical_by_message_id = HashMap::new();
+    for index in path.iter().copied() {
+        let record = &records[index];
+        if record.type_tag() == Some("assistant") {
+            if let Some(message_id) = record.message_id() {
+                canonical_by_message_id.insert(message_id, record.uuid().unwrap_or_default());
+            }
+        }
+    }
+    if canonical_by_message_id.is_empty() {
+        return;
+    }
+
+    let mut assistants = HashMap::<String, Vec<String>>::new();
+    let mut tool_results = HashMap::<String, Vec<String>>::new();
+    for uuid in &graph.order {
+        let Some(node) = graph.nodes.get(uuid) else {
+            continue;
+        };
+        let record = &records[node.record_index];
+        if record.type_tag() == Some("assistant") {
+            if let Some(message_id) = record.message_id() {
+                assistants.entry(message_id).or_default().push(uuid.clone());
+            }
+        } else if record.is_user_tool_result() {
+            if let Some(parent_uuid) = node.parent_uuid.as_ref() {
+                tool_results
+                    .entry(parent_uuid.clone())
+                    .or_default()
+                    .push(uuid.clone());
+            }
+        }
+    }
+    insert_parallel_records(
+        records,
+        graph,
+        path,
+        canonical_by_message_id,
+        assistants,
+        tool_results,
+    );
+}
+
+fn insert_parallel_records(
+    records: &[Record],
+    graph: &GraphIndex,
+    path: &mut Vec<usize>,
+    canonical: HashMap<String, String>,
+    assistants: HashMap<String, Vec<String>>,
+    tool_results: HashMap<String, Vec<String>>,
+) {
+    let mut visited: HashSet<String> = path
         .iter()
-        .map(|&index| &records[index])
+        .filter_map(|index| records[*index].uuid())
+        .collect();
+    let mut insertions = HashMap::<String, Vec<usize>>::new();
+    for (message_id, canonical_uuid) in canonical {
+        let fragments = assistants.get(&message_id).cloned().unwrap_or_default();
+        let mut assistant_indices = Vec::new();
+        let mut tool_result_indices = Vec::new();
+        for fragment_uuid in fragments {
+            if visited.insert(fragment_uuid.clone()) {
+                assistant_indices.push(graph.nodes[&fragment_uuid].record_index);
+            }
+            for tool_uuid in tool_results.get(&fragment_uuid).into_iter().flatten() {
+                if visited.insert(tool_uuid.clone()) {
+                    tool_result_indices.push(graph.nodes[tool_uuid].record_index);
+                }
+            }
+        }
+        sort_record_indices(records, &mut assistant_indices);
+        sort_record_indices(records, &mut tool_result_indices);
+        assistant_indices.extend(tool_result_indices);
+        if !assistant_indices.is_empty() {
+            insertions.insert(canonical_uuid, assistant_indices);
+        }
+    }
+
+    let mut expanded =
+        Vec::with_capacity(path.len() + insertions.values().map(Vec::len).sum::<usize>());
+    for index in path.iter().copied() {
+        expanded.push(index);
+        if let Some(uuid) = records[index].uuid() {
+            if let Some(extra) = insertions.get(&uuid) {
+                expanded.extend(extra.iter().copied());
+            }
+        }
+    }
+    *path = expanded;
+}
+
+fn append_non_message_descendants(
+    records: &[Record],
+    graph: &GraphIndex,
+    leaf_uuid: &str,
+    path: &mut Vec<usize>,
+) {
+    let mut children = HashMap::<String, Vec<String>>::new();
+    for uuid in &graph.order {
+        let Some(node) = graph.nodes.get(uuid) else {
+            continue;
+        };
+        if records[node.record_index].is_conversation_record() {
+            continue;
+        }
+        if let Some(parent_uuid) = node.parent_uuid.as_ref() {
+            children
+                .entry(parent_uuid.clone())
+                .or_default()
+                .push(uuid.clone());
+        }
+    }
+
+    let mut visited: HashSet<String> = path
+        .iter()
+        .filter_map(|index| records[*index].uuid())
+        .collect();
+    let mut queue = VecDeque::from([leaf_uuid.to_owned()]);
+    let mut descendants = Vec::new();
+    while let Some(parent_uuid) = queue.pop_front() {
+        for uuid in children.get(&parent_uuid).into_iter().flatten() {
+            if !visited.insert(uuid.clone()) {
+                continue;
+            }
+            descendants.push(graph.nodes[uuid].record_index);
+            queue.push_back(uuid.clone());
+        }
+    }
+    sort_record_indices(records, &mut descendants);
+    path.extend(descendants);
+}
+
+fn sort_record_indices(records: &[Record], indices: &mut [usize]) {
+    indices.sort_by(|left, right| records[*left].timestamp().cmp(&records[*right].timestamp()));
+}
+
+fn project_messages(records: &[Record], path: &[usize]) -> Vec<Message> {
+    path.iter()
+        .map(|index| &records[*index])
+        .filter(|record| record.is_conversation_record())
         .filter(|record| !record.is_sidechain() && !record.is_meta())
-        .filter_map(|record| {
-            let (role, content, timestamp) = record.message_payload()?;
-            parsed_message(role, content, timestamp)
-        })
+        .filter_map(project_message)
         .collect()
+}
+
+fn project_message(record: &Record) -> Option<Message> {
+    let (role, content, timestamp) = record.message_payload()?;
+    let role = role?.parse::<Role>().ok()?;
+    let text = first_direct_text(content?)?;
+    Some(Message {
+        role,
+        text: text.to_owned(),
+        timestamp: timestamp.map(str::to_owned),
+    })
+}
+
+fn first_direct_text(content: &Value) -> Option<&str> {
+    match content {
+        Value::String(text) if !text.is_empty() => Some(text),
+        Value::Array(items) => items.iter().find_map(|item| {
+            let object = item.as_object()?;
+            let item_type = object.get("type").and_then(Value::as_str);
+            let text = object.get("text").and_then(Value::as_str);
+            matches!(item_type, Some("text" | "input_text" | "output_text"))
+                .then_some(text)
+                .flatten()
+                .filter(|value| !value.is_empty())
+        }),
+        _ => None,
+    }
+}
+
+fn parse_timestamp_ms(value: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.timestamp_millis())
 }
 
 /// Derive a session id from the file stem when no in-record id is present.
@@ -287,6 +719,41 @@ impl Record {
             .unwrap_or(false)
     }
 
+    fn is_conversation_record(&self) -> bool {
+        matches!(self.type_tag(), Some("user" | "assistant"))
+    }
+
+    fn is_compact_boundary(&self) -> bool {
+        self.type_tag() == Some("system")
+            && self.raw_str("subtype").as_deref() == Some("compact_boundary")
+    }
+
+    fn message_id(&self) -> Option<String> {
+        self.raw
+            .get("message")
+            .and_then(Value::as_object)
+            .and_then(|message| message.get("id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+
+    fn is_user_tool_result(&self) -> bool {
+        if self.type_tag() != Some("user") {
+            return false;
+        }
+        self.raw
+            .get("message")
+            .and_then(Value::as_object)
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            })
+    }
+
     /// Own node uuid (non-empty). Graph records read the typed envelope;
     /// unknown records read the raw value so uuid-bearing future types still
     /// participate in the lineage graph.
@@ -301,7 +768,10 @@ impl Record {
     /// terminate the upward walk.
     pub fn parent_uuid(&self) -> Option<String> {
         if let Some(envelope) = self.graph() {
-            return envelope.parent_uuid.clone().filter(|value| !value.is_empty());
+            return envelope
+                .parent_uuid
+                .clone()
+                .filter(|value| !value.is_empty());
         }
         self.raw_str("parentUuid")
     }
@@ -333,7 +803,9 @@ impl Record {
             RecordKind::PermissionMode(record) => record.session_id.clone(),
             RecordKind::AiTitle(record) => record.session_id.clone(),
             RecordKind::QueueOperation(record) => record.session_id.clone(),
-            _ => self.raw_str("sessionId").or_else(|| self.raw_str("session_id")),
+            _ => self
+                .raw_str("sessionId")
+                .or_else(|| self.raw_str("session_id")),
         }
         .filter(|value| !value.is_empty())
     }
@@ -422,7 +894,11 @@ impl GraphEnvelope {
         self.session_id
             .clone()
             .filter(|value| !value.is_empty())
-            .or_else(|| self.session_id_snake.clone().filter(|value| !value.is_empty()))
+            .or_else(|| {
+                self.session_id_snake
+                    .clone()
+                    .filter(|value| !value.is_empty())
+            })
     }
 }
 
@@ -807,7 +1283,9 @@ pub struct Block {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BlockKind {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -1202,6 +1680,201 @@ mod tests {
         assert_eq!(session.cwd, fallback_cwd(file.path()));
         assert_eq!(session.summary, "(no summary)");
         assert_eq!(session.start_timestamp, None);
+    }
+
+    #[test]
+    fn explicit_null_leaf_clears_conversation() {
+        let cleared = r#"{"type":"last-prompt","leafUuid":null,"explicit":true,"sessionId":"s1"}"#;
+        let file = write_session(&[
+            &user("u1", None, r#""prompt""#),
+            &assistant("a1", "u1", r#"[{"type":"text","text":"answer"}]"#),
+            &last_prompt("a1"),
+            cleared,
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert!(session.messages.is_empty());
+        assert_eq!(session.start_timestamp, None);
+    }
+
+    #[test]
+    fn missing_explicit_leaf_falls_back_to_latest_foreground_record() {
+        let missing =
+            r#"{"type":"last-prompt","leafUuid":"missing","explicit":true,"sessionId":"s1"}"#;
+        let file = write_session(&[
+            &user("u1", None, r#""prompt""#),
+            &assistant("a1", "u1", r#"[{"type":"text","text":"answer"}]"#),
+            missing,
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["prompt", "answer"]);
+    }
+
+    #[test]
+    fn preferred_leaf_advances_to_later_foreground_descendant() {
+        let preferred = r#"{"type":"last-prompt","leafUuid":"a1","sessionId":"s1"}"#;
+        let file = write_session(&[
+            &user("u1", None, r#""prompt""#),
+            &assistant("a1", "u1", r#"[{"type":"text","text":"first"}]"#),
+            preferred,
+            r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","timestamp":"2026-07-21T06:13:14.040Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"later"}]}}"#,
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["prompt", "first", "later"]);
+    }
+
+    #[test]
+    fn missing_parent_recovers_nearest_same_sidechain_record() {
+        let file = write_session(&[
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-07-21T06:13:10.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"user","content":"prompt"}}"#,
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"missing","timestamp":"2026-07-21T06:13:13.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}"#,
+            &last_prompt("a1"),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["prompt", "answer"]);
+    }
+
+    #[test]
+    fn tool_result_content_is_not_projected_as_human_text() {
+        let tool_result = r#"{"type":"user","uuid":"tr1","parentUuid":"a1","timestamp":"2026-07-21T06:13:13.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool1","content":[{"type":"text","text":"tool output"}]}]}}"#;
+        let final_answer = r#"{"type":"assistant","uuid":"a2","parentUuid":"tr1","timestamp":"2026-07-21T06:13:14.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#;
+        let file = write_session(&[
+            &user("u1", None, r#""prompt""#),
+            &assistant(
+                "a1",
+                "u1",
+                r#"[{"type":"tool_use","id":"tool1","name":"Read","input":{}}]"#,
+            ),
+            tool_result,
+            final_answer,
+            &last_prompt("a2"),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["prompt", "done"]);
+    }
+
+    #[test]
+    fn start_timestamp_comes_from_reconstructed_chain_root() {
+        let queued = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-07-21T05:00:00.000Z","sessionId":"s1"}"#;
+        let file = write_session(&[
+            queued,
+            &user("u1", None, r#""prompt""#),
+            &assistant("a1", "u1", r#"[{"type":"text","text":"answer"}]"#),
+            &last_prompt("a1"),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(
+            session.start_timestamp.as_deref(),
+            Some("2026-07-21T06:13:11.040Z")
+        );
+    }
+
+    #[test]
+    fn compact_preserved_messages_relink_to_boundary_anchor() {
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","uuid":"c1","parentUuid":"u1","timestamp":"2026-07-21T06:13:12.500Z","sessionId":"s1","cwd":"/workspace/project","compactMetadata":{"preservedMessages":{"anchorUuid":"u1","uuids":["p1","p2"]}}}"#;
+        let preserved_user = r#"{"type":"user","uuid":"p1","parentUuid":"missing-a","timestamp":"2026-07-21T06:13:13.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"user","content":"preserved"}}"#;
+        let preserved_assistant = r#"{"type":"assistant","uuid":"p2","parentUuid":"missing-b","timestamp":"2026-07-21T06:13:14.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"preserved answer"}]}}"#;
+        let final_answer = r#"{"type":"assistant","uuid":"a2","parentUuid":"c1","timestamp":"2026-07-21T06:13:15.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"final"}]}}"#;
+        let file = write_session(&[
+            &user("u1", None, r#""old root""#),
+            boundary,
+            preserved_user,
+            preserved_assistant,
+            final_answer,
+            &last_prompt("a2"),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["preserved", "preserved answer", "final"]);
+    }
+
+    #[test]
+    fn latest_compaction_without_preservation_drops_older_context() {
+        let first_boundary = r#"{"type":"system","subtype":"compact_boundary","uuid":"c1","parentUuid":"u0","timestamp":"2026-07-21T06:13:12.500Z","sessionId":"s1","cwd":"/workspace/project","compactMetadata":{"preservedMessages":{"anchorUuid":"c1","uuids":["u0"]}}}"#;
+        let middle = r#"{"type":"user","uuid":"u1","parentUuid":"c1","timestamp":"2026-07-21T06:13:13.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"user","content":"middle"}}"#;
+        let latest_boundary = r#"{"type":"system","subtype":"compact_boundary","uuid":"c2","parentUuid":"u1","timestamp":"2026-07-21T06:13:14.000Z","sessionId":"s1","cwd":"/workspace/project"}"#;
+        let final_answer = r#"{"type":"assistant","uuid":"a2","parentUuid":"c2","timestamp":"2026-07-21T06:13:15.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"final"}]}}"#;
+        let file = write_session(&[
+            &user("u0", None, r#""old""#),
+            first_boundary,
+            middle,
+            latest_boundary,
+            final_answer,
+            &last_prompt("a2"),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["final"]);
+        assert_eq!(
+            session.start_timestamp.as_deref(),
+            Some("2026-07-21T06:13:14.000Z")
+        );
+    }
+
+    #[test]
+    fn non_conversation_descendant_message_payload_is_not_projected() {
+        let metadata = r#"{"type":"future-record","uuid":"x1","parentUuid":"a1","timestamp":"2026-07-21T06:13:13.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"user","content":"metadata text"}}"#;
+        let file = write_session(&[
+            &user("u1", None, r#""prompt""#),
+            &assistant("a1", "u1", r#"[{"type":"text","text":"answer"}]"#),
+            metadata,
+            &last_prompt("a1"),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["prompt", "answer"]);
+    }
+
+    #[test]
+    fn parallel_assistant_fragments_are_recovered_without_tool_output() {
+        let first = r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-07-21T06:13:12.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"id":"api1","role":"assistant","content":[{"type":"text","text":"first"}]}}"#;
+        let second = r#"{"type":"assistant","uuid":"a2","parentUuid":"u1","timestamp":"2026-07-21T06:13:13.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"id":"api1","role":"assistant","content":[{"type":"text","text":"second"}]}}"#;
+        let tool_result = r#"{"type":"user","uuid":"tr1","parentUuid":"a2","timestamp":"2026-07-21T06:13:14.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool1","content":"tool output"}]}}"#;
+        let file = write_session(&[
+            &user("u1", None, r#""prompt""#),
+            first,
+            second,
+            tool_result,
+            &last_prompt("a1"),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["prompt", "first", "second"]);
     }
 
     #[test]
