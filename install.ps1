@@ -40,6 +40,77 @@ function Ensure-SafeDirectory([string]$Path, [string]$Label) {
     }
 }
 
+function Add-RollbackError(
+    [System.Collections.Generic.List[string]]$Errors,
+    [string]$Message
+) {
+    [void]$Errors.Add($Message)
+}
+
+function Remove-RollbackPath(
+    [string]$Path,
+    [string]$Label,
+    [System.Collections.Generic.List[string]]$Errors
+) {
+    try {
+        if (Test-Path -LiteralPath $Path -ErrorAction Stop) {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        }
+    } catch {
+        Add-RollbackError $Errors "could not remove $Label at ${Path}: $($_.Exception.Message)"
+    }
+}
+
+function Confirm-RollbackPath(
+    [string]$Path,
+    [string]$Label,
+    [bool]$ShouldExist,
+    [System.Collections.Generic.List[string]]$Errors
+) {
+    try {
+        if ($ShouldExist) {
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf -ErrorAction Stop)) {
+                Add-RollbackError $Errors "could not verify restored ${Label}: expected a file at $Path"
+            }
+        } elseif (Test-Path -LiteralPath $Path -ErrorAction Stop) {
+            Add-RollbackError $Errors "could not verify removal of ${Label}: path still exists at $Path"
+        }
+    } catch {
+        Add-RollbackError $Errors "could not verify ${Label} at ${Path}: $($_.Exception.Message)"
+    }
+}
+
+function Restore-RollbackAside(
+    [string]$Path,
+    [string]$Aside,
+    [bool]$HadPrior,
+    [string]$Label,
+    [System.Collections.Generic.List[string]]$Errors
+) {
+    Remove-RollbackPath $Path $Label $Errors
+    if ($HadPrior) {
+        try {
+            Move-Item -LiteralPath $Aside -Destination $Path -Force -ErrorAction Stop
+        } catch {
+            Add-RollbackError $Errors "could not restore ${Label} from ${Aside}: $($_.Exception.Message)"
+        }
+        Confirm-RollbackPath $Path $Label $true $Errors
+        Confirm-RollbackPath $Aside "$Label aside" $false $Errors
+    } else {
+        Confirm-RollbackPath $Path $Label $false $Errors
+    }
+}
+
+function Fail-WithRollbackErrors(
+    [string]$OriginalError,
+    [System.Collections.Generic.List[string]]$Errors
+) {
+    if ($Errors.Count -eq 0) {
+        Fail "$OriginalError; rollback completed and verified"
+    }
+    Fail "$OriginalError; rollback incomplete: $($Errors -join ' | ')"
+}
+
 $Repo = "0x8f701/agent-loader"
 $ApiBase = if ($env:AL_UPDATE_BASE_URL) { $env:AL_UPDATE_BASE_URL } else { "https://api.github.com/repos/$Repo/releases" }
 $AlHome = if ($env:AL_HOME) { $env:AL_HOME } else { Join-Path $env:USERPROFILE ".agent-loader" }
@@ -235,10 +306,10 @@ try {
     try {
         Move-Item -LiteralPath $Binary.FullName -Destination $Dest
     } catch {
-        if ($HadPrior -and (Test-Path -LiteralPath $Aside)) {
-            Move-Item -LiteralPath $Aside -Destination $Dest -Force -ErrorAction SilentlyContinue
-        }
-        Fail "cannot install to $Dest: $($_.Exception.Message)"
+        $ActivationError = $_.Exception.Message
+        $RollbackErrors = [System.Collections.Generic.List[string]]::new()
+        Restore-RollbackAside $Dest $Aside $HadPrior "active executable" $RollbackErrors
+        Fail-WithRollbackErrors "cannot install to ${Dest}: $ActivationError" $RollbackErrors
     }
 
     # Secondary smoke-test of the activated path; restore prior binary on failure.
@@ -252,32 +323,45 @@ try {
     }
     if ($ActiveSmokeError -or $ActiveSmokeExit -ne 0) {
         $ActiveSmokeDetail = if ($ActiveSmokeError) { $ActiveSmokeError } else { "exit $ActiveSmokeExit" }
-        Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue
-        if ($HadPrior -and (Test-Path -LiteralPath $Aside)) {
-            Move-Item -LiteralPath $Aside -Destination $Dest -Force -ErrorAction SilentlyContinue
-        }
-        Fail "installed binary failed to run ($ActiveSmokeDetail); previous install restored if available"
+        $RollbackErrors = [System.Collections.Generic.List[string]]::new()
+        Restore-RollbackAside $Dest $Aside $HadPrior "active executable" $RollbackErrors
+        Fail-WithRollbackErrors "installed binary failed to run ($ActiveSmokeDetail)" $RollbackErrors
     }
 
     # Commit updater state only after the binary activates.
     $StateAside = "$StatePath.old.$PID.$([Guid]::NewGuid().ToString('N'))"
     $HadState = Test-Path -LiteralPath $StatePath
+    $StateMovedAside = $false
     try {
         if ($HadState) {
             Move-Item -LiteralPath $StatePath -Destination $StateAside
+            $StateMovedAside = $true
         }
         Move-Item -LiteralPath $StateTmp -Destination $StatePath
         $StateTmp = $null
     } catch {
-        Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
-        if ($HadState -and (Test-Path -LiteralPath $StateAside)) {
-            Move-Item -LiteralPath $StateAside -Destination $StatePath -Force -ErrorAction SilentlyContinue
+        $StateCommitError = $_.Exception.Message
+        $RollbackErrors = [System.Collections.Generic.List[string]]::new()
+        if ($HadState) {
+            $StateAsideExists = $StateMovedAside
+            if (-not $StateAsideExists) {
+                try {
+                    $StateAsideExists = Test-Path -LiteralPath $StateAside -PathType Leaf -ErrorAction Stop
+                } catch {
+                    Add-RollbackError $RollbackErrors "could not inspect updater state aside at ${StateAside}: $($_.Exception.Message)"
+                }
+            }
+            if ($StateAsideExists) {
+                Restore-RollbackAside $StatePath $StateAside $true "updater state" $RollbackErrors
+            } else {
+                Confirm-RollbackPath $StatePath "untouched updater state" $true $RollbackErrors
+                Confirm-RollbackPath $StateAside "updater state aside" $false $RollbackErrors
+            }
+        } else {
+            Restore-RollbackAside $StatePath $StateAside $false "new updater state" $RollbackErrors
         }
-        Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue
-        if ($HadPrior -and (Test-Path -LiteralPath $Aside)) {
-            Move-Item -LiteralPath $Aside -Destination $Dest -Force -ErrorAction SilentlyContinue
-        }
-        Fail "cannot record al update state; previous install restored if available: $($_.Exception.Message)"
+        Restore-RollbackAside $Dest $Aside $HadPrior "active executable" $RollbackErrors
+        Fail-WithRollbackErrors "cannot record al update state: $StateCommitError" $RollbackErrors
     }
     if ($HadState -and (Test-Path -LiteralPath $StateAside)) {
         Remove-Item -LiteralPath $StateAside -Force -ErrorAction SilentlyContinue

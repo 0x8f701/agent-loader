@@ -174,14 +174,28 @@ fi
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/al-install.XXXXXX")"
 STAGED=""
 TMP_LINK=""
+ROLLBACK_LINK=""
 STATE_TMP=""
+TRANSACTION_ACTIVE=0
+ROLLBACK_RUNNING=0
 cleanup() {
+    trap - EXIT HUP INT TERM
+    if [ "${TRANSACTION_ACTIVE:-0}" -eq 1 ] && [ "${ROLLBACK_RUNNING:-0}" -eq 0 ]; then
+        ROLLBACK_RUNNING=1
+        if rollback_install; then
+            TRANSACTION_ACTIVE=0
+        else
+            printf 'install.sh: error: interrupted install rollback failed\n' >&2
+        fi
+    fi
     if [ -n "${STATE_TMP:-}" ] && [ -f "$STATE_TMP" ]; then rm -f "$STATE_TMP"; fi
-    if [ -n "${TMP_LINK:-}" ] && [ -e "$TMP_LINK" ]; then rm -f "$TMP_LINK"; fi
+    if [ -n "${ROLLBACK_LINK:-}" ] && { [ -e "$ROLLBACK_LINK" ] || [ -L "$ROLLBACK_LINK" ]; }; then rm -f "$ROLLBACK_LINK"; fi
+    if [ -n "${TMP_LINK:-}" ] && { [ -e "$TMP_LINK" ] || [ -L "$TMP_LINK" ]; }; then rm -f "$TMP_LINK"; fi
     if [ -n "${STAGED:-}" ] && [ -f "$STAGED" ]; then rm -f "$STAGED"; fi
     if [ -d "$TMP_DIR" ]; then rm -rf "$TMP_DIR"; fi
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 1' HUP INT TERM
 
 # ── Resolve the release ──────────────────────────────────────────────────────
 if [ -n "$VERSION" ]; then
@@ -356,57 +370,127 @@ if [ ! -L "$BIN_DIR/al" ] && [ -e "$BIN_DIR/al" ]; then
     err "$BIN_DIR/al is not a managed symlink; refusing to overwrite it"
 fi
 
-# Capture the prior active symlink target so a rollback restores exactly what
+# Capture the prior active symlink target so rollback restores exactly what
 # was live before this install, not the newly staged version.
 HAD_ACTIVE=0
 OLD_LINK_TARGET=""
 if [ -L "$BIN_DIR/al" ]; then
-    OLD_LINK_TARGET="$(readlink "$BIN_DIR/al")"
+    OLD_LINK_TARGET="$(readlink "$BIN_DIR/al")" \
+        || { rm -f "$TMP_LINK" "$STAGED"; err "failed to read prior active al symlink"; }
     HAD_ACTIVE=1
 fi
 
+# Preserve an existing same-identity binary until both activation and the
+# update-state commit succeed. Rollback moves these exact bytes back into
+# place before restoring a link that may point at them.
+HAD_DEST=0
 VERSIONED_ASIDE="$DOWNLOADS_DIR/$VERSIONED.old.$$"
-if [ -e "$DEST" ]; then
-    mv "$DEST" "$VERSIONED_ASIDE" \
-        || { rm -f "$TMP_LINK" "$STAGED"; err "failed to preserve existing versioned binary"; }
-fi
-if ! mv -f "$STAGED" "$DEST"; then
-    [ ! -e "$VERSIONED_ASIDE" ] || mv "$VERSIONED_ASIDE" "$DEST" || true
-    rm -f "$TMP_LINK"
-    err "failed to activate versioned binary; previous install restored"
-fi
-STAGED=""
 
-# Atomic rollback helper: restore the prior active managed symlink (or remove
-# the new one if none existed) without ever leaving $BIN_DIR/al missing or
-# pointing at the new install on failure.  Only after the link is correct do
-# we remove the new DEST and restore VERSIONED_ASIDE.
+# Restore the prior managed symlink with an atomic rename, then verify the
+# live link contains the exact target captured before activation.
 rollback_active_link() {
     if [ "$HAD_ACTIVE" -eq 1 ]; then
         ROLLBACK_LINK="$BIN_DIR/al.rollback.$$"
-        [ ! -e "$ROLLBACK_LINK" ] && [ ! -L "$ROLLBACK_LINK" ] \
-            || err "rollback collision: temporary link already exists ($ROLLBACK_LINK)"
-        ln -s "$OLD_LINK_TARGET" "$ROLLBACK_LINK" \
-            || err "failed to stage rollback symlink to prior active al"
+        if [ -e "$ROLLBACK_LINK" ] || [ -L "$ROLLBACK_LINK" ]; then
+            printf 'install.sh: error: rollback path already exists: %s\n' "$ROLLBACK_LINK" >&2
+            return 1
+        fi
+        if ! ln -s "$OLD_LINK_TARGET" "$ROLLBACK_LINK"; then
+            printf 'install.sh: error: rollback failed to stage the prior active al symlink\n' >&2
+            return 1
+        fi
         if ! mv -f "$ROLLBACK_LINK" "$BIN_DIR/al"; then
-            rm -f "$ROLLBACK_LINK"
-            err "failed to restore prior active al symlink"
+            printf 'install.sh: error: rollback failed to restore the prior active al symlink\n' >&2
+            if ! rm -f "$ROLLBACK_LINK"; then
+                printf 'install.sh: error: rollback also failed to remove temporary symlink: %s\n' "$ROLLBACK_LINK" >&2
+            fi
+            return 1
+        fi
+        if [ ! -L "$BIN_DIR/al" ]; then
+            printf 'install.sh: error: rollback verification found no active al symlink\n' >&2
+            return 1
+        fi
+        if ! RESTORED_LINK_TARGET="$(readlink "$BIN_DIR/al")"; then
+            printf 'install.sh: error: rollback could not read the restored active al symlink\n' >&2
+            return 1
+        fi
+        if [ "$RESTORED_LINK_TARGET" != "$OLD_LINK_TARGET" ]; then
+            printf 'install.sh: error: rollback restored the wrong active al target\n' >&2
+            return 1
         fi
     else
-        rm -f "$BIN_DIR/al" || err "failed to remove partially-activated al symlink"
+        if ! rm -f "$BIN_DIR/al"; then
+            printf 'install.sh: error: rollback failed to remove the newly activated al symlink\n' >&2
+            return 1
+        fi
+        if [ -e "$BIN_DIR/al" ] || [ -L "$BIN_DIR/al" ]; then
+            printf 'install.sh: error: rollback verification found an unexpected active al path\n' >&2
+            return 1
+        fi
     fi
+    return 0
 }
 
-if ! mv -f "$TMP_LINK" "$BIN_DIR/al"; then
-    # Restore the prior versioned binary first so the active symlink
-    # rollback has a valid target even if link cleanup itself fails.
-    if [ -e "$VERSIONED_ASIDE" ]; then
-        mv "$VERSIONED_ASIDE" "$DEST" || true
+rollback_install() {
+    ROLLBACK_FAILED=0
+    if [ "$HAD_DEST" -eq 1 ]; then
+        if [ -e "$VERSIONED_ASIDE" ] || [ -L "$VERSIONED_ASIDE" ]; then
+            if ! mv -f "$VERSIONED_ASIDE" "$DEST"; then
+                printf 'install.sh: error: rollback failed to restore prior versioned binary: %s\n' "$DEST" >&2
+                ROLLBACK_FAILED=1
+            fi
+        elif [ ! -e "$DEST" ] && [ ! -L "$DEST" ]; then
+            printf 'install.sh: error: rollback found neither prior destination nor its aside: %s\n' "$DEST" >&2
+            ROLLBACK_FAILED=1
+        fi
+        if [ ! -e "$DEST" ] && [ ! -L "$DEST" ]; then
+            printf 'install.sh: error: rollback verification found no restored versioned binary: %s\n' "$DEST" >&2
+            ROLLBACK_FAILED=1
+        fi
     else
-        rm -f "$DEST" || true
+        if ! rm -f "$DEST"; then
+            printf 'install.sh: error: rollback failed to remove new versioned binary: %s\n' "$DEST" >&2
+            ROLLBACK_FAILED=1
+        elif [ -e "$DEST" ] || [ -L "$DEST" ]; then
+            printf 'install.sh: error: rollback verification found an unexpected versioned binary: %s\n' "$DEST" >&2
+            ROLLBACK_FAILED=1
+        fi
     fi
-    rollback_active_link
-    err "failed to activate al binary; previous install restored if available"
+
+    if ! rollback_active_link; then
+        ROLLBACK_FAILED=1
+    fi
+    [ "$ROLLBACK_FAILED" -eq 0 ]
+}
+
+fail_after_rollback() {
+    ROLLBACK_CAUSE="$1"
+    ROLLBACK_RUNNING=1
+    if rollback_install; then
+        TRANSACTION_ACTIVE=0
+        err "$ROLLBACK_CAUSE; previous install restored"
+    fi
+    err "$ROLLBACK_CAUSE; rollback failed"
+}
+
+if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+    [ ! -e "$VERSIONED_ASIDE" ] && [ ! -L "$VERSIONED_ASIDE" ] \
+        || { rm -f "$TMP_LINK" "$STAGED"; err "versioned rollback path already exists: $VERSIONED_ASIDE"; }
+    HAD_DEST=1
+    TRANSACTION_ACTIVE=1
+    mv "$DEST" "$VERSIONED_ASIDE" \
+        || { rm -f "$TMP_LINK" "$STAGED"; err "failed to preserve existing versioned binary"; }
+else
+    TRANSACTION_ACTIVE=1
+fi
+
+if ! mv -f "$STAGED" "$DEST"; then
+    fail_after_rollback "failed to activate versioned binary"
+fi
+STAGED=""
+
+if ! mv -f "$TMP_LINK" "$BIN_DIR/al"; then
+    fail_after_rollback "failed to activate al binary"
 fi
 TMP_LINK=""
 
@@ -414,49 +498,31 @@ TMP_LINK=""
 # republished tags are detected by checksum.
 STATE_FILE="$AL_HOME/update-state.json"
 if [ -d "$STATE_FILE" ]; then
-    rollback_active_link
-    rm -f "$DEST"
-    if [ -e "$VERSIONED_ASIDE" ]; then
-        mv "$VERSIONED_ASIDE" "$DEST" || err "failed to restore previous versioned binary"
-    fi
-    err "update-state path is a directory: $STATE_FILE"
+    fail_after_rollback "update-state path is a directory: $STATE_FILE"
 fi
 
-STATE_TMP="$(mktemp "$AL_HOME/.update-state.XXXXXX")" || {
-    rollback_active_link
-    rm -f "$DEST"
-    if [ -e "$VERSIONED_ASIDE" ]; then
-        mv "$VERSIONED_ASIDE" "$DEST" || err "failed to restore previous versioned binary"
-    fi
-    err "could not create temporary update state under $AL_HOME"
-}
+if ! STATE_TMP="$(mktemp "$AL_HOME/.update-state.XXXXXX")"; then
+    STATE_TMP=""
+    fail_after_rollback "could not create temporary update state under $AL_HOME"
+fi
 
-restore_on_failure() {
-    rm -f "$STATE_TMP"
-    rollback_active_link
-    rm -f "$DEST"
-    if [ -e "$VERSIONED_ASIDE" ]; then
-        mv "$VERSIONED_ASIDE" "$DEST" || err "failed to restore previous versioned binary"
-    fi
-}
-
-CHECKED_AT="$(date -u +%s)"
+if ! CHECKED_AT="$(date -u +%s)"; then
+    fail_after_rollback "could not determine the current Unix timestamp"
+fi
 case "$CHECKED_AT" in
     *[!0-9]*|'')
-        restore_on_failure
-        err "could not determine the current Unix timestamp"
+        fail_after_rollback "could not determine the current Unix timestamp"
         ;;
 esac
 printf '{\n  "installed_version": "%s",\n  "installed_asset": "%s",\n  "installed_sha256": "%s",\n  "installed_binary": "%s",\n  "checked_at_unix": %s\n}\n' \
     "$RESOLVED_VERSION" "$ASSET" "$EXPECTED" "$VERSIONED" "$CHECKED_AT" > "$STATE_TMP" || {
-    restore_on_failure
-    err "could not write update state"
+    fail_after_rollback "could not write update state"
 }
 if ! mv -f "$STATE_TMP" "$STATE_FILE"; then
-    restore_on_failure
-    err "could not record al update state"
+    fail_after_rollback "could not record al update state"
 fi
 STATE_TMP=""
+TRANSACTION_ACTIVE=0
 
 # State is committed; safe to discard the old versioned binary aside.
 rm -f "$VERSIONED_ASIDE"

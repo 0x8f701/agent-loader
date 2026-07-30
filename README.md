@@ -1,7 +1,7 @@
 # `al` — agent loader
 
 [![Release CI](https://github.com/0x8f701/agent-loader/actions/workflows/release.yml/badge.svg)](https://github.com/0x8f701/agent-loader/actions/workflows/release.yml)
-[![License](https://img.shields.io/badge/license-MIT-blue)](./Cargo.toml)
+[![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust)](./Cargo.toml)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey)](./install.sh)
 
@@ -17,23 +17,23 @@
 
 ## Installation
 
-> **Note:** the repository currently has no published GitHub Releases and the install scripts download from GitHub Releases. The commands below are for **post-release** usage. Until the first release is tagged and published, build `al` from source ([Building from source](#building-from-source)).
+> **Note:** the install scripts download prebuilt binaries from [GitHub Releases](https://github.com/0x8f701/agent-loader/releases). A published release is required; until one exists, build `al` from source ([Building from source](#building-from-source)).
 
-After the first release, prebuilt single-file binaries for macOS (arm64/x86_64), Linux (arm64/x86_64, glibc), and Windows (x86_64) will be available on [GitHub Releases](https://github.com/0x8f701/agent-loader/releases).
+Published releases contain prebuilt single-file binaries for macOS (arm64/x86_64), Linux (arm64/x86_64, glibc 2.31 or newer), and Windows (x86_64).
 
 ```sh
-# macOS / Linux (after the first release is published)
+# macOS / Linux
 curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash
 ```
 
 ```powershell
-# Windows PowerShell (after the first release is published)
+# Windows PowerShell
 irm https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.ps1 | iex
 ```
 
-The installer verifies every download against the release's `SHA256SUMS`, installs the binary under `~/.agent-loader/bin/al` (`%USERPROFILE%\.agent-loader\bin\al.exe` on Windows), and adds the install directory to your shell profile when needed.
+The installer verifies every download against the release's `SHA256SUMS` and installs the binary under `~/.agent-loader/bin/al` (`%USERPROFILE%\.agent-loader\bin\al.exe` on Windows). On Unix it adds the install directory to your shell profile when needed; on Windows it updates the user-environment `PATH`.
 
-Pin a specific release (post-release):
+Pin a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.1.0
@@ -70,7 +70,7 @@ al sessions migrate grok omp /workspace/project/grok-session.jsonl /workspace/pr
 # Convert any supported source into a Hyper payload.
 al sessions convert claude hyper /workspace/project/claude-session.jsonl /workspace/project/hyper-session/
 
-# Print the command that would reopen or fork a session, without running it.
+# Print the command without launching the agent. A cross-tool fork may first write the forked export.
 al sessions open 00000000-0000-0000-0000-000000000000 claude --print-command
 al sessions fork 00000000-0000-0000-0000-000000000000 grok --print-command
 
@@ -97,7 +97,7 @@ Run `al --help` and `al COMMAND --help` for the current argument surface.
   - `al sessions convert SOURCE TARGET INPUT [OUTPUT]` (visible alias `migrate`) — read `INPUT` in the native format of `SOURCE` and write a `TARGET`-compatible export. If `OUTPUT` is omitted, the export is written to the target tool's native session location and the path is printed.
   - `al sessions fork SESSION_REF TARGET` — fork a session to another tool.
   - `al sessions open SESSION_REF TARGET` — reopen a session in the target tool.
-  - `al sessions open|fork --print-command` — print the native command that would be run, then exit.
+  - `al sessions open|fork --print-command` — print the native command without launching the agent, then exit. A cross-tool fork may first write the forked export.
   - `al sessions sync SRC_OR_DST [DST] [--tool TOOL]... [--dry-run]` — synchronize session catalogs point-to-point. With one endpoint, the local catalog is uploaded to that endpoint. With two endpoints, the first is the source and the second is the destination; both cannot be `local`. `--tool` can be repeated to limit the transfer to specific source tools. This is a separate command from listing; it copies files and merges Codex history, while `al sessions --host` is read-only.
 - `al sks` — local interactive fuzzy filter over the displayed fields (tool, time, session id, summary) followed by a target-tool picker. Requires `fzf` on PATH.
 - `al skss QUERY...` — same picker flow, but the first fuzzy list is filtered by a local message-body search across user/assistant text. Requires `fzf` on PATH.
@@ -138,7 +138,7 @@ Common `tmux-run` flags: `--no-attach`, `--fresh`, `-s session`, `-n window`, `-
 Session conversion is intentionally lossy:
 
 - Only user/assistant messages and the first recognized text block from each message are preserved. Images, attachments, tool calls, and other metadata are dropped.
-- Empty lines and unparseable JSONL records are skipped.
+- Empty lines are skipped. After a successful native load, unparseable records and non-message entries may be skipped.
 - Generated summaries normalize whitespace and are truncated to 100 characters; projected message text is preserved.
 - `grok` and `hyper` targets reuse Grok's storage layout; other targets write their own native formats.
 
@@ -152,7 +152,7 @@ Format adapters read each tool's native export:
 - **Droid** — `session_start` and `message` typed records.
 - **Codex / Claude / Grok** — tool-specific JSON/JSONL or directory layouts. Hyper targets reuse Grok's storage layout.
 
-Malformed lines and entries that cannot be mapped to a user/assistant text message are ignored.
+Pi/OMP nonempty files require a valid native `session` header or loading fails. After a successful load, later unparseable or non-message records may be skipped.
 
 ## Building from source
 
@@ -170,8 +170,6 @@ The `release-dist` profile strips symbols and enables thin LTO for a small, sing
 
 ## Releasing
 
-> **Note:** the repository currently has no pushed tags or GitHub Releases. The steps below apply when the project is ready to publish its first release.
-
 1. Update `Cargo.toml` `[package] version` to the release version.
 2. Commit on `main`.
 3. Tag and push. The tag must match the `Cargo.toml` version exactly:
@@ -179,7 +177,7 @@ The `release-dist` profile strips symbols and enables thin LTO for a small, sing
 ```sh
 VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
 git tag "v${VERSION}"
-git push origin "v${VERSION}"
+git push origin main "v${VERSION}"
 ```
 
 CI builds the five targets below, packages each archive, generates `SHA256SUMS`, and publishes a GitHub Release.
@@ -192,8 +190,8 @@ Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 |-------|---------|
 | macOS arm64 | `al-0.1.0-aarch64-apple-darwin.tar.gz` |
 | macOS x86_64 | `al-0.1.0-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc) | `al-0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc) | `al-0.1.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux x86_64 (glibc 2.31+) | `al-0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc 2.31+) | `al-0.1.0-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows x86_64 | `al-0.1.0-x86_64-pc-windows-msvc.zip` |
 | Checksums | `SHA256SUMS` |
 
@@ -201,4 +199,4 @@ The tag must match `Cargo.toml` version exactly (`v0.1.0` ↔ `0.1.0`) or the bu
 
 ## License
 
-MIT. See [`Cargo.toml`](./Cargo.toml).
+MIT. See [`LICENSE`](./LICENSE).
