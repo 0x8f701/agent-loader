@@ -1,0 +1,182 @@
+name: Release
+
+# On tag push v*, build the single-file `al` binary for the five supported
+# targets, package per-target archives named
+# al-<version>-<target-triple>.{tar.gz|zip}, generate SHA256SUMS, and publish as
+# a GitHub Release. install.sh / install.ps1 resolve these exact asset names.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail before packaging if debug metadata accidentally inflates a distribution
+  # binary. `al` is a small launcher; the release-dist profile keeps it well
+  # under 32 MiB.
+  MAX_RELEASE_BINARY_BYTES: "33554432"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          # macos-14 runners are arm64; the x86_64 slice is a cross-compile
+          # against the same SDK.
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            rustflags: "-C target-feature=+crt-static"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          file_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+          if [ "$tag_version" != "$file_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version ($file_version)" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Add build target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build al (release-dist)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --profile release-dist --locked --target ${{ matrix.target }}
+
+      - name: Verify stripped release binary
+        shell: bash
+        run: |
+          suffix=""
+          if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
+          src="target/${{ matrix.target }}/release-dist/al${suffix}"
+          [ -f "$src" ] || { echo "al binary not found at $src" >&2; exit 1; }
+
+          bytes="$(wc -c < "$src" | tr -d '[:space:]')"
+          echo "release binary: $src ($bytes bytes; limit $MAX_RELEASE_BINARY_BYTES)"
+          if [ "$bytes" -gt "$MAX_RELEASE_BINARY_BYTES" ]; then
+            echo "release binary exceeds the 32 MiB distribution limit" >&2
+            exit 1
+          fi
+
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sections="$RUNNER_TEMP/al-sections.txt"
+            readelf -SW "$src" > "$sections"
+            if grep -Eq '\.(z)?debug_|\.gnu_debuglink' "$sections"; then
+              echo "Linux release binary still contains debug sections" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Package archive (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="al-${version}-${{ matrix.target }}.tar.gz"
+          staging="$(mktemp -d)"
+          src="target/${{ matrix.target }}/release-dist/al"
+          cp "$src" "$staging/al"
+          chmod 0755 "$staging/al"
+          [ -f LICENSE ] && cp LICENSE "$staging/"
+          [ -f NOTICE ] && cp NOTICE "$staging/"
+          tar -C "$staging" -czf "$archive" .
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive"
+          else
+            shasum -a 256 "$archive"
+          fi
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Package archive (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $archive = "al-$version-${{ matrix.target }}.zip"
+          $staging = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "staging") -Force
+          Copy-Item "target/${{ matrix.target }}/release-dist/al.exe" (Join-Path $staging "al.exe")
+          if (Test-Path LICENSE) { Copy-Item LICENSE $staging }
+          if (Test-Path NOTICE) { Copy-Item NOTICE $staging }
+          Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $archive
+          Get-FileHash -Algorithm SHA256 $archive
+          Add-Content -Path $env:GITHUB_ENV -Value "ARCHIVE=$archive"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          ls -l
+          sha256sum al-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          draft: false
+          # Always publish as a full release so /latest resolution works for
+          # installers and any in-place updater.
+          prerelease: false
+          make_latest: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## al `${{ github.ref_name }}`
+
+            ### Install
+
+            ```sh
+            # macOS / Linux
+            curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash
+            ```
+
+            ```powershell
+            # Windows PowerShell
+            irm https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.ps1 | iex
+            ```
+
+            Pin a release:
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version ${{ github.ref_name }}
+            ```

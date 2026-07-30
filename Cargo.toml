@@ -1,0 +1,42 @@
+[package]
+name = "agent-loader"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Session catalog and launcher for AI coding assistants"
+license = "MIT"
+repository = "https://github.com/0x8f701/agent-loader"
+default-run = "al"
+
+[[bin]]
+name = "al"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+walkdir = "2"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+incremental = true
+panic = "abort"
+
+[profile.release-dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+debug = 0
+split-debuginfo = "off"
