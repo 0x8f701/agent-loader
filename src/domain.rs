@@ -72,10 +72,11 @@ pub enum TargetTool {
     Claude,
     Grok,
     Hyper,
+    Rpi,
 }
 
 impl TargetTool {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Pi,
         Self::Omp,
         Self::Droid,
@@ -83,6 +84,7 @@ impl TargetTool {
         Self::Claude,
         Self::Grok,
         Self::Hyper,
+        Self::Rpi,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -94,6 +96,7 @@ impl TargetTool {
             Self::Claude => "claude",
             Self::Grok => "grok",
             Self::Hyper => "hyper",
+            Self::Rpi => "rpi",
         }
     }
 
@@ -106,11 +109,16 @@ impl TargetTool {
             Self::Claude => Some(SourceTool::Claude),
             Self::Grok => Some(SourceTool::Grok),
             Self::Hyper => None,
+            Self::Rpi => None,
         }
     }
 
     pub const fn uses_grok_storage(self) -> bool {
         matches!(self, Self::Grok | Self::Hyper)
+    }
+
+    pub const fn uses_pi_storage(self) -> bool {
+        matches!(self, Self::Pi | Self::Rpi)
     }
 }
 
@@ -132,6 +140,7 @@ impl FromStr for TargetTool {
             "claude" => Ok(Self::Claude),
             "grok" => Ok(Self::Grok),
             "hyper" => Ok(Self::Hyper),
+            "rpi" => Ok(Self::Rpi),
             _ => Err(ToolParseError(value.to_owned())),
         }
     }

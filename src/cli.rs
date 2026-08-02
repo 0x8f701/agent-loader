@@ -36,13 +36,14 @@ fn restore_raw_tail(cli: &mut Cli, arguments: &[OsString]) {
     };
     if !matches!(
         command_name,
-        "omlo" | "pilo" | "grolo" | "hyperlo" | "dolo" | "colo" | "cclo" | "tmux-run"
+        "omlo" | "pilo" | "rpilo" | "grolo" | "hyperlo" | "dolo" | "colo" | "cclo" | "tmux-run"
     ) {
         return;
     }
     let tail = match cli.command.as_mut() {
         Some(Command::Omlo(tail))
         | Some(Command::Pilo(tail))
+        | Some(Command::Rpilo(tail))
         | Some(Command::Grolo(tail))
         | Some(Command::Hyperlo(tail))
         | Some(Command::Dolo(tail))
@@ -60,6 +61,7 @@ pub enum Command {
     Skss(SkssArgs),
     Omlo(RawTail),
     Pilo(RawTail),
+    Rpilo(RawTail),
     Grolo(RawTail),
     Hyperlo(RawTail),
     Dolo(RawTail),
@@ -226,6 +228,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Skss(args) => dispatch_picker(Some(args.query.join(" "))),
         Command::Omlo(args) => dispatch_launcher(crate::launcher::LauncherKind::Omp, args.argv),
         Command::Pilo(args) => dispatch_launcher(crate::launcher::LauncherKind::Pi, args.argv),
+        Command::Rpilo(args) => dispatch_launcher(crate::launcher::LauncherKind::Rpi, args.argv),
         Command::Grolo(args) => dispatch_launcher(crate::launcher::LauncherKind::Grok, args.argv),
         Command::Hyperlo(args) => dispatch_launcher(crate::launcher::LauncherKind::Hyper, args.argv),
         Command::Dolo(args) => dispatch_launcher(crate::launcher::LauncherKind::Droid, args.argv),
@@ -564,7 +567,8 @@ fn dispatch_session_launch(
     let home = home_dir()?;
     let session = crate::sessions::resolve_any_session(&session_ref)?;
     let same_format = target.source() == Some(session.tool)
-        || (session.tool == SourceTool::Grok && target == TargetTool::Hyper);
+        || (session.tool == SourceTool::Grok && target == TargetTool::Hyper)
+        || (session.tool == SourceTool::Pi && target == TargetTool::Rpi);
 
     let (path, session_id, created_output) = prepare_session_launch(
         &session,
@@ -587,7 +591,7 @@ fn dispatch_session_launch(
             let kind = launcher_kind_for_target(target);
             let args = match target {
                 TargetTool::Droid => vec![OsString::from(&session_id)],
-                TargetTool::Pi | TargetTool::Omp => vec![
+                TargetTool::Pi | TargetTool::Rpi | TargetTool::Omp => vec![
                     OsString::from("--session"),
                     path.as_os_str().to_owned(),
                 ],
@@ -699,6 +703,7 @@ fn dispatch_picker(query: Option<String>) -> anyhow::Result<()> {
 fn launcher_kind_for_target(target: TargetTool) -> crate::launcher::LauncherKind {
     match target {
         TargetTool::Pi => crate::launcher::LauncherKind::Pi,
+        TargetTool::Rpi => crate::launcher::LauncherKind::Rpi,
         TargetTool::Omp => crate::launcher::LauncherKind::Omp,
         TargetTool::Droid => crate::launcher::LauncherKind::Droid,
         TargetTool::Codex => crate::launcher::LauncherKind::Codex,
@@ -999,13 +1004,14 @@ mod tests {
     #[test]
     fn compatibility_command_spellings_parse() {
         let cases = [
-            "omlo", "pilo", "grolo", "hyperlo", "dolo", "colo", "cclo", "tmux-run",
+            "omlo", "pilo", "rpilo", "grolo", "hyperlo", "dolo", "colo", "cclo", "tmux-run",
         ];
         for spelling in cases {
             let parsed = Cli::try_parse_from(["al", spelling, "--unknown", "value"]).unwrap();
             let argv = match parsed.command.unwrap() {
                 Command::Omlo(tail)
                 | Command::Pilo(tail)
+                | Command::Rpilo(tail)
                 | Command::Grolo(tail)
                 | Command::Hyperlo(tail)
                 | Command::Dolo(tail)

@@ -390,7 +390,7 @@ pub fn emit_with_defaults<D: EmitDefaults>(
     };
 
     match target {
-        TargetTool::Pi => {
+        TargetTool::Pi | TargetTool::Rpi => {
             let records = emit_pi(session, cwd, &session_id, start, defaults);
             write_jsonl(&output, &records)?;
         }
@@ -893,7 +893,7 @@ fn target_path(
     context: &EmitContext,
 ) -> Result<PathBuf> {
     let path = match target {
-        TargetTool::Pi => context
+        TargetTool::Pi | TargetTool::Rpi => context
             .roots
             .pi
             .join(crate::formats::pi::encode_cwd(Path::new(cwd))?)
@@ -1347,7 +1347,7 @@ mod tests {
                 assert_eq!(name, "summary.json");
             } else if matches!(target, TargetTool::Droid | TargetTool::Claude) {
                 assert_eq!(name, format!("{}.jsonl", emitted.session_id));
-            } else if matches!(target, TargetTool::Pi | TargetTool::Omp) {
+            } else if target.uses_pi_storage() || matches!(target, TargetTool::Omp) {
                 assert!(name.ends_with(&format!("_{}.jsonl", emitted.session_id)));
             } else {
                 assert!(name.starts_with("rollout-"));
@@ -1610,7 +1610,7 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let home = temporary.path();
         let mut session = fixture(home);
-        let cwd = format!("/{}", "界".repeat(100));
+        let cwd = format!("/{}", "é".repeat(100));
         session.cwd = PathBuf::from(&cwd);
         let context = EmitContext::new(home).with_session_id("grok-session");
         let emitted = emit_with_defaults(

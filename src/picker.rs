@@ -327,21 +327,24 @@ pub fn format_picker_line(row: &SessionRow, use_color: bool) -> Option<Vec<u8>> 
 // ── Target-tool ordering ──────────────────────────────────────────────── //
 
 /// Build the ordered list of target tools for a source, preferring the
-/// source's native tool (or `hyper` ahead of `grok` for shared Grok
-/// storage) and appending the remaining tools in a fixed order.
+/// source's native tool (or `hyper` ahead of `grok` / `rpi` ahead of `pi`
+/// for shared storage) and appending the remaining tools in a fixed order.
 ///
 /// Grok sessions are shared with Hyper; Hyper is listed first so the
 /// picker defaults to the more capable target while keeping Grok
-/// available. Every other source defaults to its own native tool.
-/// The remaining candidates are appended in the order: `hyper, omp,
+/// available. Pi sessions are shared with Rpi; Rpi is listed first for
+/// the same reason. Every other source defaults to its own native tool.
+/// The remaining candidates are appended in the order: `hyper, rpi, omp,
 /// codex, claude, grok, pi, droid`.
 pub fn target_tools_for_source(source: SourceTool) -> Vec<TargetTool> {
     let mut tools = match source {
         SourceTool::Grok => vec![TargetTool::Hyper, TargetTool::Grok],
+        SourceTool::Pi => vec![TargetTool::Rpi, TargetTool::Pi],
         _ => vec![source_to_target(source)],
     };
     for candidate in [
         TargetTool::Hyper,
+        TargetTool::Rpi,
         TargetTool::Omp,
         TargetTool::Codex,
         TargetTool::Claude,
@@ -1071,7 +1074,7 @@ mod tests {
     fn pick_session_round_trips_non_utf8_path_through_stub_fzf() {
         let temp = tempfile::tempdir().unwrap();
         let fzf = temp.path().join("fzf");
-        fs::write(&fzf, b"#!/bin/sh\ncat\n").unwrap();
+        fs::write(&fzf, b"#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' \"$line\"; done\n").unwrap();
         let mut permissions = fs::metadata(&fzf).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&fzf, permissions).unwrap();
@@ -1096,14 +1099,15 @@ mod tests {
         let tools = target_tools_for_source(SourceTool::Grok);
         assert_eq!(tools[0], TargetTool::Hyper);
         assert_eq!(tools[1], TargetTool::Grok);
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
     }
 
     #[test]
     fn target_tools_non_grok_starts_with_native() {
         let tools = target_tools_for_source(SourceTool::Pi);
-        assert_eq!(tools[0], TargetTool::Pi);
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools[0], TargetTool::Rpi);
+        assert_eq!(tools[1], TargetTool::Pi);
+        assert_eq!(tools.len(), 8);
     }
 
     // -- parse_picker_selection --
@@ -1152,6 +1156,7 @@ mod tests {
             vec![
                 TargetTool::Omp,
                 TargetTool::Hyper,
+                TargetTool::Rpi,
                 TargetTool::Codex,
                 TargetTool::Claude,
                 TargetTool::Grok,
@@ -1169,6 +1174,7 @@ mod tests {
             vec![
                 TargetTool::Hyper,
                 TargetTool::Grok,
+                TargetTool::Rpi,
                 TargetTool::Omp,
                 TargetTool::Codex,
                 TargetTool::Claude,
@@ -1179,12 +1185,13 @@ mod tests {
     }
 
     #[test]
-    fn target_tools_all_seven_present() {
+    fn target_tools_all_eight_present() {
         for source in SourceTool::ALL {
             let tools = target_tools_for_source(source);
-            assert_eq!(tools.len(), 7, "wrong count for {source:?}");
+            assert_eq!(tools.len(), 8, "wrong count for {source:?}");
             let set: HashSet<TargetTool> = tools.iter().copied().collect();
             assert!(set.contains(&TargetTool::Pi));
+            assert!(set.contains(&TargetTool::Rpi));
             assert!(set.contains(&TargetTool::Omp));
             assert!(set.contains(&TargetTool::Droid));
             assert!(set.contains(&TargetTool::Codex));

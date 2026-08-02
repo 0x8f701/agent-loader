@@ -101,7 +101,7 @@ Run `al --help` and `al COMMAND --help` for the current argument surface.
   - `al sessions sync SRC_OR_DST [DST] [--tool TOOL]... [--dry-run]` — synchronize session catalogs point-to-point. With one endpoint, the local catalog is uploaded to that endpoint. With two endpoints, the first is the source and the second is the destination; both cannot be `local`. `--tool` can be repeated to limit the transfer to specific source tools. This is a separate command from listing; it copies files and merges Codex history, while `al sessions --host` is read-only.
 - `al sks` — local interactive fuzzy filter over the displayed fields (tool, time, session id, summary) followed by a target-tool picker. Requires `fzf` on PATH.
 - `al skss QUERY...` — same picker flow, but the first fuzzy list is filtered by a local message-body search across user/assistant text. Requires `fzf` on PATH.
-- `al omlo|pilo|grolo|hyperlo|dolo|colo|cclo [...]` — launch the corresponding coding agent (OMP, Pi, Grok, Hyper, Droid, Codex, Claude). Common launcher flags:
+- `al omlo|pilo|rpilo|grolo|hyperlo|dolo|colo|cclo [...]` — launch the corresponding coding agent (OMP, Pi, Rpi, Grok, Hyper, Droid, Codex, Claude). Common launcher flags:
   - `--host HOST` — run on a remote host over SSH (requires the current directory to be inside a git repository).
   - `--wt NAME` — use a named git worktree on the remote host (requires `--host`).
   - `--tmux` — wrap the launch in tmux (Unix only).
@@ -131,16 +131,16 @@ Common `tmux-run` flags: `--no-attach`, `--fresh`, `-s session`, `-n window`, `-
 | Role | Tools |
 |------|-------|
 | Source (export from) | `pi`, `omp`, `droid`, `codex`, `claude`, `grok` |
-| Target (convert to / launch) | `pi`, `omp`, `droid`, `codex`, `claude`, `grok`, `hyper` |
+| Target (convert to / launch) | `pi`, `omp`, `droid`, `codex`, `claude`, `grok`, `hyper`, `rpi` |
 
-`grok` and `hyper` share the same storage layout; a Grok session can be converted to Hyper in place, and Hyper targets reuse Grok's native format.
+`grok` and `hyper` share the same storage layout; a Grok session can be converted to Hyper in place, and Hyper targets reuse Grok's native format. `pi` and `rpi` likewise share Pi session storage; Rpi launches the `rpi` executable against that layout.
 
 Session conversion is intentionally lossy:
 
 - Only user/assistant messages and the first recognized text block from each message are preserved. Images, attachments, tool calls, and other metadata are dropped.
 - Empty lines are skipped. After a successful native load, unparseable records and non-message entries may be skipped.
 - Generated summaries normalize whitespace and are truncated to 100 characters; projected message text is preserved.
-- `grok` and `hyper` targets reuse Grok's storage layout; other targets write their own native formats.
+- `grok` and `hyper` targets reuse Grok's storage layout; `pi` and `rpi` targets reuse Pi's storage layout; other targets write their own native formats.
 
 This is by design: `al` is a loader that passes the useful context forward, not a bit-perfect archival mirror.
 
@@ -150,7 +150,7 @@ Format adapters read each tool's native export:
 
 - **Pi / OMP** — newline-delimited JSONL conversation trees.
 - **Droid** — `session_start` and `message` typed records.
-- **Codex / Claude / Grok** — tool-specific JSON/JSONL or directory layouts. Hyper targets reuse Grok's storage layout.
+- **Codex / Claude / Grok** — tool-specific JSON/JSONL or directory layouts. Hyper targets reuse Grok's storage layout. Rpi targets reuse Pi's storage layout.
 
 Pi/OMP nonempty files require a valid native `session` header or loading fails. After a successful load, later unparseable or non-message records may be skipped.
 

@@ -71,6 +71,7 @@ impl CommandSpec {
 pub enum LauncherKind {
     Omp,
     Pi,
+    Rpi,
     Grok,
     Hyper,
     Droid,
@@ -83,6 +84,7 @@ impl LauncherKind {
         match self {
             Self::Omp => "omlo",
             Self::Pi => "pilo",
+            Self::Rpi => "rpilo",
             Self::Grok => "grolo",
             Self::Hyper => "hyperlo",
             Self::Droid => "dolo",
@@ -94,7 +96,7 @@ impl LauncherKind {
     const fn argument_error_code(self) -> i32 {
         match self {
             Self::Grok | Self::Hyper | Self::Claude => 2,
-            Self::Omp | Self::Pi | Self::Droid | Self::Codex => 1,
+            Self::Omp | Self::Pi | Self::Rpi | Self::Droid | Self::Codex => 1,
         }
     }
 
@@ -248,9 +250,10 @@ pub type Result<T, E = LauncherError> = std::result::Result<T, E>;
 
 /// Build the raw, native argv for resuming an exact session.
 ///
-/// `session_path` is authoritative for Pi and OMP. The remaining tools resume
-/// by `session_id`. `home` is used to prefer Hyper's managed executable at
-/// `~/.hyper/bin/hyper` without consulting a shell.
+/// `session_path` is authoritative for Pi, Rpi, and OMP. The remaining tools
+/// resume by `session_id`. `home` is used to prefer Hyper's managed executable
+/// at `~/.hyper/bin/hyper` and Rpi's managed executable at `~/.pi-rs/bin/rpi`
+/// without consulting a shell.
 pub fn native_resume(
     target: TargetTool,
     session_path: &Path,
@@ -259,6 +262,10 @@ pub fn native_resume(
 ) -> CommandSpec {
     match target {
         TargetTool::Pi => command("pi", [os("--session"), session_path.as_os_str().to_owned()]),
+        TargetTool::Rpi => command(
+            preferred_rpi_executable(home),
+            [os("--session"), session_path.as_os_str().to_owned()],
+        ),
         TargetTool::Omp => command("omp", [os("--resume"), session_path.as_os_str().to_owned()]),
         TargetTool::Droid => command("droid", [os("--resume"), os(session_id)]),
         TargetTool::Codex => command("codex", [os("resume"), os(session_id)]),
@@ -280,6 +287,10 @@ pub fn native_fork(
 ) -> CommandSpec {
     match target {
         TargetTool::Pi => command("pi", [os("--fork"), session_path.as_os_str().to_owned()]),
+        TargetTool::Rpi => command(
+            preferred_rpi_executable(home),
+            [os("--fork"), session_path.as_os_str().to_owned()],
+        ),
         TargetTool::Omp => command("omp", [os("--fork"), session_path.as_os_str().to_owned()]),
         TargetTool::Droid => command("droid", [os("--fork"), os(session_id)]),
         TargetTool::Codex => command("codex", [os("fork"), os(session_id)]),
@@ -302,6 +313,7 @@ pub fn native_fork(
 pub fn resolve_tool_executable(target: TargetTool, home: &Path) -> Result<OsString> {
     let program = match target {
         TargetTool::Pi => OsString::from("pi"),
+        TargetTool::Rpi => preferred_rpi_executable(home),
         TargetTool::Omp => OsString::from("omp"),
         TargetTool::Droid => OsString::from("droid"),
         TargetTool::Codex => OsString::from("codex"),
@@ -685,6 +697,7 @@ fn build_local(
     match kind {
         LauncherKind::Omp => build_omp(args, home),
         LauncherKind::Pi => build_pi(args, home),
+        LauncherKind::Rpi => build_rpi(args, home),
         LauncherKind::Grok => build_grok(args, home, repo_root),
         LauncherKind::Hyper => build_hyper(args, home, repo_root),
         LauncherKind::Droid => build_droid(args, home, repo_root),
@@ -732,11 +745,35 @@ fn build_omp(args: &[OsString], home: &Path) -> Result<LaunchPlan> {
 
 fn build_pi(args: &[OsString], home: &Path) -> Result<LaunchPlan> {
     let pi = resolve_launcher_executable("pi")?;
+    Ok(LaunchPlan::Command(build_pi_family(
+        LauncherKind::Pi,
+        pi,
+        args,
+        home,
+    )?))
+}
+
+fn build_rpi(args: &[OsString], home: &Path) -> Result<LaunchPlan> {
+    let rpi = resolve_rpi_launcher_executable(home)?;
+    Ok(LaunchPlan::Command(build_pi_family(
+        LauncherKind::Rpi,
+        rpi,
+        args,
+        home,
+    )?))
+}
+
+fn build_pi_family(
+    kind: LauncherKind,
+    program: OsString,
+    args: &[OsString],
+    home: &Path,
+) -> Result<CommandSpec> {
     let command = if args.is_empty() {
-        command(pi, [os("--continue")])
+        command(program, [os("--continue")])
     } else if args[0] == "--session" {
-        let id = required_selector(LauncherKind::Pi, args, "--session")?;
-        command_with_tail(pi, [os("--session"), id.clone()], &args[2..])
+        let id = required_selector(kind, args, "--session")?;
+        command_with_tail(program, [os("--session"), id.clone()], &args[2..])
     } else if args[0] == "--fork" {
         let (session, tail) = optional_selector(args, 1);
         let session = match session {
@@ -744,24 +781,24 @@ fn build_pi(args: &[OsString], home: &Path) -> Result<LaunchPlan> {
             None => {
                 let root = home.join(".pi/agent/sessions");
                 let path = latest_jsonl(&root, true).ok_or_else(|| LauncherError::NoSession {
-                    launcher: LauncherKind::Pi.as_str(),
+                    launcher: kind.as_str(),
                     root: root.clone(),
                     code: 1,
                 })?;
                 read_pi_session_id(&path).ok_or(LauncherError::SessionId {
-                    launcher: LauncherKind::Pi.as_str(),
+                    launcher: kind.as_str(),
                     path,
                     code: 1,
                 })?
             }
         };
-        command_with_tail(pi, [os("--fork"), session], tail)
+        command_with_tail(program, [os("--fork"), session], tail)
     } else if starts_with_hyphen(&args[0]) {
-        command(pi, args.iter().cloned())
+        command(program, args.iter().cloned())
     } else {
-        command_with_tail(pi, [os("--session"), args[0].clone()], &args[1..])
+        command_with_tail(program, [os("--session"), args[0].clone()], &args[1..])
     };
-    Ok(LaunchPlan::Command(command))
+    Ok(command)
 }
 
 fn build_grok(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Result<LaunchPlan> {
@@ -1278,6 +1315,32 @@ fn resolve_hyper_launcher_executable(home: &Path) -> Result<OsString> {
         })
 }
 
+fn preferred_rpi_executable(home: &Path) -> OsString {
+    preferred_rpi_executable_in(home, env::var_os("PI_HOME").as_deref())
+}
+
+fn preferred_rpi_executable_in(home: &Path, pi_home: Option<&OsStr>) -> OsString {
+    let pi_home = pi_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".pi-rs"));
+    let managed = pi_home.join("bin/rpi");
+    if managed.is_file() {
+        managed.into_os_string()
+    } else {
+        os("rpi")
+    }
+}
+
+fn resolve_rpi_launcher_executable(home: &Path) -> Result<OsString> {
+    let preferred = preferred_rpi_executable(home);
+    resolve_executable(&preferred)
+        .map(PathBuf::into_os_string)
+        .ok_or(LauncherError::MissingExecutable {
+            executable: preferred,
+        })
+}
+
 fn resolve_launcher_executable(program: &str) -> Result<OsString> {
     resolve_executable(OsStr::new(program))
         .map(PathBuf::into_os_string)
@@ -1616,7 +1679,6 @@ mod tests {
     fn test_home() -> PathBuf {
         Path::new("/").join("workspace").join("user")
     }
-
     #[test]
     fn native_resume_uses_paths_only_for_pi_and_omp() {
         let home = test_home();
@@ -1625,6 +1687,10 @@ mod tests {
         assert_eq!(
             native_resume(TargetTool::Pi, path, "sid", home),
             command("pi", strings(&["--session", "/tmp/a session.jsonl"]))
+        );
+        assert_eq!(
+            native_resume(TargetTool::Rpi, path, "sid", home),
+            command("rpi", strings(&["--session", "/tmp/a session.jsonl"]))
         );
         assert_eq!(
             native_resume(TargetTool::Omp, path, "sid", home),
@@ -1656,6 +1722,10 @@ mod tests {
             native_fork(TargetTool::Pi, path, "ignored", home),
             command("pi", strings(&["--fork", "/tmp/session.jsonl"]))
         );
+        assert_eq!(
+            native_fork(TargetTool::Rpi, path, "ignored", home),
+            command("rpi", strings(&["--fork", "/tmp/session.jsonl"]))
+        );
     }
 
     #[test]
@@ -1669,6 +1739,89 @@ mod tests {
             binary.into_os_string()
         );
     }
+
+    #[test]
+    fn native_rpi_prefers_managed_binary() {
+        let temp = TempDir::new().unwrap();
+        let binary = temp.path().join(".pi-rs/bin/rpi");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, "").unwrap();
+        assert_eq!(
+            preferred_rpi_executable_in(temp.path(), None),
+            binary.into_os_string()
+        );
+    }
+
+    #[test]
+    fn native_rpi_falls_back_to_path_name() {
+        let temp = TempDir::new().unwrap();
+        assert_eq!(
+            preferred_rpi_executable_in(temp.path(), None),
+            OsString::from("rpi")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpilo_session_and_fork_use_rpi_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let rpi = bin.join("rpi");
+        fs::write(&rpi, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&rpi, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let previous = env::var_os("PATH");
+        // SAFETY: tests run single-threaded for this process env mutation.
+        unsafe {
+            env::set_var("PATH", &bin);
+        }
+
+        let resume = assert_command(
+            build_launcher(
+                LauncherKind::Rpi,
+                &strings(&["--session", "/tmp/session.jsonl", "prompt"]),
+                temp.path(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(resume.program, rpi.as_os_str());
+        assert_eq!(
+            resume.args,
+            strings(&["--session", "/tmp/session.jsonl", "prompt"])
+        );
+
+        let fork = assert_command(
+            build_launcher(
+                LauncherKind::Rpi,
+                &strings(&["--fork", "session-id"]),
+                temp.path(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(fork.program, rpi.as_os_str());
+        assert_eq!(fork.args, strings(&["--fork", "session-id"]));
+
+        let empty = assert_command(
+            build_launcher(LauncherKind::Rpi, &[], temp.path(), Path::new("/tmp")).unwrap(),
+        );
+        assert_eq!(empty.program, rpi.as_os_str());
+        assert_eq!(empty.args, strings(&["--continue"]));
+
+        match previous {
+            Some(value) => unsafe {
+                env::set_var("PATH", value);
+            },
+            None => unsafe {
+                env::remove_var("PATH");
+            },
+        }
+    }
+
 
     #[test]
     fn local_omp_arguments_are_not_shell_quoted_or_reparsed() {
@@ -1887,6 +2040,7 @@ mod tests {
         for kind in [
             LauncherKind::Omp,
             LauncherKind::Pi,
+            LauncherKind::Rpi,
             LauncherKind::Grok,
             LauncherKind::Droid,
             LauncherKind::Codex,
@@ -1897,8 +2051,14 @@ mod tests {
                 &strings(&["--", "--host", "evil", "--wt", "x", "--tmux"]),
                 &test_home(),
                 Path::new("/tmp"),
-            )
-            .unwrap();
+            );
+            let plan = match plan {
+                Ok(plan) => plan,
+                Err(LauncherError::MissingExecutable { .. }) if kind == LauncherKind::Rpi => {
+                    continue;
+                }
+                Err(error) => panic!("unexpected error for {kind:?}: {error}"),
+            };
             let command = match plan {
                 LaunchPlan::Command(command) => command,
                 LaunchPlan::Fallback { fallback, .. } => fallback,
@@ -1920,6 +2080,7 @@ mod tests {
         for kind in [
             LauncherKind::Omp,
             LauncherKind::Pi,
+            LauncherKind::Rpi,
             LauncherKind::Grok,
             LauncherKind::Hyper,
             LauncherKind::Droid,
@@ -1931,8 +2092,14 @@ mod tests {
                 &strings(&["--session=my-id"]),
                 &test_home(),
                 Path::new("/tmp"),
-            )
-            .unwrap();
+            );
+            let plan = match plan {
+                Ok(plan) => plan,
+                Err(LauncherError::MissingExecutable { .. }) if kind == LauncherKind::Rpi => {
+                    continue;
+                }
+                Err(error) => panic!("unexpected error for {kind:?}: {error}"),
+            };
             let command = match plan {
                 LaunchPlan::Command(command) => command,
                 LaunchPlan::Fallback { primary, .. } => primary,
@@ -1954,6 +2121,7 @@ mod tests {
         for kind in [
             LauncherKind::Omp,
             LauncherKind::Pi,
+            LauncherKind::Rpi,
             LauncherKind::Grok,
             LauncherKind::Droid,
             LauncherKind::Codex,
