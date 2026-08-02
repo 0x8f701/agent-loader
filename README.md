@@ -36,7 +36,7 @@ The installer verifies every download against the release's `SHA256SUMS` and ins
 Pin a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.2.0
+curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.2.1
 ```
 
 If `al` is not on PATH after installation, open a new terminal or use the full path printed during install.
@@ -135,6 +135,10 @@ Common `tmux-run` flags: `--no-attach`, `--fresh`, `-s session`, `-n window`, `-
 
 `grok` and `hyper` share the same storage layout; a Grok session can be converted to Hyper in place, and Hyper targets reuse Grok's native format. `pi` and `rpi` likewise share Pi session storage; Rpi launches the `rpi` executable against that layout.
 
+The managed `rpi` executable is resolved from `$PI_HOME/bin/rpi`, then
+`~/.rpi/bin/rpi`, then `PATH`. Runtime sessions remain in Pi-compatible storage
+under `$PI_CODING_AGENT_DIR/sessions` or `~/.pi/agent/sessions`.
+
 Session conversion is intentionally lossy:
 
 - Only user/assistant messages and the first recognized text block from each message are preserved. Images, attachments, tool calls, and other metadata are dropped.
@@ -188,14 +192,14 @@ Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 
 | Asset | Example |
 |-------|---------|
-| macOS arm64 | `al-0.2.0-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `al-0.2.0-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc 2.31+) | `al-0.2.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc 2.31+) | `al-0.2.0-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `al-0.2.0-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `al-0.2.1-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `al-0.2.1-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 (glibc 2.31+) | `al-0.2.1-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc 2.31+) | `al-0.2.1-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `al-0.2.1-x86_64-pc-windows-msvc.zip` |
 | Checksums | `SHA256SUMS` |
 
-The tag must match `Cargo.toml` version exactly (`v0.2.0` ↔ `0.2.0`) or the build fails.
+The tag must match `Cargo.toml` version exactly (`v0.2.1` ↔ `0.2.1`) or the build fails.
 
 ## License
 

@@ -9,7 +9,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | sh
-#   sh install.sh --version v0.2.0      # pin a specific release
+#   sh install.sh --version v0.2.1      # pin a specific release
 #
 # Environment:
 #   AL_HOME                install root (default: ~/.agent-loader)

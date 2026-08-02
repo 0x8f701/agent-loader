@@ -6,7 +6,7 @@
 #
 # Usage:
 #   irm https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.ps1 | iex
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.0
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.1
 #
 # Environment:
 #   AL_HOME                install root (default: %USERPROFILE%\.agent-loader)

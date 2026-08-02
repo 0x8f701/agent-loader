@@ -478,7 +478,11 @@ pub fn run_fzf(lines: &[String]) -> Result<FzfOutcome> {
 /// or fzf exits with an unexpected code.
 pub fn pick_target_tool(tools: &[TargetTool]) -> Result<TargetOutcome> {
     let fzf = which_fzf()?;
-    let mut cmd = Command::new(&fzf);
+    pick_target_tool_with_fzf(tools, &fzf)
+}
+
+fn pick_target_tool_with_fzf(tools: &[TargetTool], fzf: &Path) -> Result<TargetOutcome> {
+    let mut cmd = Command::new(fzf);
     cmd.args([
         "--layout=reverse",
         "--height=40%",
@@ -1090,6 +1094,23 @@ mod tests {
         };
         assert_eq!(source, SourceTool::Omp);
         assert_eq!(path.as_os_str().as_bytes(), path_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sks_target_picker_can_select_rpi() {
+        let temp = tempfile::tempdir().unwrap();
+        let fzf = temp.path().join("fzf");
+        fs::write(&fzf, b"#!/bin/sh\nwhile IFS= read -r line; do if [ \"$line\" = rpi ]; then printf '%s\\n' \"$line\"; fi; done\n").unwrap();
+        let mut permissions = fs::metadata(&fzf).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fzf, permissions).unwrap();
+
+        let tools = target_tools_for_source(SourceTool::Pi);
+        assert_eq!(
+            pick_target_tool_with_fzf(&tools, &fzf).unwrap(),
+            TargetOutcome::Selected(TargetTool::Rpi)
+        );
     }
 
     // -- target_tools_for_source --

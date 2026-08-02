@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::SystemTime;
@@ -252,7 +252,7 @@ pub type Result<T, E = LauncherError> = std::result::Result<T, E>;
 ///
 /// `session_path` is authoritative for Pi, Rpi, and OMP. The remaining tools
 /// resume by `session_id`. `home` is used to prefer Hyper's managed executable
-/// at `~/.hyper/bin/hyper` and Rpi's managed executable at `~/.pi-rs/bin/rpi`
+/// at `~/.hyper/bin/hyper` and Rpi's managed executable at `~/.rpi/bin/rpi`
 /// without consulting a shell.
 pub fn native_resume(
     target: TargetTool,
@@ -779,17 +779,13 @@ fn build_pi_family(
         let session = match session {
             Some(session) => session.clone(),
             None => {
-                let root = home.join(".pi/agent/sessions");
+                let root = pi_session_root(home);
                 let path = latest_jsonl(&root, true).ok_or_else(|| LauncherError::NoSession {
                     launcher: kind.as_str(),
                     root: root.clone(),
                     code: 1,
                 })?;
-                read_pi_session_id(&path).ok_or(LauncherError::SessionId {
-                    launcher: kind.as_str(),
-                    path,
-                    code: 1,
-                })?
+                path.into_os_string()
             }
         };
         command_with_tail(program, [os("--fork"), session], tail)
@@ -1232,31 +1228,6 @@ fn latest_jsonl(root: &Path, recursive: bool) -> Option<PathBuf> {
     latest.map(|(_, path)| path)
 }
 
-fn read_pi_session_id(path: &Path) -> Option<OsString> {
-    let file = File::open(path).ok()?;
-    for line in BufReader::new(file)
-        .lines()
-        .map_while(std::result::Result::ok)
-    {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let Some(object) = value.as_object() else {
-            continue;
-        };
-        if object.get("type").is_some_and(|kind| kind != "session") {
-            continue;
-        }
-        if let Some(id) = object
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            return Some(os(id));
-        }
-    }
-    None
-}
 
 fn find_repo_root(cwd: &Path) -> Option<PathBuf> {
     let start = fs::canonicalize(cwd).ok()?;
@@ -1287,6 +1258,18 @@ fn worktree_path(repo: &Path, name: &OsStr, kind: LauncherKind) -> Result<PathBu
     worktree_name.push("-");
     worktree_name.push(name);
     Ok(parent.join(worktree_name))
+}
+
+fn pi_session_root(home: &Path) -> PathBuf {
+    pi_session_root_in(home, env::var_os("PI_CODING_AGENT_DIR").as_deref())
+}
+
+fn pi_session_root_in(home: &Path, agent_dir: Option<&OsStr>) -> PathBuf {
+    agent_dir
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".pi/agent"))
+        .join("sessions")
 }
 
 fn preferred_hyper_executable(home: &Path) -> OsString {
@@ -1323,7 +1306,7 @@ fn preferred_rpi_executable_in(home: &Path, pi_home: Option<&OsStr>) -> OsString
     let pi_home = pi_home
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".pi-rs"));
+        .unwrap_or_else(|| home.join(".rpi"));
     let managed = pi_home.join("bin/rpi");
     if managed.is_file() {
         managed.into_os_string()
@@ -1743,13 +1726,24 @@ mod tests {
     #[test]
     fn native_rpi_prefers_managed_binary() {
         let temp = TempDir::new().unwrap();
-        let binary = temp.path().join(".pi-rs/bin/rpi");
+        let binary = temp.path().join(".rpi/bin/rpi");
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         fs::write(&binary, "").unwrap();
         assert_eq!(
             preferred_rpi_executable_in(temp.path(), None),
             binary.into_os_string()
         );
+    }
+
+    #[test]
+    fn rpi_session_root_honors_configured_agent_dir() {
+        let home = Path::new("/").join("workspace").join("user");
+        let configured = Path::new("/").join("workspace").join("agent-root");
+        assert_eq!(
+            pi_session_root_in(&home, Some(configured.as_os_str())),
+            configured.join("sessions")
+        );
+        assert_eq!(pi_session_root_in(&home, None), home.join(".pi/agent/sessions"));
     }
 
     #[test]
@@ -1767,59 +1761,61 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().unwrap();
-        let bin = temp.path().join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        let rpi = bin.join("rpi");
+        let rpi_home = temp.path().join("managed-rpi");
+        let rpi = rpi_home.join("bin/rpi");
+        fs::create_dir_all(rpi.parent().unwrap()).unwrap();
         fs::write(&rpi, b"#!/bin/sh\n").unwrap();
         fs::set_permissions(&rpi, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let previous = env::var_os("PATH");
-        // SAFETY: tests run single-threaded for this process env mutation.
-        unsafe {
-            env::set_var("PATH", &bin);
-        }
-
-        let resume = assert_command(
-            build_launcher(
-                LauncherKind::Rpi,
-                &strings(&["--session", "/tmp/session.jsonl", "prompt"]),
-                temp.path(),
-                Path::new("/tmp"),
-            )
-            .unwrap(),
-        );
+        let program = preferred_rpi_executable_in(temp.path(), Some(rpi_home.as_os_str()));
+        let resume = build_pi_family(
+            LauncherKind::Rpi,
+            program.clone(),
+            &strings(&["--session", "/tmp/session.jsonl", "prompt"]),
+            temp.path(),
+        ).unwrap();
         assert_eq!(resume.program, rpi.as_os_str());
         assert_eq!(
             resume.args,
             strings(&["--session", "/tmp/session.jsonl", "prompt"])
         );
 
-        let fork = assert_command(
-            build_launcher(
-                LauncherKind::Rpi,
-                &strings(&["--fork", "session-id"]),
-                temp.path(),
-                Path::new("/tmp"),
-            )
-            .unwrap(),
-        );
+        let fork = build_pi_family(
+            LauncherKind::Rpi,
+            program.clone(),
+            &strings(&["--fork", "session-id"]),
+            temp.path(),
+        ).unwrap();
         assert_eq!(fork.program, rpi.as_os_str());
         assert_eq!(fork.args, strings(&["--fork", "session-id"]));
 
-        let empty = assert_command(
-            build_launcher(LauncherKind::Rpi, &[], temp.path(), Path::new("/tmp")).unwrap(),
-        );
+        let empty = build_pi_family(
+            LauncherKind::Rpi,
+            program,
+            &[],
+            temp.path(),
+        ).unwrap();
         assert_eq!(empty.program, rpi.as_os_str());
         assert_eq!(empty.args, strings(&["--continue"]));
+    }
 
-        match previous {
-            Some(value) => unsafe {
-                env::set_var("PATH", value);
-            },
-            None => unsafe {
-                env::remove_var("PATH");
-            },
-        }
+    #[cfg(unix)]
+    #[test]
+    fn rpilo_implicit_fork_uses_latest_session_path() {
+        let temp = TempDir::new().unwrap();
+        let rpi = temp.path().join("managed-rpi/bin/rpi");
+        let session = temp.path().join(".pi/agent/sessions/project/session.jsonl");
+        fs::create_dir_all(session.parent().unwrap()).unwrap();
+        fs::write(&session, "{}\n").unwrap();
+
+        let fork = build_pi_family(
+            LauncherKind::Rpi,
+            rpi.clone().into_os_string(),
+            &[os("--fork")],
+            temp.path(),
+        ).unwrap();
+        assert_eq!(fork.program, rpi.as_os_str());
+        assert_eq!(fork.args, vec![os("--fork"), session.into_os_string()]);
     }
 
 
