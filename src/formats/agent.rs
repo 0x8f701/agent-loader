@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, types::ValueRef};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -101,10 +101,14 @@ fn read_messages(connection: &Connection, path: &Path) -> Result<Vec<Message>> {
         Err(error) if is_missing_table(&error) => return Ok(Vec::new()),
         Err(error) => return Err(error).with_context(|| format!("reading Agent blobs {}", path.display())),
     };
-    let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0)).with_context(|| format!("querying Agent blobs {}", path.display()))?;
+    let rows = statement.query_map([], |row| match row.get_ref(0)? {
+        ValueRef::Blob(value) | ValueRef::Text(value) => Ok(Some(value.to_vec())),
+        _ => Ok(None),
+    }).with_context(|| format!("querying Agent blobs {}", path.display()))?;
     let mut messages = Vec::new();
     for row in rows {
-        for value in json_values(&row.with_context(|| format!("reading Agent blob {}", path.display()))?) {
+        let Some(blob) = row.with_context(|| format!("reading Agent blob {}", path.display()))? else { continue };
+        for value in json_values(&blob) {
             if let Some(message) = project_message(&value) { messages.push(message); }
         }
     }
@@ -143,12 +147,18 @@ fn balanced_json_objects(data: &[u8]) -> impl Iterator<Item = &[u8]> {
 fn project_message(value: &Value) -> Option<Message> {
     let object = value.as_object()?;
     let role = match object.get("role").and_then(Value::as_str)? { "user" => Role::User, "assistant" => Role::Assistant, _ => return None };
+    if role == Role::User && is_synthesized_user_record(object) { return None; }
     let raw = first_agent_text(object.get("content")?)?;
     let text = if role == Role::User { clean_user_text(raw)? } else { raw.trim().to_owned() };
     if text.is_empty() { return None; }
     let timestamp = ["timestamp", "createdAt", "created_at", "updatedAt", "updated_at"].into_iter()
         .find_map(|key| object.get(key).and_then(Value::as_str)).map(str::to_owned);
     Some(Message { role, text, timestamp })
+}
+
+fn is_synthesized_user_record(object: &serde_json::Map<String, Value>) -> bool {
+    object.get("providerOptions").and_then(|value| value.get("cursor"))
+        .and_then(|cursor| cursor.get("isSummary")).and_then(Value::as_bool) == Some(true)
 }
 
 fn first_agent_text(content: &Value) -> Option<&str> {
@@ -171,8 +181,8 @@ fn clean_user_text(text: &str) -> Option<String> {
         let joined = queries.into_iter().map(str::trim).filter(|value| !value.is_empty()).collect::<Vec<_>>().join("\n");
         return (!joined.is_empty()).then_some(joined);
     }
-    let cleaned = ["user_info", "system_reminder", "attached_files", "timestamp"].into_iter()
-        .fold(text.to_owned(), |text, tag| remove_tagged_sections(&text, tag)).trim().to_owned();
+    let cleaned = ["user_info", "system_reminder", "attached_files", "timestamp", "git_status", "agent_transcripts"]
+        .into_iter().fold(text.to_owned(), |text, tag| remove_tagged_sections(&text, tag)).trim().to_owned();
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
@@ -264,10 +274,23 @@ mod tests {
     }
     #[test]
     fn cleans_user_wrappers_and_skips_injected_only_records() {
-        let (_home, path) = fixture(Some(r#"{"agentId":"id"}"#), &[br#"{"role":"user","content":"<user_info>ignore</user_info><user_query>real request</user_query><system_reminder>ignore</system_reminder>"}"#, br#"{"role":"user","content":"<attached_files>ignore</attached_files><timestamp>ignore</timestamp>"}"#], None);
+        let injected_context = br#"{"role":"user","content":"<user_info>ignore</user_info><agent_transcripts>ignore</agent_transcripts>","providerOptions":{"cursor":{"requestContextCompleteness":{"rules":true}}}}"#;
+        let real_context = br#"{"role":"user","content":"<user_info>ignore</user_info>plain real request","providerOptions":{"cursor":{"requestContextCompleteness":{"rules":true}}}}"#;
+        let synthesized_summary = br#"{"role":"user","content":"summary-only term","providerOptions":{"cursor":{"isSummary":true}}}"#;
+        let (_home, path) = fixture(Some(r#"{"agentId":"id"}"#), &[br#"{"role":"user","content":"<user_info>ignore</user_info><user_query>tagged real request</user_query><system_reminder>ignore</system_reminder>"}"#, br#"{"role":"user","content":"<attached_files>ignore</attached_files><timestamp>ignore</timestamp>"}"#, injected_context, real_context, synthesized_summary], None);
         let session = parse(&path).unwrap();
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].text, "real request");
+        assert_eq!(session.messages.iter().map(|message| message.text.as_str()).collect::<Vec<_>>(), ["tagged real request", "plain real request"]);
+    }
+    #[test]
+    fn malformed_blob_storage_classes_do_not_hide_valid_messages() {
+        let (_home, path) = fixture(Some(r#"{"agentId":"id"}"#), &[br#"{"role":"user","content":"valid message"}"#], None);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute("INSERT INTO blobs VALUES('null', NULL)", []).unwrap();
+        connection.execute("INSERT INTO blobs VALUES('integer', 7)", []).unwrap();
+        connection.execute("INSERT INTO blobs VALUES('text', ?1)", [r#"{"role":"assistant","content":"text message"}"#]).unwrap();
+        drop(connection);
+        let session = parse(&path).unwrap();
+        assert_eq!(session.messages.iter().map(|message| message.text.as_str()).collect::<Vec<_>>(), ["valid message", "text message"]);
     }
     #[test]
     fn subagents_are_rejected_as_non_resumable() {
