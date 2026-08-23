@@ -87,8 +87,8 @@ al sessions sync host-a host-b --tool omp --tool pi --dry-run
 # Run one shell-compatible command string in a tmux-managed pane (Unix only).
 al tmux-run -c /workspace/project --fresh -- 'make test'
 
-# Launch Cursor's official `agent` CLI. Bare `agentlo` continues Cursor's
-# latest chat, or starts a new chat when the current workspace has none.
+# Launch Cursor's official `agent` CLI. Bare `agentlo` tries to continue
+# Cursor's latest chat, then starts a new chat if `--continue` exits nonzero.
 al agentlo
 al agentlo chat-123 "fix the parser"
 al agentlo --session chat-123 "fix the parser"
@@ -121,7 +121,7 @@ Run `al --help` and `al COMMAND --help` for the current argument surface.
 
   On macOS, remote launchers map `/Users/<user>` to `/home/<user>`. Additional component-aware mappings can be supplied through `AL_REMOTE_PATH_MAPS` as an ordered JSON array of absolute source/destination pairs, for example `[["/Volumes/workspace","/srv/workspace"]]`. Every source and destination must be an absolute path; malformed configuration fails before SSH is invoked. The remote host must have `al` installed and on PATH.
 
-  `al agentlo` launches Cursor's official `agent` CLI. With no tool args it first runs `agent --force --trust --approve-mcps --continue`; if Cursor reports no previous chat, it retries as `agent --force --trust --approve-mcps` to create a new chat. Cursor's native local worktree options (`-w`/`--worktree [NAME]` and `--worktree-base REF`) pass through normally. The launcher-level `--wt NAME` remains the remote-host worktree control and therefore requires `--host`; `--tmux` works for both local and remote launches. A `--session ID` selector (or a positional chat id) maps to `--resume ID`; any other arguments are forwarded verbatim after the base approval flags. Separately, `al sessions`, `al sessions search`, `sks`, and `skss` discover native Cursor Agent sessions and can reopen them exactly; conversion and sync remain disabled because the native SQLite/blob format is undocumented and live stores may depend on WAL state.
+  `al agentlo` launches Cursor's official `agent` CLI. With no tool args it first runs `agent --force --trust --approve-mcps --continue`; if that command exits nonzero, it retries as `agent --force --trust --approve-mcps` to create a new chat. Cursor's native local worktree options (`-w`/`--worktree [NAME]` and `--worktree-base REF`) pass through normally. The launcher-level `--wt NAME` remains the remote-host worktree control and therefore requires `--host`; `--tmux` works for both local and remote launches. A `--session ID` selector (or a positional chat id) maps to `--resume ID`; any other arguments are forwarded verbatim after the base approval flags. Separately, `al sessions`, `al sessions search`, `sks`, and `skss` discover native Cursor Agent sessions and can reopen them exactly; conversion and sync remain disabled because the native SQLite/blob format is undocumented and live stores may depend on WAL state.
 - `al tmux-run ...` — run a command inside the tmux integration wrapper (Unix only; Windows returns an explicit unsupported-platform error).
 
 ```sh
