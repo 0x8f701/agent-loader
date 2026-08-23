@@ -16,8 +16,8 @@ use chrono::{Local, TimeZone};
 use walkdir::WalkDir;
 
 use crate::domain::{Session, SessionRow, SourceTool};
-use crate::formats::{claude, codex, droid, grok, omp, pi};
-use crate::fs::{is_grok_summary, is_tree_top_level_session, path_under_root};
+use crate::formats::{agent, claude, codex, droid, grok, omp, pi};
+use crate::fs::{is_agent_store, is_grok_summary, is_tree_top_level_session, path_under_root};
 use crate::picker::{dedupe_rows, format_paths_line, select_rows};
 
 pub const DEFAULT_RECENT_COUNT: usize = 5;
@@ -168,6 +168,7 @@ impl Catalog {
         match tool {
             SourceTool::Pi | SourceTool::Omp => is_tree_top_level_session(path, &root),
             SourceTool::Grok => is_grok_summary(path, &root),
+            SourceTool::Agent => is_agent_store(path, &root),
             SourceTool::Droid | SourceTool::Codex | SourceTool::Claude => true,
         }
     }
@@ -180,6 +181,7 @@ impl Catalog {
             SourceTool::Codex => codex::parse(path),
             SourceTool::Claude => claude::parse(path),
             SourceTool::Grok => grok::parse(path, &self.root_for_tool(SourceTool::Grok).path),
+            SourceTool::Agent => agent::parse(path),
         }
         .with_context(|| format!("parsing {tool} session {}", path.display()))?;
         session.tool = tool;
@@ -313,7 +315,7 @@ impl Catalog {
                         continue;
                     }
                 };
-                let modified_epoch = metadata_epoch(&metadata);
+                let (modified_epoch, size) = session_file_stats(tool, &path, &metadata);
                 let session = match self.parse(tool, &path) {
                     Ok(session) => session,
                     Err(error) => {
@@ -335,7 +337,7 @@ impl Catalog {
                     session_id: session.session_id,
                     summary: session.summary,
                     path,
-                    size: metadata.len(),
+                    size,
                     cwd: session.cwd,
                 });
             }
@@ -431,6 +433,7 @@ fn root_spec(tool: SourceTool) -> (&'static Path, &'static str) {
         SourceTool::Codex => (Path::new(".codex/sessions"), "rollout-*.jsonl"),
         SourceTool::Claude => (Path::new(".claude/projects"), "*.jsonl"),
         SourceTool::Grok => (Path::new(".grok/sessions"), "summary.json"),
+        SourceTool::Agent => (Path::new(".cursor/chats"), "store.db"),
     }
 }
 
@@ -460,6 +463,7 @@ fn matches_pattern(tool: SourceTool, path: &Path) -> bool {
                     .is_some_and(|name| name.starts_with("rollout-"))
         }
         SourceTool::Grok => file_name == OsStr::new("summary.json"),
+        SourceTool::Agent => file_name == OsStr::new("store.db"),
     }
 }
 
@@ -511,6 +515,26 @@ fn missing_user_home_message() -> &'static str {
     } else {
         "HOME is not set"
     }
+}
+
+fn session_file_stats(tool: SourceTool, path: &Path, metadata: &Metadata) -> (f64, u64) {
+    if tool != SourceTool::Agent {
+        return (metadata_epoch(metadata), metadata.len());
+    }
+    let mut modified = metadata_epoch(metadata);
+    let mut size = metadata.len();
+    let Some(directory) = path.parent() else {
+        return (modified, size);
+    };
+    for name in ["store.db-wal", "store.db-shm", "meta.json"] {
+        if let Ok(metadata) = std::fs::symlink_metadata(directory.join(name)) {
+            if metadata.is_file() && !metadata.file_type().is_symlink() {
+                modified = modified.max(metadata_epoch(&metadata));
+                size = size.saturating_add(metadata.len());
+            }
+        }
+    }
+    (modified, size)
 }
 
 #[cfg(unix)]
@@ -981,5 +1005,55 @@ mod tests {
 
         exact.path = PathBuf::from(OsString::from_vec(b"/tmp/unsafe\npath".to_vec()));
         assert!(render_paths_tsv(&[exact]).is_empty());
+    }
+
+    fn write_agent(catalog: &Catalog, id: &str, message: &str) -> PathBuf {
+        let directory = catalog
+            .root_for_tool(SourceTool::Agent)
+            .path
+            .join("0123456789abcdef0123456789abcdef")
+            .join(id);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("store.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)", []).unwrap();
+        connection.execute("CREATE TABLE blobs(id TEXT PRIMARY KEY,data BLOB)", []).unwrap();
+        connection.execute("INSERT INTO meta VALUES('0', ?1)", [format!(r#"{{"agentId":"{id}","name":"New Agent"}}"#)]).unwrap();
+        connection.execute("INSERT INTO blobs VALUES('message', ?1)", [serde_json::to_vec(&serde_json::json!({"role":"user","content":message})).unwrap()]).unwrap();
+        drop(connection);
+        fs::write(directory.join("meta.json"), r#"{"cwd":"/workspace/agent","title":"Agent title","updatedAtMs":1767225660000}"#).unwrap();
+        fs::write(directory.join("store.db-wal"), b"wal").unwrap();
+        path
+    }
+
+    #[test]
+    fn agent_discovery_search_and_row_stats_use_native_artifacts() {
+        let (_home, catalog) = catalog();
+        let path = write_agent(&catalog, "agent-session", "Needle in Agent conversation");
+        let nested = path.parent().unwrap().join("nested/store.db");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"ignored").unwrap();
+        assert_eq!(catalog.discover(SourceTool::Agent), [path.clone()]);
+        let rows = catalog.search("needle", &SearchOptions { dedupe: false, tools: vec![SourceTool::Agent] }).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, SourceTool::Agent);
+        assert_eq!(rows[0].session_id, "agent-session");
+        assert_eq!(rows[0].summary, "Agent title");
+        assert_eq!(rows[0].cwd, Path::new("/workspace/agent"));
+        assert!(rows[0].size > fs::metadata(&path).unwrap().len());
+        assert_eq!(catalog.resolve_for_tool(SourceTool::Agent, "agent-session").unwrap().path, path);
+    }
+
+    #[test]
+    fn agent_subagents_are_excluded_from_catalog_rows() {
+        let (_home, catalog) = catalog();
+        let path = write_agent(&catalog, "subagent-session", "internal work");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute(
+            "UPDATE meta SET value = ?1 WHERE key = '0'",
+            [r#"{"agentId":"subagent-session","subagentInfo":{"parentAgentId":"parent"}}"#],
+        ).unwrap();
+        assert!(catalog.scan(&[SourceTool::Agent]).is_empty());
+        assert!(catalog.resolve_for_tool(SourceTool::Agent, "subagent-session").is_err());
     }
 }

@@ -77,6 +77,7 @@ pub enum LauncherKind {
     Droid,
     Codex,
     Claude,
+    Agent,
 }
 
 impl LauncherKind {
@@ -90,13 +91,14 @@ impl LauncherKind {
             Self::Droid => "dolo",
             Self::Codex => "colo",
             Self::Claude => "cclo",
+            Self::Agent => "agentlo",
         }
     }
 
     const fn argument_error_code(self) -> i32 {
         match self {
             Self::Grok | Self::Hyper | Self::Claude => 2,
-            Self::Omp | Self::Pi | Self::Rpi | Self::Droid | Self::Codex => 1,
+            Self::Omp | Self::Pi | Self::Rpi | Self::Droid | Self::Codex | Self::Agent => 1,
         }
     }
 
@@ -275,6 +277,16 @@ pub fn native_resume(
             preferred_hyper_executable(home),
             [os("--resume"), os(session_id)],
         ),
+        TargetTool::Agent => command(
+            "agent",
+            [
+                os("--force"),
+                os("--trust"),
+                os("--approve-mcps"),
+                os("--resume"),
+                os(session_id),
+            ],
+        ),
     }
 }
 
@@ -306,6 +318,7 @@ pub fn native_fork(
             preferred_hyper_executable(home),
             [os("--fork-session"), os("--resume"), os(session_id)],
         ),
+        TargetTool::Agent => unreachable!("Agent fork is rejected before launcher dispatch"),
     }
 }
 
@@ -320,6 +333,7 @@ pub fn resolve_tool_executable(target: TargetTool, home: &Path) -> Result<OsStri
         TargetTool::Claude => OsString::from("claude"),
         TargetTool::Grok => OsString::from("grok"),
         TargetTool::Hyper => preferred_hyper_executable(home),
+        TargetTool::Agent => OsString::from("agent"),
     };
     resolve_executable(&program)
         .map(PathBuf::into_os_string)
@@ -703,6 +717,7 @@ fn build_local(
         LauncherKind::Droid => build_droid(args, home, repo_root),
         LauncherKind::Codex => build_codex(args),
         LauncherKind::Claude => build_claude(args),
+        LauncherKind::Agent => build_agent(args),
     }
     .map(|mut plan| {
         if let LaunchPlan::Command(command) = &mut plan {
@@ -984,6 +999,35 @@ fn build_claude(args: &[OsString]) -> Result<LaunchPlan> {
         fallback_prefix.extend_from_slice(args);
         let fallback = command("claude", fallback_prefix);
         return Ok(LaunchPlan::Fallback { primary, fallback });
+    };
+    Ok(LaunchPlan::Command(command))
+}
+
+/// Build the raw, native argv for Cursor's official `agent` CLI.
+///
+/// The base approval flags `--force --trust --approve-mcps` always lead. With
+/// no tool args the launcher continues Cursor's own latest chat
+/// (`--continue`). A `--session ID` selector (or a positional chat id) maps
+/// to `--resume ID`, mirroring the OMP family; everything else is forwarded
+/// verbatim after the base flags. `agent` is resolved through `PATH` at
+/// execution time like the other generic CLIs (`omp`, `codex`, `claude`).
+fn build_agent(args: &[OsString]) -> Result<LaunchPlan> {
+    let base = [os("--force"), os("--trust"), os("--approve-mcps")];
+    let command = if args.is_empty() {
+        let mut prefix = base.to_vec();
+        prefix.push(os("--continue"));
+        command("agent", prefix)
+    } else if args[0] == "--session" {
+        let id = required_selector(LauncherKind::Agent, args, "--session")?;
+        let mut prefix = base.to_vec();
+        prefix.extend([os("--resume"), id.clone()]);
+        command_with_tail("agent", prefix, &args[2..])
+    } else if starts_with_hyphen(&args[0]) {
+        command_with_tail("agent", base, args)
+    } else {
+        let mut prefix = base.to_vec();
+        prefix.push(os("--resume"));
+        command_with_tail("agent", prefix, args)
     };
     Ok(LaunchPlan::Command(command))
 }
@@ -1687,6 +1731,13 @@ mod tests {
             native_resume(TargetTool::Claude, path, "sid", home),
             command("claude", strings(&["--resume", "sid"]))
         );
+        assert_eq!(
+            native_resume(TargetTool::Agent, path, "agent-id", home),
+            command(
+                "agent",
+                strings(&["--force", "--trust", "--approve-mcps", "--resume", "agent-id"]),
+            )
+        );
     }
 
     #[test]
@@ -2032,6 +2083,119 @@ mod tests {
     }
 
     #[test]
+    fn agentlo_default_appends_continue_after_base_flags() {
+        let command = assert_command(
+            build_launcher(LauncherKind::Agent, &[], &test_home(), Path::new("/tmp")).unwrap(),
+        );
+        assert_eq!(command.program, "agent");
+        assert_eq!(
+            command.args,
+            strings(&["--force", "--trust", "--approve-mcps", "--continue"]),
+        );
+    }
+
+    #[test]
+    fn agentlo_session_maps_to_resume_with_remaining_tail() {
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::Agent,
+                &strings(&["--session", "chat-123", "fix the parser"]),
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(command.program, "agent");
+        assert_eq!(
+            command.args,
+            strings(&[
+                "--force",
+                "--trust",
+                "--approve-mcps",
+                "--resume",
+                "chat-123",
+                "fix the parser",
+            ]),
+        );
+    }
+
+    #[test]
+    fn agentlo_leading_options_forwarded_verbatim_after_base() {
+        for args in [
+            strings(&["--continue"]),
+            strings(&["--resume", "chat-9"]),
+            strings(&["--model", "gpt-5", "prompt"]),
+        ] {
+            let command = assert_command(
+                build_launcher(LauncherKind::Agent, &args, &test_home(), Path::new("/tmp"))
+                    .unwrap(),
+            );
+            assert_eq!(command.program, "agent");
+            let mut expected = strings(&["--force", "--trust", "--approve-mcps"]);
+            expected.extend(args.iter().cloned());
+            assert_eq!(command.args, expected, "verbatim forwarding for {args:?}");
+        }
+    }
+
+    #[test]
+    fn agentlo_positional_chat_id_maps_to_resume() {
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::Agent,
+                &strings(&["chat-42", "do the thing"]),
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(command.program, "agent");
+        assert_eq!(
+            command.args,
+            strings(&[
+                "--force",
+                "--trust",
+                "--approve-mcps",
+                "--resume",
+                "chat-42",
+                "do the thing",
+            ]),
+        );
+    }
+
+    #[test]
+    fn agentlo_session_without_id_errors_with_normal_exit_code() {
+        let error = build_launcher(
+            LauncherKind::Agent,
+            &[os("--session")],
+            &test_home(),
+            Path::new("/tmp"),
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+    }
+
+    #[test]
+    fn agentlo_remote_argv_retains_agentlo_subcommand() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join(".git")).unwrap();
+        let plan = build_launcher(
+            LauncherKind::Agent,
+            &strings(&["--host", "host-a", "--session", "chat-7", "prompt"]),
+            &test_home(),
+            temp.path(),
+        )
+        .unwrap();
+        let LaunchPlan::Remote { host, argv, .. } = plan else {
+            panic!("expected remote plan, got {plan:?}");
+        };
+        assert_eq!(host, "host-a");
+        assert_eq!(
+            argv,
+            strings(&["al", "agentlo", "--session", "chat-7", "prompt"]),
+        );
+    }
+
+    #[test]
     fn dash_dash_stops_option_parsing_for_every_launcher() {
         for kind in [
             LauncherKind::Omp,
@@ -2041,6 +2205,7 @@ mod tests {
             LauncherKind::Droid,
             LauncherKind::Codex,
             LauncherKind::Claude,
+            LauncherKind::Agent,
         ] {
             let plan = build_launcher(
                 kind,
@@ -2082,6 +2247,7 @@ mod tests {
             LauncherKind::Droid,
             LauncherKind::Codex,
             LauncherKind::Claude,
+            LauncherKind::Agent,
         ] {
             let plan = build_launcher(
                 kind,
@@ -2122,6 +2288,7 @@ mod tests {
             LauncherKind::Droid,
             LauncherKind::Codex,
             LauncherKind::Claude,
+            LauncherKind::Agent,
         ] {
             let error = build_launcher(kind, &[os("--host=")], &test_home(), Path::new("/tmp"))
                 .unwrap_err();

@@ -157,6 +157,33 @@ pub fn is_grok_summary(path: &Path, root: &Path) -> bool {
     path_under_root(&path, &root)
 }
 
+/// Validates an Agent store at `root/<32-hex-workspace>/<session-id>/store.db`.
+pub fn is_agent_store(path: &Path, root: &Path) -> bool {
+    let Some((path, root, relative)) = absolute_relative_path(path, root) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let (
+        Some(Component::Normal(workspace)),
+        Some(Component::Normal(_)),
+        Some(Component::Normal(file_name)),
+        None,
+    ) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    )
+    else {
+        return false;
+    };
+    let workspace = workspace.as_encoded_bytes();
+    if workspace.len() != 32 || !workspace.iter().all(u8::is_ascii_hexdigit) {
+        return false;
+    }
+    file_name == OsStr::new("store.db") && path_under_root(&path, &root)
+}
+
 /// Atomically replaces `path` with one compact JSON value per line.
 ///
 /// The temporary file and destination are addressed relative to a descriptor for the parent
@@ -841,6 +868,24 @@ mod tests {
         assert!(is_grok_summary(&summary, &root));
         assert!(!is_grok_summary(&nested_summary, &root));
         assert!(!is_grok_summary(&wrong_name, &root));
+    }
+
+    #[test]
+    fn agent_validation_requires_exact_depth_hash_and_store_name() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("chats");
+        let directory = root.join("0123456789abcdef0123456789abcdef/session-id");
+        fs::create_dir_all(directory.join("nested")).unwrap();
+        let store = directory.join("store.db");
+        let nested = directory.join("nested/store.db");
+        let wrong = directory.join("meta.json");
+        let bad_hash = root.join("not-a-workspace-hash/session-id/store.db");
+        fs::create_dir_all(bad_hash.parent().unwrap()).unwrap();
+        for path in [&store, &nested, &wrong, &bad_hash] { fs::write(path, "x").unwrap(); }
+        assert!(is_agent_store(&store, &root));
+        assert!(!is_agent_store(&nested, &root));
+        assert!(!is_agent_store(&wrong, &root));
+        assert!(!is_agent_store(&bad_hash, &root));
     }
 
     #[test]

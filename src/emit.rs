@@ -360,6 +360,9 @@ pub fn emit_with_defaults<D: EmitDefaults>(
     context: &EmitContext,
     defaults: &mut D,
 ) -> Result<EmittedSession> {
+    if target == TargetTool::Agent {
+        bail!("Agent sessions cannot be emitted or converted");
+    }
     if session.messages.is_empty() {
         bail!(
             "input session has no convertible user/assistant text messages: {}",
@@ -427,6 +430,7 @@ pub fn emit_with_defaults<D: EmitDefaults>(
             let bundle = emit_grok(session, cwd, &session_id, start, &model);
             write_grok_bundle(&output, cwd, &bundle, defaults)?;
         }
+        TargetTool::Agent => unreachable!("Agent emission rejected before materialization"),
     }
 
     Ok(EmittedSession {
@@ -944,6 +948,7 @@ fn target_path(
             .join(grok_cwd.expect("Grok cwd computed before target path"))
             .join(session_id)
             .join("summary.json"),
+        TargetTool::Agent => unreachable!("Agent emission rejected before path selection"),
     };
     Ok(path)
 }
@@ -1329,7 +1334,7 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let home = temporary.path();
         let session = fixture(home);
-        for target in TargetTool::ALL {
+        for target in TargetTool::ALL.into_iter().filter(|target| *target != TargetTool::Agent) {
             let context = EmitContext::new(home).with_session_id(format!(
                 "00000000-0000-4000-8000-0000000000{}",
                 target as u8
@@ -1354,6 +1359,21 @@ mod tests {
                 assert!(name.ends_with(&format!("-{}.jsonl", emitted.session_id)));
             }
         }
+    }
+
+    #[test]
+    fn agent_emission_is_rejected_without_creating_store_files() {
+        let temporary = TempDir::new().unwrap();
+        let context = EmitContext::new(temporary.path());
+        let error = emit_with_defaults(
+            &fixture(temporary.path()),
+            TargetTool::Agent,
+            &context,
+            &mut FixedDefaults::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be emitted"));
+        assert!(!temporary.path().join(".cursor").exists());
     }
 
     #[cfg(unix)]

@@ -36,7 +36,8 @@ fn restore_raw_tail(cli: &mut Cli, arguments: &[OsString]) {
     };
     if !matches!(
         command_name,
-        "omlo" | "pilo" | "rpilo" | "grolo" | "hyperlo" | "dolo" | "colo" | "cclo" | "tmux-run"
+        "omlo" | "pilo" | "rpilo" | "grolo" | "hyperlo" | "dolo" | "colo" | "cclo" | "agentlo"
+            | "tmux-run"
     ) {
         return;
     }
@@ -49,6 +50,7 @@ fn restore_raw_tail(cli: &mut Cli, arguments: &[OsString]) {
         | Some(Command::Dolo(tail))
         | Some(Command::Colo(tail))
         | Some(Command::Cclo(tail))
+        | Some(Command::Agentlo(tail))
         | Some(Command::TmuxRun(tail)) => tail,
         _ => return,
     };
@@ -67,6 +69,7 @@ pub enum Command {
     Dolo(RawTail),
     Colo(RawTail),
     Cclo(RawTail),
+    Agentlo(RawTail),
     #[command(name = "tmux-run")]
     TmuxRun(RawTail),
     #[command(name = "__tmux-child", hide = true)]
@@ -128,7 +131,9 @@ pub struct SessionSearchArgs {
 
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct SessionConvertArgs {
+    #[arg(value_parser = non_agent_source)]
     pub source_tool: SourceTool,
+    #[arg(value_parser = non_agent_target)]
     pub target_tool: TargetTool,
     pub input: OsString,
     pub output: Option<PathBuf>,
@@ -139,6 +144,7 @@ pub struct SessionForkArgs {
     #[arg(long)]
     pub print_command: bool,
     pub session_ref: OsString,
+    #[arg(value_parser = non_agent_target)]
     pub target_tool: TargetTool,
 }
 
@@ -154,7 +160,7 @@ pub struct SessionOpenArgs {
 pub struct SessionSyncArgs {
     #[arg(required = true, num_args = 1..=2)]
     pub hosts: Vec<String>,
-    #[arg(long = "tool")]
+    #[arg(long = "tool", value_parser = non_agent_source)]
     pub tools: Vec<SourceTool>,
     #[arg(long)]
     pub dry_run: bool,
@@ -181,6 +187,25 @@ pub struct TmuxChildArgs {
     #[arg(long)]
     pub ready: PathBuf,
 }
+
+fn non_agent_source(value: &str) -> Result<SourceTool, String> {
+    let tool = value.parse::<SourceTool>().map_err(|error| error.to_string())?;
+    if tool == SourceTool::Agent {
+        Err("Agent sessions do not support conversion or sync".to_owned())
+    } else {
+        Ok(tool)
+    }
+}
+
+fn non_agent_target(value: &str) -> Result<TargetTool, String> {
+    let tool = value.parse::<TargetTool>().map_err(|error| error.to_string())?;
+    if tool == TargetTool::Agent {
+        Err("Agent is not a conversion or fork target".to_owned())
+    } else {
+        Ok(tool)
+    }
+}
+
 
 fn nonempty_query(value: &str) -> Result<String, String> {
     if value.trim().is_empty() {
@@ -234,6 +259,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Dolo(args) => dispatch_launcher(crate::launcher::LauncherKind::Droid, args.argv),
         Command::Colo(args) => dispatch_launcher(crate::launcher::LauncherKind::Codex, args.argv),
         Command::Cclo(args) => dispatch_launcher(crate::launcher::LauncherKind::Claude, args.argv),
+        Command::Agentlo(args) => dispatch_launcher(crate::launcher::LauncherKind::Agent, args.argv),
         Command::TmuxRun(args) => dispatch_tmux_run(args.argv),
         Command::TmuxChild(args) => dispatch_tmux_child(args),
     }
@@ -566,6 +592,14 @@ fn dispatch_session_launch(
 ) -> anyhow::Result<()> {
     let home = home_dir()?;
     let session = crate::sessions::resolve_any_session(&session_ref)?;
+    if session.tool == SourceTool::Agent && (fork || target != TargetTool::Agent) {
+        eprintln!("al: Agent sessions can only be reopened with target agent");
+        return exit_with(2);
+    }
+    if target == TargetTool::Agent && session.tool != SourceTool::Agent {
+        eprintln!("al: target agent only supports native Agent sessions");
+        return exit_with(2);
+    }
     let same_format = target.source() == Some(session.tool)
         || (session.tool == SourceTool::Grok && target == TargetTool::Hyper)
         || (session.tool == SourceTool::Pi && target == TargetTool::Rpi);
@@ -600,6 +634,7 @@ fn dispatch_session_launch(
                     OsString::from(&session_id),
                 ],
                 TargetTool::Claude => unreachable!(),
+                TargetTool::Agent => unreachable!("Agent cross-format launch rejected"),
             };
             crate::launcher::build_launcher(
                 kind,
@@ -710,6 +745,7 @@ fn launcher_kind_for_target(target: TargetTool) -> crate::launcher::LauncherKind
         TargetTool::Claude => crate::launcher::LauncherKind::Claude,
         TargetTool::Grok => crate::launcher::LauncherKind::Grok,
         TargetTool::Hyper => crate::launcher::LauncherKind::Hyper,
+        TargetTool::Agent => crate::launcher::LauncherKind::Agent,
     }
 }
 
@@ -938,6 +974,19 @@ mod tests {
     }
 
     #[test]
+    fn agent_is_open_only_on_the_cli_surface() {
+        assert!(Cli::try_parse_from(["al", "sessions", "convert", "agent", "omp", "id"]).is_err());
+        assert!(Cli::try_parse_from(["al", "sessions", "convert", "omp", "agent", "id"]).is_err());
+        assert!(Cli::try_parse_from(["al", "sessions", "fork", "id", "agent"]).is_err());
+        assert!(Cli::try_parse_from(["al", "sessions", "sync", "host", "--tool", "agent"]).is_err());
+
+        let parsed = Cli::try_parse_from(["al", "sessions", "open", "id", "agent"]).unwrap();
+        let Some(Command::Sessions(sessions)) = parsed.command else { panic!("expected sessions") };
+        let Some(SessionsCommand::Open(open)) = sessions.command else { panic!("expected open") };
+        assert_eq!(open.target_tool, TargetTool::Agent);
+    }
+
+    #[test]
     fn open_and_fork_preserve_session_ref_as_os_string() {
         for command in ["open", "fork"] {
             let parsed = Cli::try_parse_from([
@@ -1004,7 +1053,8 @@ mod tests {
     #[test]
     fn compatibility_command_spellings_parse() {
         let cases = [
-            "omlo", "pilo", "rpilo", "grolo", "hyperlo", "dolo", "colo", "cclo", "tmux-run",
+            "omlo", "pilo", "rpilo", "grolo", "hyperlo", "dolo", "colo", "cclo", "agentlo",
+            "tmux-run",
         ];
         for spelling in cases {
             let parsed = Cli::try_parse_from(["al", spelling, "--unknown", "value"]).unwrap();
@@ -1017,6 +1067,7 @@ mod tests {
                 | Command::Dolo(tail)
                 | Command::Colo(tail)
                 | Command::Cclo(tail)
+                | Command::Agentlo(tail)
                 | Command::TmuxRun(tail) => tail.argv,
                 other => panic!("unexpected command: {other:?}"),
             };

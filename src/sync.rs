@@ -572,13 +572,11 @@ fn validate_endpoint(endpoint: &Endpoint) -> Result<()> {
 }
 
 fn selected_tools(requested: &[SourceTool]) -> Vec<SourceTool> {
-    if requested.is_empty() {
-        return SourceTool::ALL.to_vec();
-    }
     let requested: HashSet<SourceTool> = requested.iter().copied().collect();
     SourceTool::ALL
         .into_iter()
-        .filter(|tool| requested.contains(tool))
+        .filter(|tool| *tool != SourceTool::Agent)
+        .filter(|tool| requested.is_empty() || requested.contains(tool))
         .collect()
 }
 
@@ -780,6 +778,7 @@ fn matches_tool_path(tool: SourceTool, path: &Path) -> bool {
             path.extension() == Some(OsStr::new("jsonl")) && os_starts_with(name, b"rollout-")
         }
         SourceTool::Grok => depth == 3 && !os_ends_with(name, b".lock"),
+        SourceTool::Agent => false,
     }
 }
 
@@ -801,6 +800,7 @@ fn remote_inventory_script(tool: SourceTool, root: &Path) -> Result<OsString> {
         SourceTool::Droid | SourceTool::Claude => "-type f -name '*.jsonl'",
         SourceTool::Codex => "-type f -name 'rollout-*.jsonl'",
         SourceTool::Grok => "-mindepth 3 -maxdepth 3 -type f ! -name '*.lock'",
+        SourceTool::Agent => "-false",
     });
     script.push(" -not -path '*/.rsync-partial/*' -printf '%P\\0'");
     Ok(script)
@@ -2331,6 +2331,7 @@ mod tests {
             (SourceTool::Grok, "encoded/session-id/active.lock", false),
             (SourceTool::Grok, "session-id/summary.json", false),
             (SourceTool::Grok, "a/b/c/d", false),
+            (SourceTool::Agent, "0123456789abcdef0123456789abcdef/id/store.db", false),
         ];
         for (tool, path, expected) in cases {
             let actual = matches_tool_path(*tool, Path::new(path));

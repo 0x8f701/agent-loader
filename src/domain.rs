@@ -16,16 +16,18 @@ pub enum SourceTool {
     Codex,
     Claude,
     Grok,
+    Agent,
 }
 
 impl SourceTool {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Pi,
         Self::Omp,
         Self::Droid,
         Self::Codex,
         Self::Claude,
         Self::Grok,
+        Self::Agent,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -36,6 +38,7 @@ impl SourceTool {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Grok => "grok",
+            Self::Agent => "agent",
         }
     }
 }
@@ -57,6 +60,7 @@ impl FromStr for SourceTool {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
             "grok" => Ok(Self::Grok),
+            "agent" => Ok(Self::Agent),
             _ => Err(ToolParseError(value.to_owned())),
         }
     }
@@ -73,10 +77,11 @@ pub enum TargetTool {
     Grok,
     Hyper,
     Rpi,
+    Agent,
 }
 
 impl TargetTool {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Pi,
         Self::Omp,
         Self::Droid,
@@ -85,6 +90,7 @@ impl TargetTool {
         Self::Grok,
         Self::Hyper,
         Self::Rpi,
+        Self::Agent,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -97,6 +103,7 @@ impl TargetTool {
             Self::Grok => "grok",
             Self::Hyper => "hyper",
             Self::Rpi => "rpi",
+            Self::Agent => "agent",
         }
     }
 
@@ -108,6 +115,7 @@ impl TargetTool {
             Self::Codex => Some(SourceTool::Codex),
             Self::Claude => Some(SourceTool::Claude),
             Self::Grok => Some(SourceTool::Grok),
+            Self::Agent => Some(SourceTool::Agent),
             Self::Hyper => None,
             Self::Rpi => None,
         }
@@ -141,6 +149,7 @@ impl FromStr for TargetTool {
             "grok" => Ok(Self::Grok),
             "hyper" => Ok(Self::Hyper),
             "rpi" => Ok(Self::Rpi),
+            "agent" => Ok(Self::Agent),
             _ => Err(ToolParseError(value.to_owned())),
         }
     }

@@ -161,6 +161,7 @@ pub fn tool_color(tool: SourceTool) -> &'static str {
         SourceTool::Codex => "\x1b[92m",
         SourceTool::Claude => "\x1b[93m",
         SourceTool::Grok => "\x1b[95m",
+        SourceTool::Agent => "\x1b[97m",
     }
 }
 
@@ -326,20 +327,14 @@ pub fn format_picker_line(row: &SessionRow, use_color: bool) -> Option<Vec<u8>> 
 
 // ── Target-tool ordering ──────────────────────────────────────────────── //
 
-/// Build the ordered list of target tools for a source, preferring the
-/// source's native tool (or `hyper` ahead of `grok` / `rpi` ahead of `pi`
-/// for shared storage) and appending the remaining tools in a fixed order.
-///
-/// Grok sessions are shared with Hyper; Hyper is listed first so the
-/// picker defaults to the more capable target while keeping Grok
-/// available. Pi sessions are shared with Rpi; Rpi is listed first for
-/// the same reason. Every other source defaults to its own native tool.
-/// The remaining candidates are appended in the order: `hyper, rpi, omp,
-/// codex, claude, grok, pi, droid`.
+/// Build the ordered list of compatible targets for a source. Agent stores are
+/// undocumented and can only reopen natively, so Agent is the sole target for
+/// Agent sessions and is not offered for other sources.
 pub fn target_tools_for_source(source: SourceTool) -> Vec<TargetTool> {
     let mut tools = match source {
         SourceTool::Grok => vec![TargetTool::Hyper, TargetTool::Grok],
         SourceTool::Pi => vec![TargetTool::Rpi, TargetTool::Pi],
+        SourceTool::Agent => return vec![TargetTool::Agent],
         _ => vec![source_to_target(source)],
     };
     for candidate in [
@@ -367,6 +362,7 @@ const fn source_to_target(source: SourceTool) -> TargetTool {
         SourceTool::Codex => TargetTool::Codex,
         SourceTool::Claude => TargetTool::Claude,
         SourceTool::Grok => TargetTool::Grok,
+        SourceTool::Agent => TargetTool::Agent,
     }
 }
 
@@ -1131,6 +1127,17 @@ mod tests {
         assert_eq!(tools.len(), 8);
     }
 
+    #[test]
+    fn target_tools_agent_is_native_only() {
+        assert_eq!(
+            target_tools_for_source(SourceTool::Agent),
+            vec![TargetTool::Agent]
+        );
+        for source in SourceTool::ALL.into_iter().filter(|source| *source != SourceTool::Agent) {
+            assert!(!target_tools_for_source(source).contains(&TargetTool::Agent));
+        }
+    }
+
     // -- parse_picker_selection --
 
     #[test]
@@ -1206,8 +1213,8 @@ mod tests {
     }
 
     #[test]
-    fn target_tools_all_eight_present() {
-        for source in SourceTool::ALL {
+    fn target_tools_non_agent_sources_keep_all_conversion_targets() {
+        for source in SourceTool::ALL.into_iter().filter(|source| *source != SourceTool::Agent) {
             let tools = target_tools_for_source(source);
             assert_eq!(tools.len(), 8, "wrong count for {source:?}");
             let set: HashSet<TargetTool> = tools.iter().copied().collect();
@@ -1219,6 +1226,7 @@ mod tests {
             assert!(set.contains(&TargetTool::Claude));
             assert!(set.contains(&TargetTool::Grok));
             assert!(set.contains(&TargetTool::Hyper));
+            assert!(!set.contains(&TargetTool::Agent));
         }
     }
 

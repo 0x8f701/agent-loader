@@ -73,17 +73,25 @@ al sessions convert claude hyper /workspace/project/claude-session.jsonl /worksp
 # Print the command without launching the agent. A cross-tool fork may first write the forked export.
 al sessions open 00000000-0000-0000-0000-000000000000 claude --print-command
 al sessions fork 00000000-0000-0000-0000-000000000000 grok --print-command
+al sessions open agent-session-id agent --print-command
 
 # Interactive fuzzy session picker (local only; requires fzf on PATH).
 al sks
 al skss "refactor auth"
 
 # Point-to-point session catalog sync (dry-run first).
+# Cursor Agent native SQLite stores are intentionally not synchronized.
 al sessions sync host-a --dry-run
 al sessions sync host-a host-b --tool omp --tool pi --dry-run
 
 # Run one shell-compatible command string in a tmux-managed pane (Unix only).
 al tmux-run -c /workspace/project --fresh -- 'make test'
+
+# Launch Cursor's official `agent` CLI. Bare `agentlo` continues Cursor's
+# latest chat; a chat id (or --session ID) resumes that chat by id.
+al agentlo
+al agentlo chat-123 "fix the parser"
+al agentlo --session chat-123 "fix the parser"
 ```
 
 ## Commands
@@ -94,14 +102,14 @@ Run `al --help` and `al COMMAND --help` for the current argument surface.
   - `al sessions list [COUNT]` — explicit list with the same flags.
   - Repeatable `--host HOST` adds a remote host to query. `local` is reserved for the current machine. With `--host`, `al` runs `al sessions list` on each host over SSH and prints read-only results grouped under `== <host> ==`. It is not a sync: no files are copied. Hosts are queried in the order given; `--all`/`--dedupe`/COUNT are forwarded to each remote. Per-host deduplication only; there is no cross-host deduplication. The command continues after a failed host and exits nonzero if any host failed. Empty, whitespace-containing, control-character, or option-like host values are rejected. `--host` cannot be combined with `--paths`, `--picker`, or `--fzf`.
   - `al sessions search QUERY` — search the text of user/assistant messages in discovered sessions. Search is local-only. `--dedupe` and `--picker` change output style.
-  - `al sessions convert SOURCE TARGET INPUT [OUTPUT]` (visible alias `migrate`) — read `INPUT` in the native format of `SOURCE` and write a `TARGET`-compatible export. If `OUTPUT` is omitted, the export is written to the target tool's native session location and the path is printed.
-  - `al sessions fork SESSION_REF TARGET` — fork a session to another tool.
-  - `al sessions open SESSION_REF TARGET` — reopen a session in the target tool.
+  - `al sessions convert SOURCE TARGET INPUT [OUTPUT]` (visible alias `migrate`) — read `INPUT` in the native format of `SOURCE` and write a `TARGET`-compatible export. If `OUTPUT` is omitted, the export is written to the target tool's native session location and the path is printed. Cursor Agent is intentionally excluded because its store format is undocumented.
+  - `al sessions fork SESSION_REF TARGET` — fork a session to another tool. Agent is not a fork target and native Agent sessions cannot be forked.
+  - `al sessions open SESSION_REF TARGET` — reopen a session in the target tool. A native Agent session may only target `agent`; it runs `agent --force --trust --approve-mcps --resume <session-id>` in the recorded cwd.
   - `al sessions open|fork --print-command` — print the native command without launching the agent, then exit. A cross-tool fork may first write the forked export.
-  - `al sessions sync SRC_OR_DST [DST] [--tool TOOL]... [--dry-run]` — synchronize session catalogs point-to-point. With one endpoint, the local catalog is uploaded to that endpoint. With two endpoints, the first is the source and the second is the destination; both cannot be `local`. `--tool` can be repeated to limit the transfer to specific source tools. This is a separate command from listing; it copies files and merges Codex history, while `al sessions --host` is read-only.
-- `al sks` — local interactive fuzzy filter over the displayed fields (tool, time, session id, summary) followed by a target-tool picker. Requires `fzf` on PATH.
-- `al skss QUERY...` — same picker flow, but the first fuzzy list is filtered by a local message-body search across user/assistant text. Requires `fzf` on PATH.
-- `al omlo|pilo|rpilo|grolo|hyperlo|dolo|colo|cclo [...]` — launch the corresponding coding agent (OMP, Pi, Rpi, Grok, Hyper, Droid, Codex, Claude). Common launcher flags:
+  - `al sessions sync SRC_OR_DST [DST] [--tool TOOL]... [--dry-run]` — synchronize supported session catalogs point-to-point. With one endpoint, the local catalog is uploaded to that endpoint. With two endpoints, the first is the source and the second is the destination; both cannot be `local`. `--tool` can be repeated to limit the transfer to specific source tools. Cursor Agent SQLite stores are excluded and `--tool agent` is rejected. This is separate from read-only multi-host listing.
+- `al sks` — local interactive fuzzy filter over tool, time, session id, and summary, followed by a target picker. Native Agent rows offer only `agent` and default to it. Requires `fzf` on PATH.
+- `al skss QUERY...` — the same picker flow after a local user/assistant message-body search, including parsed native Agent messages. Requires `fzf` on PATH.
+- `al omlo|pilo|rpilo|grolo|hyperlo|dolo|colo|cclo|agentlo [...]` — launch the corresponding coding agent (OMP, Pi, Rpi, Grok, Hyper, Droid, Codex, Claude, Cursor Agent). Common launcher flags:
   - `--host HOST` — run on a remote host over SSH (requires the current directory to be inside a git repository).
   - `--wt NAME` — use a named git worktree on the remote host (requires `--host`).
   - `--tmux` — wrap the launch in tmux (Unix only).
@@ -109,6 +117,8 @@ Run `al --help` and `al COMMAND --help` for the current argument surface.
   - `--` — protects everything after the delimiter from being interpreted as launcher flags, forwarding it verbatim to the agent.
 
   On macOS, remote launchers map `/Users/<user>` to `/home/<user>`. Additional component-aware mappings can be supplied through `AL_REMOTE_PATH_MAPS` as an ordered JSON array of absolute source/destination pairs, for example `[["/Volumes/workspace","/srv/workspace"]]`. Every source and destination must be an absolute path; malformed configuration fails before SSH is invoked. The remote host must have `al` installed and on PATH.
+
+  `al agentlo` launches Cursor's official `agent` CLI. With no tool args it runs the exact command `agent --force --trust --approve-mcps --continue`, continuing Cursor's own latest chat in the current directory. A `--session ID` selector (or a positional chat id) maps to `--resume ID`; any other arguments are forwarded verbatim after the base approval flags. Separately, `al sessions`, `al sessions search`, `sks`, and `skss` discover native Cursor Agent sessions and can reopen them exactly; conversion and fork remain unsupported.
 - `al tmux-run ...` — run a command inside the tmux integration wrapper (Unix only; Windows returns an explicit unsupported-platform error).
 
 ```sh
@@ -130,10 +140,12 @@ Common `tmux-run` flags: `--no-attach`, `--fresh`, `-s session`, `-n window`, `-
 
 | Role | Tools |
 |------|-------|
-| Source (export from) | `pi`, `omp`, `droid`, `codex`, `claude`, `grok` |
-| Target (convert to / launch) | `pi`, `omp`, `droid`, `codex`, `claude`, `grok`, `hyper`, `rpi` |
+| Source (discover/search) | `pi`, `omp`, `droid`, `codex`, `claude`, `grok`, `agent` |
+| Target (convert to / launch) | `pi`, `omp`, `droid`, `codex`, `claude`, `grok`, `hyper`, `rpi`; `agent` is open-only for native Agent sessions |
 
 `grok` and `hyper` share the same storage layout; a Grok session can be converted to Hyper in place, and Hyper targets reuse Grok's native format. `pi` and `rpi` likewise share Pi session storage; Rpi launches the `rpi` executable against that layout.
+
+Cursor Agent discovery reads `.cursor/chats/<32-hex-workspace-hash>/<session-id>/store.db` exactly two directories beneath the chats root, plus the sibling `meta.json` sidecar for cwd, title, and timestamps. The SQLite database is opened read-only. Cursor's store format is undocumented and `al` never emits or converts sessions into it; malformed individual stores are skipped without hiding other catalog rows.
 
 The managed `rpi` executable is resolved from `$PI_HOME/bin/rpi`, then
 `~/.rpi/bin/rpi`, then `PATH`. Runtime sessions remain in Pi-compatible storage
@@ -155,6 +167,7 @@ Format adapters read each tool's native export:
 - **Pi / OMP** — newline-delimited JSONL conversation trees.
 - **Droid** — `session_start` and `message` typed records.
 - **Codex / Claude / Grok** — tool-specific JSON/JSONL or directory layouts. Hyper targets reuse Grok's storage layout. Rpi targets reuse Pi's storage layout.
+- **Cursor Agent** — a read-only SQLite `store.db` adapter with sibling `meta.json`; only plaintext user/assistant text is projected, injected wrappers and tool output are excluded, and the native store remains canonical.
 
 Pi/OMP nonempty files require a valid native `session` header or loading fails. After a successful load, later unparseable or non-message records may be skipped.
 
