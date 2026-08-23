@@ -1006,18 +1006,19 @@ fn build_claude(args: &[OsString]) -> Result<LaunchPlan> {
 /// Build the raw, native argv for Cursor's official `agent` CLI.
 ///
 /// The base approval flags `--force --trust --approve-mcps` always lead. With
-/// no tool args the launcher continues Cursor's own latest chat
-/// (`--continue`). A `--session ID` selector (or a positional chat id) maps
-/// to `--resume ID`, mirroring the OMP family; everything else is forwarded
+/// no tool args the launcher first continues Cursor's latest chat and starts a
+/// new chat if Cursor reports that none exists. A `--session ID` selector (or
+/// a positional chat id) maps to `--resume ID`; everything else is forwarded
 /// verbatim after the base flags. `agent` is resolved through `PATH` at
 /// execution time like the other generic CLIs (`omp`, `codex`, `claude`).
 fn build_agent(args: &[OsString]) -> Result<LaunchPlan> {
     let base = [os("--force"), os("--trust"), os("--approve-mcps")];
-    let command = if args.is_empty() {
-        let mut prefix = base.to_vec();
-        prefix.push(os("--continue"));
-        command("agent", prefix)
-    } else if args[0] == "--session" {
+    if args.is_empty() {
+        let primary = command_with_tail("agent", base.clone(), &[os("--continue")]);
+        let fallback = command("agent", base);
+        return Ok(LaunchPlan::Fallback { primary, fallback });
+    }
+    let command = if args[0] == "--session" {
         let id = required_selector(LauncherKind::Agent, args, "--session")?;
         let mut prefix = base.to_vec();
         prefix.extend([os("--resume"), id.clone()]);
@@ -2083,15 +2084,20 @@ mod tests {
     }
 
     #[test]
-    fn agentlo_default_appends_continue_after_base_flags() {
-        let command = assert_command(
-            build_launcher(LauncherKind::Agent, &[], &test_home(), Path::new("/tmp")).unwrap(),
-        );
-        assert_eq!(command.program, "agent");
-        assert_eq!(
-            command.args,
-            strings(&["--force", "--trust", "--approve-mcps", "--continue"]),
-        );
+    fn agentlo_default_continues_then_falls_back_to_new_chat() {
+        let plan = build_launcher(LauncherKind::Agent, &[], &test_home(), Path::new("/tmp")).unwrap();
+        let LaunchPlan::Fallback { primary, fallback } = plan else { panic!("expected fallback plan") };
+        assert_eq!(primary.program, "agent");
+        assert_eq!(primary.args, strings(&["--force", "--trust", "--approve-mcps", "--continue"]));
+        assert_eq!(fallback.program, "agent");
+        assert_eq!(fallback.args, strings(&["--force", "--trust", "--approve-mcps"]));
+    }
+    #[test]
+    fn agentlo_tmux_preserves_new_chat_fallback() {
+        let plan = build_launcher(LauncherKind::Agent, &strings(&["--tmux"]), &test_home(), Path::new("/tmp/project")).unwrap();
+        let LaunchPlan::Tmux { command, fallback, .. } = plan else { panic!("expected tmux plan") };
+        assert_eq!(command.args, strings(&["--force", "--trust", "--approve-mcps", "--continue"]));
+        assert_eq!(fallback.unwrap().args, strings(&["--force", "--trust", "--approve-mcps"]));
     }
 
     #[test]

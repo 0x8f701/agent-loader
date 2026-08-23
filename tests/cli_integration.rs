@@ -762,7 +762,7 @@ fn print_command_never_materializes_or_mutates_legacy_same_format_sessions() {
 
 #[cfg(unix)]
 #[test]
-fn agentlo_default_invokes_exact_required_argv_and_propagates_success() {
+fn agentlo_default_continues_existing_chat_without_fallback() {
     let home = TempDir::new().unwrap();
     let bin = home.path().join("bin");
     let invocations = home.path().join("agent-invocations");
@@ -771,27 +771,27 @@ fn agentlo_default_invokes_exact_required_argv_and_propagates_success() {
         "agent",
         "#!/bin/sh\nfor a in \"$@\"; do printf '<%s>\\n' \"$a\" >> \"$AL_AGENT_INVOCATIONS\"; done\n",
     );
-    let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-        .unwrap();
-    let output = run_with_env(
-        home.path(),
-        &["agentlo"],
-        &[
-            ("PATH", path.as_os_str()),
-            ("AL_AGENT_INVOCATIONS", invocations.as_os_str()),
-        ],
+    let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let output = run_with_env(home.path(), &["agentlo"], &[("PATH", path.as_os_str()), ("AL_AGENT_INVOCATIONS", invocations.as_os_str())]);
+    assert!(output.status.success(), "agentlo failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read_to_string(&invocations).unwrap(), "<--force>\n<--trust>\n<--approve-mcps>\n<--continue>\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn agentlo_default_starts_new_chat_when_continue_fails() {
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let invocations = home.path().join("agent-invocations");
+    write_fake_tool(
+        &bin,
+        "agent",
+        "#!/bin/sh\nfor a in \"$@\"; do printf '<%s>\\n' \"$a\" >> \"$AL_AGENT_INVOCATIONS\"; done\ncase \" $* \" in *' --continue '*) exit 1;; esac\n",
     );
-    assert!(
-        output.status.success(),
-        "agentlo failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let recorded = fs::read_to_string(&invocations).unwrap();
-    // The exact required default argv: base approval flags then --continue.
-    assert_eq!(
-        recorded,
-        "<--force>\n<--trust>\n<--approve-mcps>\n<--continue>\n"
-    );
+    let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let output = run_with_env(home.path(), &["agentlo"], &[("PATH", path.as_os_str()), ("AL_AGENT_INVOCATIONS", invocations.as_os_str())]);
+    assert!(output.status.success(), "agentlo fallback failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read_to_string(&invocations).unwrap(), "<--force>\n<--trust>\n<--approve-mcps>\n<--continue>\n<--force>\n<--trust>\n<--approve-mcps>\n");
 }
 
 #[cfg(unix)]
