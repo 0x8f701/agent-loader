@@ -36,7 +36,7 @@ The installer verifies every download against the release's `SHA256SUMS` and ins
 Pin a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.2.1
+curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.3.0
 ```
 
 If `al` is not on PATH after installation, open a new terminal or use the full path printed during install.
@@ -207,15 +207,14 @@ Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 ### Artifacts
 
 | Asset | Example |
-|-------|---------|
-| macOS arm64 | `al-0.2.1-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `al-0.2.1-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc 2.31+) | `al-0.2.1-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc 2.31+) | `al-0.2.1-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `al-0.2.1-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `al-0.3.0-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `al-0.3.0-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 (glibc 2.31+) | `al-0.3.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc 2.31+) | `al-0.3.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `al-0.3.0-x86_64-pc-windows-msvc.zip` |
 | Checksums | `SHA256SUMS` |
 
-The tag must match `Cargo.toml` version exactly (`v0.2.1` ↔ `0.2.1`) or the build fails.
+The tag must match `Cargo.toml` version exactly (`v0.3.0` ↔ `0.3.0`) or the build fails.
 
 ## License
 
