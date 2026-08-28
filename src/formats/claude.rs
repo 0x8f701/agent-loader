@@ -1733,6 +1733,58 @@ mod tests {
     }
 
     #[test]
+    fn explicit_leaf_is_authoritative_over_later_foreground_descendant() {
+        // `explicit: true` pins the leaf to the resolvable preferred uuid: a
+        // later foreground descendant must not advance past it.
+        let explicit = r#"{"type":"last-prompt","leafUuid":"a1","explicit":true,"sessionId":"s1"}"#;
+        let file = write_session(&[
+            &user("u1", None, r#""prompt""#),
+            &assistant("a1", "u1", r#"[{"type":"text","text":"first"}]"#),
+            r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","timestamp":"2026-07-21T06:13:14.040Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"later"}]}}"#,
+            explicit,
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["prompt", "first"]);
+    }
+
+    #[test]
+    fn preserved_segment_chain_is_relinked_in_tail_to_head_order() {
+        // compactMetadata.preservedSegment names headUuid/tailUuid of a chain
+        // whose parent pointers span pre-compaction nodes: the walk must
+        // collect tailUuid..headUuid, reverse into head-first order, and
+        // relink so the segment reads forward from the anchor.
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","uuid":"c1","parentUuid":"old-b","timestamp":"2026-07-21T06:13:12.500Z","sessionId":"s1","cwd":"/workspace/project","compactMetadata":{"preservedSegment":{"anchorUuid":"old-b","headUuid":"p1","tailUuid":"p2"}}}"#;
+        // p1's parent pointer is a pre-compaction node removed later; the
+        // walk must reach it through the graph regardless.
+        let preserved_user = r#"{"type":"user","uuid":"p1","parentUuid":"old-a","timestamp":"2026-07-21T06:13:13.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"user","content":"preserved"}}"#;
+        let preserved_assistant = r#"{"type":"assistant","uuid":"p2","parentUuid":"p1","timestamp":"2026-07-21T06:13:14.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"preserved answer"}]}}"#;
+        let final_answer = r#"{"type":"assistant","uuid":"a2","parentUuid":"c1","timestamp":"2026-07-21T06:13:15.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"final"}]}}"#;
+        let file = write_session(&[
+            &user("old-a", None, r#""dropped older context""#),
+            &assistant("old-b", "old-a", r#"[{"type":"text","text":"dropped answer"}]"#),
+            boundary,
+            preserved_user,
+            preserved_assistant,
+            final_answer,
+            &last_prompt("a2"),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        // Old context is dropped; the preserved segment projects in
+        // head-first order followed by the post-compaction answer.
+        assert_eq!(texts, ["preserved", "preserved answer", "final"]);
+    }
+
+    #[test]
     fn missing_parent_recovers_nearest_same_sidechain_record() {
         let file = write_session(&[
             r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-07-21T06:13:10.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"user","content":"prompt"}}"#,

@@ -29,6 +29,7 @@ walkdir = "2"
 
 [dev-dependencies]
 assert_cmd = "2"
+parking_lot = "0.12.5"
 predicates = "3"
 
 [profile.release]

@@ -207,8 +207,19 @@ pub fn run_exact_fallback(
     primary: &crate::launcher::CommandSpec,
     fallback: Option<&crate::launcher::CommandSpec>,
 ) -> Result<i32> {
+    run(&exact_request(session, primary, fallback)?)
+}
+
+/// Build the exact-argv request for a launcher command: `env`-prefixed argv
+/// derived from the spec's environment edits, the spec's cwd (or the current
+/// directory), and an optional exact-argv fallback.
+fn exact_request(
+    session: &str,
+    primary: &crate::launcher::CommandSpec,
+    fallback: Option<&crate::launcher::CommandSpec>,
+) -> Result<Request> {
     let primary_command = ExactCommand::from_spec(primary);
-    let request = Request {
+    Ok(Request {
         no_attach: false,
         fresh: false,
         session: os(session),
@@ -223,10 +234,8 @@ pub fn run_exact_fallback(
         fallback: fallback.map(ExactCommand::from_spec),
         command_mode: CommandMode::Argv,
         help: false,
-    };
-    run(&request)
+    })
 }
-
 
 /// Run a parsed request.
 pub fn run(request: &Request) -> Result<i32> {
@@ -1287,6 +1296,16 @@ mod tests {
         Request::parse(&strings(argv)).expect("request")
     }
 
+    fn spec(program: &str, args: &[&str]) -> crate::launcher::CommandSpec {
+        crate::launcher::CommandSpec {
+            program: os(program),
+            args: strings(args),
+            cwd: None,
+            env_remove: Vec::new(),
+            env_set: Vec::new(),
+        }
+    }
+
     #[test]
     fn parser_supports_all_options_and_stops_at_command() {
         let parsed = request(&[
@@ -1626,6 +1645,116 @@ mod tests {
         let direct = recorder.records.last().unwrap();
         assert_eq!(direct.program, OsStr::new("literal ; command"));
         assert!(direct.args.is_empty());
+    }
+
+    #[test]
+    fn from_spec_prepends_env_edits_before_program() {
+        let mut command = spec("agent", &["arg one", "arg two"]);
+        command.env_remove = strings(&["RUST_LOG", "DEBUG"]);
+        command.env_set = vec![
+            (os("TERM"), os("xterm-256color")),
+            (os("SPACED"), os("a b=c")),
+        ];
+        let exact = ExactCommand::from_spec(&command);
+        assert_eq!(exact.program, os("env"));
+        assert_eq!(
+            exact.args,
+            strings(&[
+                "-u",
+                "RUST_LOG",
+                "-u",
+                "DEBUG",
+                "TERM=xterm-256color",
+                "SPACED=a b=c",
+                "agent",
+                "arg one",
+                "arg two",
+            ])
+        );
+        assert_eq!(
+            exact.clone().into_argv(),
+            strings(&[
+                "env",
+                "-u",
+                "RUST_LOG",
+                "-u",
+                "DEBUG",
+                "TERM=xterm-256color",
+                "SPACED=a b=c",
+                "agent",
+                "arg one",
+                "arg two",
+            ])
+        );
+    }
+
+    #[test]
+    fn from_spec_without_env_edits_uses_program_directly() {
+        let command = spec("agent", &["arg one", "arg two"]);
+        let exact = ExactCommand::from_spec(&command);
+        assert_eq!(exact.program, os("agent"));
+        assert_eq!(exact.args, strings(&["arg one", "arg two"]));
+        assert_eq!(
+            exact.clone().into_argv(),
+            strings(&["agent", "arg one", "arg two"])
+        );
+    }
+
+    #[test]
+    fn exact_request_propagates_spec_cwd() {
+        let mut command = spec("agent", &["arg"]);
+        command.cwd = Some(PathBuf::from("/work tree"));
+        let request = exact_request("agents", &command, None).unwrap();
+        assert_eq!(request.cwd, Path::new("/work tree"));
+        assert_eq!(request.session, OsStr::new("agents"));
+        assert_eq!(request.command, strings(&["agent", "arg"]));
+        assert_eq!(request.command_mode, CommandMode::Argv);
+        assert!(request.fallback.is_none());
+        assert!(!request.no_attach);
+        assert!(!request.fresh);
+        assert!(!request.help);
+        assert!(request.window.is_none());
+        assert!(request.socket_name.is_none());
+        assert!(request.socket_path.is_none());
+    }
+
+    #[test]
+    fn exact_request_without_spec_cwd_uses_current_directory() {
+        let command = spec("agent", &["arg"]);
+        let request = exact_request("agents", &command, None).unwrap();
+        assert_eq!(
+            request.cwd,
+            env::current_dir().expect("current directory")
+        );
+    }
+
+    #[test]
+    fn exact_request_bridges_primary_and_fallback_exact_argv() {
+        let mut primary = spec("agent", &["arg one"]);
+        primary.env_remove = strings(&["RUST_LOG"]);
+        primary.env_set = vec![(os("TERM"), os("xterm-256color"))];
+        let mut fallback = spec("fallback ; literal", &["two words", "$(not-shell)"]);
+        fallback.env_remove = strings(&["DEBUG"]);
+        let request = exact_request("agents", &primary, Some(&fallback)).unwrap();
+        assert_eq!(
+            request.command,
+            strings(&[
+                "env",
+                "-u",
+                "RUST_LOG",
+                "TERM=xterm-256color",
+                "agent",
+                "arg one",
+            ])
+        );
+        assert_eq!(
+            request.fallback,
+            Some(ExactCommand {
+                program: os("env"),
+                args: strings(&["-u", "DEBUG", "fallback ; literal", "two words", "$(not-shell)"]),
+            })
+        );
+        assert_eq!(request.command_mode, CommandMode::Argv);
     }
 
 

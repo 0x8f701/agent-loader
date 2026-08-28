@@ -362,6 +362,7 @@ mod tests {
 
     use super::*;
     use crate::domain::Role;
+    use serde_json::json;
 
     fn write_session(lines: &[&str]) -> NamedTempFile {
         let mut file = NamedTempFile::new().expect("temp file");
@@ -619,6 +620,105 @@ mod tests {
             .map(|message| message.text.as_str())
             .collect();
         assert_eq!(texts, ["hi", "hello"]);
+    }
+
+    #[test]
+    fn v2_hook_message_role_is_rewritten_to_custom() {
+        // A v2 header (no `version` → 2) with a `hookMessage`-role entry: the
+        // migration must rewrite the role to `custom` so the entry no longer
+        // resembles a user turn, and the rewrite must land in the shared entry
+        // object. A later (v3) file must be left untouched.
+        let v2_header =
+            r#"{"type":"session","id":"s1","version":2,"timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#;
+        let file = write_session(&[
+            v2_header,
+            &msg(
+                "h",
+                None,
+                "hookMessage",
+                r#"[{"type":"text","text":"contextual note"}]"#,
+            ),
+            &msg("a", Some("h"), "assistant", r#""ready""#),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        // `custom` is not a projected role, so the hook message emits nothing;
+        // only the assistant reply survives.
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].role, Role::Assistant);
+        assert_eq!(session.messages[0].text, "ready");
+
+        let mut values = vec![
+            serde_json::from_str(v2_header).expect("header json"),
+            serde_json::from_str(&msg(
+                "h",
+                None,
+                "hookMessage",
+                r#"[{"type":"text","text":"note"}]"#,
+            ))
+            .expect("entry json"),
+        ];
+        migrate_legacy_entries(&mut values);
+        assert_eq!(
+            values[1].get("message").and_then(|m| m.get("role")),
+            Some(&json!("custom"))
+        );
+
+        let v3_file = write_session(&[
+            HEADER,
+            &msg(
+                "h",
+                None,
+                "hookMessage",
+                r#"[{"type":"text","text":"note"}]"#,
+            ),
+            &msg("a", Some("h"), "assistant", r#""ready""#),
+        ]);
+        let v3_session = parse(v3_file.path()).expect("parse");
+        assert_eq!(v3_session.messages.len(), 1);
+        assert_eq!(v3_session.messages[0].text, "ready");
+        // v3 role left verbatim (still hookMessage on the raw entry).
+        let v3_values = read_jsonl_values(v3_file.path()).expect("read v3");
+        assert_eq!(
+            v3_values[1].get("message").and_then(|m| m.get("role")),
+            Some(&json!("hookMessage"))
+        );
+    }
+
+    #[test]
+    fn v1_first_kept_entry_index_converts_to_entry_id() {
+        // A v1 file carries `firstKeptEntryIndex` on its compaction record.
+        // Migration must drop that index and synthesize
+        // `firstKeptEntryId:"legacy-{index}"`, and the native projection must
+        // honor it: entries before the kept entry are dropped, the kept entry
+        // and everything after survive.
+        let file = write_session(&[
+            r#"{"type":"session","id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+            r#"{"type":"message","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"old"}}"#,
+            r#"{"type":"message","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"kept"}]}}"#,
+            r#"{"type":"compaction","timestamp":"2026-01-01T00:00:03.000Z","summary":"prior context","firstKeptEntryIndex":2,"tokensBefore":100}"#,
+            r#"{"type":"message","timestamp":"2026-01-01T00:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["kept", "done"]);
+
+        // The index field itself is consumed: the migrated compaction carries
+        // `firstKeptEntryId` and no longer carries `firstKeptEntryIndex`.
+        let mut values = read_jsonl_values(file.path()).expect("read values");
+        migrate_legacy_entries(&mut values);
+        let compaction = values
+            .iter()
+            .find(|value| value.get("type").and_then(Value::as_str) == Some("compaction"))
+            .expect("compaction record");
+        assert_eq!(
+            compaction.get("firstKeptEntryId"),
+            Some(&json!("legacy-2"))
+        );
+        assert_eq!(compaction.get("firstKeptEntryIndex"), None);
     }
 
     #[test]

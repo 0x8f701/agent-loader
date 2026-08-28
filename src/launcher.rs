@@ -2841,6 +2841,7 @@ mod tests {
     #[test]
     fn hyperlo_session_fork_forks_the_session() {
         use std::os::unix::fs::PermissionsExt;
+        let _lock = HYPER_ENV_LOCK.lock();
 
         let temp = TempDir::new().unwrap();
         let hyper = temp.path().join(".hyper/bin/hyper");
@@ -2859,6 +2860,228 @@ mod tests {
         assert_eq!(command.program, preferred_hyper_executable(temp.path()));
         assert_eq!(command.args, strings(&["--fork-session", "--resume", "sid"]));
         assert!(command.cwd.is_none());
+    }
+    // `build_hyper` reads GROK_HOME/HYPER_HOME from the process environment,
+    // so tests that pin those variables for hermetic fixtures must not run
+    // concurrently with other hyper tests that read them. Serialize the whole
+    // env-sensitive hyper test population behind one mutex.
+    #[cfg(unix)]
+    static HYPER_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[cfg(unix)]
+    struct ScopedEnvGuard {
+        grok_home: Option<OsString>,
+        hyper_home: Option<OsString>,
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl ScopedEnvGuard {
+        fn neutralize_hyper_home_vars() -> Self {
+            let _lock = HYPER_ENV_LOCK.lock();
+            let grok_home = env::var_os("GROK_HOME");
+            let hyper_home = env::var_os("HYPER_HOME");
+            unsafe {
+                env::remove_var("GROK_HOME");
+                env::remove_var("HYPER_HOME");
+            }
+            Self {
+                grok_home,
+                hyper_home,
+                _lock,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScopedEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = &self.grok_home {
+                    env::set_var("GROK_HOME", value);
+                }
+                if let Some(value) = &self.hyper_home {
+                    env::set_var("HYPER_HOME", value);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn hyper_fixture() -> (TempDir, ScopedEnvGuard) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let hyper = temp.path().join(".hyper/bin/hyper");
+        fs::create_dir_all(hyper.parent().unwrap()).unwrap();
+        fs::write(&hyper, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&hyper, fs::Permissions::from_mode(0o755)).unwrap();
+        (temp, ScopedEnvGuard::neutralize_hyper_home_vars())
+    }
+
+    #[cfg(unix)]
+    fn hyper_session_fixture(home: &Path, repo: &Path) -> OsString {
+        let root = grok_session_root(home, repo, LauncherKind::Hyper).unwrap();
+        let older_id = "11111111-1111-4111-8111-111111111111";
+        let newer_id = "22222222-2222-4222-8222-222222222222";
+        for (id, updated, active) in [
+            (older_id, "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z"),
+            (newer_id, "2026-01-04T00:00:00Z", "2026-01-05T00:00:00Z"),
+        ] {
+            let directory = root.join(id);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("summary.json"),
+                serde_json::json!({
+                    "info": {"id": id, "cwd": repo.to_string_lossy()},
+                    "updated_at": updated,
+                    "last_active_at": active,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        os(newer_id)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hyperlo_fork_with_explicit_uuid_uses_fork_session_resume() {
+        let (temp, _guard) = hyper_fixture();
+        let session_id = "12345678-1234-4234-8234-123456789abc";
+        let command = assert_command(
+            build_hyper(
+                &strings(&["--fork", session_id, "prompt"]),
+                temp.path(),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(command.program, preferred_hyper_executable(temp.path()));
+        assert_eq!(
+            command.args,
+            strings(&["--fork-session", "--resume", session_id, "prompt"])
+        );
+        assert!(command.cwd.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hyperlo_fork_without_uuid_uses_latest_session() {
+        let (temp, _guard) = hyper_fixture();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let latest = hyper_session_fixture(temp.path(), &repo);
+        let command = assert_command(
+            build_hyper(&strings(&["--fork"]), temp.path(), Some(&repo)).unwrap(),
+        );
+        assert_eq!(command.program, preferred_hyper_executable(temp.path()));
+        assert_eq!(
+            command.args,
+            vec![os("--fork-session"), os("--resume"), latest]
+        );
+    }
+
+    #[test]
+    fn normalize_hyper_fork_args_rewrites_worktree_flags() {
+        for flag in ["-w", "--worktree"] {
+            let (normalized, worktree, headless) =
+                normalize_hyper_fork_args(&strings(&[flag, "plain"]));
+            assert_eq!(normalized, strings(&["--worktree=", "plain"]));
+            assert!(worktree);
+            assert!(!headless);
+        }
+        let (normalized, worktree, headless) =
+            normalize_hyper_fork_args(&strings(&["--worktree=feature/x"]));
+        assert_eq!(normalized, strings(&["--worktree=feature/x"]));
+        assert!(worktree);
+        assert!(!headless);
+    }
+
+    #[test]
+    fn normalize_hyper_fork_args_detects_headless_flags() {
+        for flag in ["-p", "--single", "--prompt-file", "--prompt-json"] {
+            let (normalized, worktree, headless) =
+                normalize_hyper_fork_args(&strings(&[flag, "prompt.txt"]));
+            assert_eq!(normalized, strings(&[flag, "prompt.txt"]));
+            assert!(!worktree);
+            assert!(headless);
+        }
+        let (normalized, worktree, headless) =
+            normalize_hyper_fork_args(&strings(&["prompt"]));
+        assert_eq!(normalized, strings(&["prompt"]));
+        assert!(!worktree);
+        assert!(!headless);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hyperlo_worktree_fork_rejects_headless() {
+        let (temp, _guard) = hyper_fixture();
+        let session_id = "12345678-1234-4234-8234-123456789abc";
+        let error = build_hyper(
+            &strings(&["--fork", session_id, "-w", "-p"]),
+            temp.path(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(
+            error.to_string(),
+            "hyperlo --fork --worktree only supports the interactive TUI"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hyperlo_worktree_fork_rewrites_to_resume() {
+        let (temp, _guard) = hyper_fixture();
+        let session_id = "12345678-1234-4234-8234-123456789abc";
+        let command = assert_command(
+            build_hyper(
+                &strings(&["--fork", session_id, "-w"]),
+                temp.path(),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            command.args,
+            strings(&["--resume", session_id, "--worktree="])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hyperlo_empty_args_continue_when_latest_session_exists() {
+        let (temp, _guard) = hyper_fixture();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        hyper_session_fixture(temp.path(), &repo);
+        let command = assert_command(build_hyper(&[], temp.path(), Some(&repo)).unwrap());
+        assert_eq!(command.args, strings(&["--continue"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hyperlo_positional_uuid_resumes_session() {
+        let (temp, _guard) = hyper_fixture();
+        let session_id = "12345678-1234-4234-8234-123456789abc";
+        let command = assert_command(
+            build_hyper(&strings(&[session_id, "prompt"]), temp.path(), None).unwrap(),
+        );
+        assert_eq!(command.args, strings(&["--resume", session_id, "prompt"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hyperlo_sets_color_environment() {
+        let (temp, _guard) = hyper_fixture();
+        let command = assert_command(
+            build_hyper(&strings(&["hello"]), temp.path(), None).unwrap(),
+        );
+        assert_eq!(command.env_remove, strings(&["NO_COLOR"]));
+        assert_eq!(command.env_set, vec![(os("COLORTERM"), os("truecolor"))]);
     }
 
     #[test]
@@ -2969,6 +3192,244 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "agentlo: Agent sessions are read-only and cannot be forked"
+        );
+    }
+
+    // -- executable resolution --
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_executable_scans_path_for_bare_program_names() {
+        // Child branch: this test was re-executed with a controlled PATH; the
+        // expected resolution path arrives via the environment.
+        if let Some(expected) = env::var_os("AL_RESOLVE_PATH_EXPECT") {
+            assert_eq!(
+                resolve_executable(OsStr::new("al-path-probe")),
+                Some(PathBuf::from(expected)),
+                "a bare name must resolve through PATH to the executable there"
+            );
+            assert_eq!(
+                resolve_executable(OsStr::new("al-path-probe-missing")),
+                None,
+                "a name absent from PATH must not resolve"
+            );
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("bin");
+        fs::create_dir(&directory).unwrap();
+        let executable = directory.join("al-path-probe");
+        fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Parent branch: re-run this test in a child process with a controlled
+        // PATH, so this thread never mutates the process environment and the
+        // test cannot race with other tests in this process.
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launcher::tests::resolve_executable_scans_path_for_bare_program_names",
+            ])
+            .env("AL_RESOLVE_PATH_EXPECT", &executable)
+            .env("PATH", &directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "PATH probe child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_executable_checks_absolute_paths_directly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let executable = temp.path().join("al-abs-probe");
+        fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // An absolute path is checked as-is and never falls through to a PATH
+        // scan, even when PATH does not contain it.
+        assert_eq!(
+            resolve_executable(executable.as_os_str()),
+            Some(executable.clone())
+        );
+        assert_eq!(
+            resolve_executable(temp.path().join("al-abs-missing").as_os_str()),
+            None
+        );
+        // An existing but non-executable file is rejected, not resolved by
+        // name lookup in PATH.
+        let plain = temp.path().join("al-abs-plain");
+        fs::write(&plain, b"").unwrap();
+        assert_eq!(resolve_executable(plain.as_os_str()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_executable_in_scans_split_path_directories_in_order() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+
+        let tool = "al-split-probe";
+        let first_match = first.join(tool);
+        let second_match = second.join(tool);
+        for file in [&first_match, &second_match] {
+            fs::write(file, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(file, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // A non-executable entry in the first directory must be skipped, and
+        // search stops at the first executable match.
+        let decoy = first.join("al-split-decoy");
+        fs::write(&decoy, b"").unwrap();
+
+        let path = env::join_paths([&first, &second]).unwrap();
+        assert_eq!(
+            resolve_executable_in(OsStr::new(tool), &path),
+            Some(first_match)
+        );
+        // Non-executable and absent names yield no match after a full scan.
+        assert_eq!(
+            resolve_executable_in(OsStr::new("al-split-decoy"), &path),
+            None
+        );
+        assert_eq!(
+            resolve_executable_in(OsStr::new("al-split-missing"), &path),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_tool_executable_maps_each_target_to_its_own_program() {
+        // Child branch: this test was re-executed with controlled PATH and
+        // HYPER_HOME/PI_HOME; the temp home arrives via the environment.
+        if let Some(home) = env::var_os("AL_RESOLVE_TOOL_HOME") {
+            let home = PathBuf::from(home);
+            let results: Vec<_> = TargetTool::ALL
+                .iter()
+                .map(|target| (target, resolve_tool_executable(*target, &home)))
+                .collect();
+            for (target, result) in results {
+                let expected = match target {
+                    // Generic CLIs resolve through PATH to their own names.
+                    TargetTool::Pi
+                    | TargetTool::Omp
+                    | TargetTool::Droid
+                    | TargetTool::Codex
+                    | TargetTool::Claude
+                    | TargetTool::Grok
+                    | TargetTool::Agent => home.join("bin").join(target.as_str()).into_os_string(),
+                    // Hyper and Rpi resolve to their managed home binaries,
+                    // not a PATH name.
+                    TargetTool::Hyper | TargetTool::Rpi => home
+                        .join(if *target == TargetTool::Hyper {
+                            ".hyper/bin/hyper"
+                        } else {
+                            ".rpi/bin/rpi"
+                        })
+                        .into_os_string(),
+                };
+                assert_eq!(
+                    result.unwrap(),
+                    expected,
+                    "{target:?} must resolve its own executable"
+                );
+            }
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let bin = home.join("bin");
+        fs::create_dir(&bin).unwrap();
+        for program in ["pi", "omp", "droid", "codex", "claude", "grok", "agent"] {
+            let executable = bin.join(program);
+            fs::write(&executable, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Hyper and Rpi resolve to their managed home binaries rather than a
+        // PATH name, so those managed binaries must exist in the temp home.
+        for managed in [home.join(".hyper/bin/hyper"), home.join(".rpi/bin/rpi")] {
+            fs::create_dir_all(managed.parent().unwrap()).unwrap();
+            fs::write(&managed, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&managed, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Parent branch: re-run this test in a child process with controlled
+        // PATH and HYPER_HOME/PI_HOME, so this thread never mutates the
+        // process environment and the test cannot race with other tests.
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launcher::tests::resolve_tool_executable_maps_each_target_to_its_own_program",
+            ])
+            .env("AL_RESOLVE_TOOL_HOME", home)
+            .env("PATH", &bin)
+            .env("HYPER_HOME", "")
+            .env("PI_HOME", "")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "target mapping child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_executable_exits_with_shell_status_127() {
+        // Child branch: this test was re-executed with a PATH that contains no
+        // target executables at all.
+        if env::var_os("AL_MISSING_EXEC_CHILD").is_some() {
+            let error = resolve_tool_executable(TargetTool::Pi, Path::new("/")).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                r#"target executable not found: "pi""#,
+                "the failed target name must be reported"
+            );
+            assert_eq!(
+                error.exit_code(),
+                127,
+                "a missing executable must surface as the shell's 127 code"
+            );
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let empty_bin = temp.path().join("empty-bin");
+        fs::create_dir(&empty_bin).unwrap();
+
+        // Parent branch: re-run this test in a child process with a PATH that
+        // holds no executables, so this thread never mutates the process
+        // environment and the test cannot race with other tests.
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launcher::tests::missing_executable_exits_with_shell_status_127",
+            ])
+            .env("AL_MISSING_EXEC_CHILD", "1")
+            .env("PATH", &empty_bin)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "missing executable child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

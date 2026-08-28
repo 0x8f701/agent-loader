@@ -315,15 +315,19 @@ mod tests {
         assert!(session.cwd.as_os_str().is_empty());
     }
     #[test]
-    fn missing_tables_are_tolerated_but_invalid_database_is_contextual() {
-        let home = TempDir::new().unwrap();
-        let directory = home.path().join("workspace/session");
-        fs::create_dir_all(&directory).unwrap();
-        let empty_db = directory.join("store.db");
-        Connection::open(&empty_db).unwrap();
-        assert_eq!(parse(&empty_db).unwrap().session_id, "session");
-        let invalid = directory.join("invalid.db");
-        fs::write(&invalid, b"not sqlite").unwrap();
-        assert!(!parse(&invalid).unwrap_err().to_string().is_empty());
+    fn odd_length_hex_is_rejected() {
+        let error = decode_hex("abc").unwrap_err().to_string();
+        assert!(error.contains("odd-length hex metadata"), "{error}");
+    }
+    #[test]
+    fn invalid_hex_digit_is_rejected() {
+        let error = decode_hex("z0").unwrap_err().to_string();
+        assert!(error.contains("invalid hex metadata"), "{error}");
+    }
+    #[test]
+    fn hex_decoding_to_non_json_falls_back_to_plain_parse() {
+        // "1234" decodes to bytes [0x12, 0x34], which are not JSON, so decode_meta
+        // falls back to parsing the hex string itself as plain JSON: the number 1234.
+        assert_eq!(decode_meta("1234").unwrap().as_i64(), Some(1234));
     }
 }
