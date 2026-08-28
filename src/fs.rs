@@ -947,4 +947,49 @@ mod tests {
         assert!(atomic_write_jsonl(&directory, &[json!({"changed": true})]).is_err());
         assert_eq!(fs::read_to_string(&real).unwrap(), "unchanged\n");
     }
+
+    #[test]
+    fn atomic_jsonl_write_failure_removes_temporary_file_and_preserves_original() {
+        struct FailingSerialize;
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("intentional serialization failure"))
+            }
+        }
+
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("session.jsonl");
+        fs::write(&path, "original\n").unwrap();
+
+        let result = atomic_write_jsonl(&path, &[FailingSerialize]);
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "serializing JSONL record"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original\n");
+
+        let leftovers: Vec<_> = fs::read_dir(temporary.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".al-jsonl-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files leaked: {leftovers:?}");
+    }
+
+    #[test]
+    fn path_under_root_rejects_directory_with_symlinked_ancestor() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let real = root.join("real");
+        let sub = real.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        symlink(&real, root.join("linked")).unwrap();
+
+        assert!(path_under_root(&sub, &root));
+        assert!(!path_under_root(&root.join("linked/sub"), &root));
+    }
 }

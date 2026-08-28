@@ -2338,4 +2338,234 @@ mod tests {
             assert_eq!(actual, *expected, "{tool:?} {path}");
         }
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_session_root_symlink_is_rejected() {
+        let temporary = tempdir().unwrap();
+        let session_root = root(temporary.path(), SourceTool::Pi);
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(session_root.parent().unwrap()).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &session_root).unwrap();
+
+        let mut executor = FakeExecutor::with_rsync();
+        let error = directory_exists(&Endpoint::Local, &session_root, &mut executor).unwrap_err();
+        match error {
+            SyncError::UnsafeRoot(path) => assert_eq!(path, session_root),
+            other => panic!("expected UnsafeRoot, got {other:?}"),
+        }
+
+        let mut executor = FakeExecutor::with_rsync();
+        let report = sync(
+            &Endpoint::Local,
+            &Endpoint::Remote("remote".into()),
+            &SyncOptions {
+                tools: vec![SourceTool::Pi],
+                dry_run: false,
+            },
+            temporary.path(),
+            &mut executor,
+        )
+        .unwrap();
+
+        assert_eq!(report.failure_count(), 1);
+        let message = report.tools[0].error.as_deref().unwrap();
+        assert!(message.contains("refusing unsafe session root"));
+        assert!(message.contains(&session_root.display().to_string()));
+        assert!(executor.commands.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_codex_history_symlink_is_rejected() {
+        let temporary = tempdir().unwrap();
+        let history = temporary.path().join(".codex/history.jsonl");
+        let outside = temporary.path().join("outside-history.jsonl");
+        fs::create_dir_all(history.parent().unwrap()).unwrap();
+        fs::write(&outside, b"{\"session_id\":\"x\",\"ts\":1,\"text\":\"x\"}\n").unwrap();
+        std::os::unix::fs::symlink(&outside, &history).unwrap();
+
+        let mut executor = FakeExecutor::default();
+        let error = read_history(&Endpoint::Local, &history, &mut executor).unwrap_err();
+        match error {
+            SyncError::UnsafeHistory(path) => assert_eq!(path, history),
+            other => panic!("expected UnsafeHistory, got {other:?}"),
+        }
+
+        let mut executor = FakeExecutor::default();
+        let error = append_history_local(
+            &history,
+            b"{\"session_id\":\"y\",\"ts\":2,\"text\":\"y\"}\n",
+        )
+        .unwrap_err();
+        assert!(matches!(error, SyncError::UnsafeHistory(path) if path == history));
+
+        let mut executor = FakeExecutor::with_rsync();
+        executor.output(3, Vec::new(), Vec::new());
+        executor.output(0, b"{\"session_id\":\"x\",\"ts\":1,\"text\":\"x\"}\n".to_vec(), Vec::new());
+        let report = sync(
+            &Endpoint::Remote("source".into()),
+            &Endpoint::Local,
+            &SyncOptions {
+                tools: vec![SourceTool::Codex],
+                dry_run: false,
+            },
+            temporary.path(),
+            &mut executor,
+        )
+        .unwrap();
+
+        assert_eq!(report.failure_count(), 1);
+        let message = report.tools[0].error.as_deref().unwrap();
+        assert!(message.contains("refusing unsafe Codex history path"));
+        assert!(message.contains(&history.display().to_string()));
+        assert_eq!(executor.commands.len(), 2);
+    }
+
+    #[test]
+    fn executor_io_error_becomes_spawn_error() {
+        let mut executor = FakeExecutor::default();
+        let spec = CommandSpec::new("rsync", vec![OsString::from("--")]);
+        let error = execute(&mut executor, &spec, "rsync").unwrap_err();
+        match error {
+            SyncError::Spawn { operation, source } => {
+                assert_eq!(operation, "rsync");
+                assert_eq!(source.to_string(), "missing fake command output");
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+
+        let temporary = tempdir().unwrap();
+        let mut executor = FakeExecutor::default();
+        let producer = CommandSpec::new("ssh", vec![OsString::from("host")]);
+        let consumer = CommandSpec::new(
+            "tar",
+            vec![
+                OsString::from("-C"),
+                temporary.path().as_os_str().to_owned(),
+                OsString::from("-xf"),
+                OsString::from("-"),
+            ],
+        );
+        let error = pipeline(&mut executor, &producer, &consumer, "remote tar pull").unwrap_err();
+        match error {
+            SyncError::Spawn { operation, source } => {
+                assert_eq!(operation, "remote tar pull");
+                assert_eq!(source.to_string(), "missing fake pipeline output");
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_surfaces_spawn_error_when_rsync_cannot_start() {
+        let temporary = tempdir().unwrap();
+        let session_root = root(temporary.path(), SourceTool::Pi);
+        fs::create_dir_all(session_root.join("project")).unwrap();
+        fs::write(session_root.join("project/session.jsonl"), b"{}\n").unwrap();
+
+        let mut executor = FakeExecutor::with_rsync();
+        executor.output(0, Vec::new(), Vec::new());
+        executor.output(0, Vec::new(), Vec::new());
+        let report = sync(
+            &Endpoint::Local,
+            &Endpoint::Remote("remote".into()),
+            &SyncOptions {
+                tools: vec![SourceTool::Pi],
+                dry_run: false,
+            },
+            temporary.path(),
+            &mut executor,
+        )
+        .unwrap();
+
+        assert_eq!(report.failure_count(), 1);
+        let message = report.tools[0].error.as_deref().unwrap();
+        assert!(message.contains("failed to start rsync"));
+        assert!(message.contains("missing fake command output"));
+        assert_eq!(executor.commands.len(), 3);
+    }
+
+    #[test]
+    fn ensure_pipeline_success_reports_stderr_on_failure() {
+        let error = ensure_pipeline_success(
+            "remote tar pull",
+            &PipelineOutput {
+                producer_status: 0,
+                consumer_status: 2,
+                producer_stderr: b"".to_vec(),
+                consumer_stdout: Vec::new(),
+                consumer_stderr: b"boom: corrupt archive\n".to_vec(),
+            },
+        )
+        .unwrap_err();
+        match error {
+            SyncError::PipelineFailed {
+                operation,
+                producer_status,
+                consumer_status,
+                detail,
+            } => {
+                assert_eq!(operation, "remote tar pull");
+                assert_eq!(producer_status, 0);
+                assert_eq!(consumer_status, 2);
+                assert!(detail.contains("boom: corrupt archive"));
+            }
+            other => panic!("expected PipelineFailed, got {other:?}"),
+        }
+
+        let error = ensure_pipeline_success(
+            "remote tar pull",
+            &PipelineOutput {
+                producer_status: 1,
+                consumer_status: 0,
+                producer_stderr: b"ssh: connection refused\n".to_vec(),
+                consumer_stdout: Vec::new(),
+                consumer_stderr: b"".to_vec(),
+            },
+        )
+        .unwrap_err();
+        let SyncError::PipelineFailed { detail, .. } = error else {
+            panic!("expected PipelineFailed");
+        };
+        assert!(detail.contains("ssh: connection refused"));
+
+        ensure_pipeline_success("remote tar pull", &PipelineOutput::success()).unwrap();
+    }
+
+    #[test]
+    fn sync_surfaces_pipeline_failure_with_stderr() {
+        let temporary = tempdir().unwrap();
+        let mut executor = FakeExecutor::default();
+        executor.output(0, Vec::new(), Vec::new());
+        executor.output(0, Vec::new(), Vec::new());
+        executor.output(0, b"project/session.jsonl\0".to_vec(), Vec::new());
+        executor.output(0, Vec::new(), Vec::new());
+        executor.pipeline_outputs.push_back(PipelineOutput {
+            producer_status: 0,
+            consumer_status: 2,
+            producer_stderr: b"".to_vec(),
+            consumer_stdout: Vec::new(),
+            consumer_stderr: b"boom: tar failed\n".to_vec(),
+        });
+
+        let report = sync(
+            &Endpoint::Remote("source".into()),
+            &Endpoint::Remote("destination".into()),
+            &SyncOptions {
+                tools: vec![SourceTool::Droid],
+                dry_run: false,
+            },
+            temporary.path(),
+            &mut executor,
+        )
+        .unwrap();
+
+        assert_eq!(report.failure_count(), 1);
+        let message = report.tools[0].error.as_deref().unwrap();
+        assert!(message.contains("remote tar pull pipeline failed (producer exit 0, consumer exit 2)"));
+        assert!(message.contains("boom: tar failed"));
+        assert_eq!(executor.pipelines.len(), 1);
+    }
 }

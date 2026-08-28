@@ -952,12 +952,96 @@ mod tests {
             .expect("resolve exact path");
         assert_eq!(resolved.path, first);
         assert_eq!(resolved.cwd, Path::new("/tmp/one"));
+    }
 
-        assert!(catalog
-            .resolve_any_path(OsStr::new("duplicate-uuid"))
-            .expect_err("duplicate id across catalog must be ambiguous")
-            .to_string()
-            .contains("ambiguous"));
+    #[test]
+    fn resolve_path_for_tool_rejects_file_at_wrong_depth_for_pi() {
+        let (_home, catalog) = catalog();
+        let nested = write_pi(
+            &catalog,
+            "project/top/subagent",
+            "nested.jsonl",
+            "nested",
+            "/tmp",
+            &[],
+        );
+        let error = catalog
+            .resolve_path_for_tool(SourceTool::Pi, nested.as_os_str())
+            .expect_err("nested Pi file must not resolve");
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid pi session path"));
+        assert!(message.contains(&nested.display().to_string()));
+    }
+
+    #[test]
+    fn resolve_path_for_tool_reports_missing_session_id() {
+        let (_home, catalog) = catalog();
+        write_pi(
+            &catalog,
+            "project",
+            "known.jsonl",
+            "known-id",
+            "/tmp",
+            &[],
+        );
+        let error = catalog
+            .resolve_path_for_tool(SourceTool::Pi, OsStr::new("absent-session-xyz"))
+            .expect_err("absent id must not resolve");
+        let message = format!("{error:#}");
+        assert!(message.contains("session not found for pi"));
+        assert!(message.contains("absent-session-xyz"));
+    }
+
+    #[test]
+    fn resolve_any_path_rejects_file_matching_no_tool() {
+        let (_home, catalog) = catalog();
+        let nested = write_pi(
+            &catalog,
+            "project/top/subagent",
+            "nested.jsonl",
+            "nested",
+            "/tmp",
+            &[],
+        );
+        let error = catalog
+            .resolve_any_path(nested.as_os_str())
+            .expect_err("file at no tool's depth must not resolve");
+        let message = format!("{error:#}");
+        assert!(message.contains("cannot infer source tool from path"));
+        assert!(message.contains(&nested.display().to_string()));
+    }
+
+    #[test]
+    fn resolve_any_path_lists_both_tools_for_cross_tool_duplicate_id() {
+        let (_home, catalog) = catalog();
+        let pi_path = write_pi(
+            &catalog,
+            "project",
+            "shared.jsonl",
+            "shared-id",
+            "/tmp/pi",
+            &[("user", "pi summary")],
+        );
+        let droid_path = catalog
+            .root_for_tool(SourceTool::Droid)
+            .path
+            .join("project/shared.jsonl");
+        fs::create_dir_all(droid_path.parent().expect("parent")).expect("create Droid parent");
+        fs::write(
+            &droid_path,
+            r#"{"type":"session_start","id":"shared-id","title":"Droid title","cwd":"/tmp/droid","version":2}"#,
+        )
+        .expect("write Droid session");
+
+        let error = catalog
+            .resolve_any_path(OsStr::new("shared-id"))
+            .expect_err("shared id across tools must be ambiguous");
+        let message = format!("{error:#}");
+        assert!(message.contains("ambiguous across tools"));
+        assert!(message.contains("pi:"));
+        assert!(message.contains(&pi_path.display().to_string()));
+        assert!(message.contains("droid:"));
+        assert!(message.contains(&droid_path.display().to_string()));
     }
 
     #[test]

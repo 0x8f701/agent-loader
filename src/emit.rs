@@ -1682,6 +1682,111 @@ mod tests {
         assert_eq!(records[1]["timestamp"], "2026-07-30T01:02:04.000Z");
         assert_eq!(records[2]["timestamp"], "2026-07-30T01:02:05.000Z");
     }
+    #[test]
+    fn unsafe_session_ids_are_rejected_by_component_guard() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let long_id = "x".repeat(256);
+        for (session_id, expected) in [
+            ("a/b", "unsafe session id"),
+            ("a\\b", "unsafe session id"),
+            ("a\0b", "unsafe session id"),
+            (".", "unsafe session id"),
+            ("..", "unsafe session id"),
+            ("", "unsafe session id"),
+            (long_id.as_str(), "exceeding filesystem limit"),
+        ] {
+            let context = EmitContext::new(home).with_session_id(session_id);
+            let error = emit_with_defaults(
+                &fixture(home),
+                TargetTool::Droid,
+                &context,
+                &mut FixedDefaults::new(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "session_id {session_id:?} should fail with {expected:?}, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_session_id_passes_the_component_guard() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let context = EmitContext::new(home).with_session_id("valid-session-id");
+        let emitted = emit_with_defaults(
+            &fixture(home),
+            TargetTool::Droid,
+            &context,
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        assert_eq!(emitted.session_id, "valid-session-id");
+    }
+
+    #[test]
+    fn fallback_time_prefers_modified_epoch_over_context_and_clock() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let mut session = fixture(home);
+        session.start_timestamp = None;
+        session.modified_epoch = Some(0.0);
+        let context = EmitContext::new(home)
+            .with_session_id("epoch-session")
+            .with_fallback_time(Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap());
+        let emitted = emit_with_defaults(
+            &session,
+            TargetTool::Pi,
+            &context,
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        let records = read_jsonl(&emitted.path);
+        assert_eq!(records[0]["timestamp"], "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn fallback_time_context_wins_over_default_clock() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let mut session = fixture(home);
+        session.start_timestamp = None;
+        session.modified_epoch = None;
+        let fallback = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        let context = EmitContext::new(home)
+            .with_session_id("fallback-session")
+            .with_fallback_time(fallback);
+        let emitted = emit_with_defaults(
+            &session,
+            TargetTool::Pi,
+            &context,
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        let records = read_jsonl(&emitted.path);
+        assert_eq!(records[0]["timestamp"], "2025-06-01T00:00:00.000Z");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_cwd_is_rejected_before_any_write() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let mut session = fixture(home);
+        session.cwd = PathBuf::from(std::ffi::OsString::from_vec(vec![0x62, 0xff, 0x63]));
+        let error = emit_with_defaults(
+            &session,
+            TargetTool::Droid,
+            &EmitContext::new(home).with_session_id("non-utf8-cwd"),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not valid UTF-8"));
+    }
     #[cfg(unix)]
     #[test]
     fn timed_command_drains_output_larger_than_pipe_capacity() {

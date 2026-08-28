@@ -215,6 +215,8 @@ pub enum LauncherError {
     },
     #[error("hyperlo --fork --worktree only supports the interactive TUI")]
     HyperWorktreeHeadless,
+    #[error("agentlo: Agent sessions are read-only and cannot be forked")]
+    AgentForkRejected,
     #[error("failed to execute {program:?}: {source}")]
     Execute {
         program: OsString,
@@ -238,7 +240,7 @@ impl LauncherError {
             | Self::InvalidRemotePathMapsJson { code, .. }
             | Self::InvalidRemotePathMapPath { code, .. } => *code,
             Self::MissingExecutable { .. } => 127,
-            Self::HyperWorktreeHeadless => 2,
+            Self::HyperWorktreeHeadless | Self::AgentForkRejected => 2,
             Self::Execute { source, .. } => match source.kind() {
                 io::ErrorKind::NotFound => 127,
                 io::ErrorKind::PermissionDenied => 126,
@@ -733,7 +735,12 @@ fn build_omp(args: &[OsString], home: &Path) -> Result<LaunchPlan> {
         command("omp", [os("--continue")])
     } else if args[0] == "--session" {
         let id = required_selector(LauncherKind::Omp, args, "--session")?;
-        command_with_tail("omp", [os("--resume"), id.clone()], &args[2..])
+        let remaining = &args[2..];
+        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+            command_with_tail("omp", [os("--fork"), id.clone()], &remaining[1..])
+        } else {
+            command_with_tail("omp", [os("--resume"), id.clone()], remaining)
+        }
     } else if args[0] == "--fork" {
         let (session, tail) = optional_selector(args, 1);
         let session = match session {
@@ -788,7 +795,12 @@ fn build_pi_family(
         command(program, [os("--continue")])
     } else if args[0] == "--session" {
         let id = required_selector(kind, args, "--session")?;
-        command_with_tail(program, [os("--session"), id.clone()], &args[2..])
+        let remaining = &args[2..];
+        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+            command_with_tail(program, [os("--fork"), id.clone()], &remaining[1..])
+        } else {
+            command_with_tail(program, [os("--session"), id.clone()], remaining)
+        }
     } else if args[0] == "--fork" {
         let (session, tail) = optional_selector(args, 1);
         let session = match session {
@@ -825,7 +837,12 @@ fn build_grok(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Resul
         }
     } else if args[0] == "--session" {
         let id = required_selector(LauncherKind::Grok, args, "--session")?;
-        command_with_tail("grok", [os("--resume"), id.clone()], &args[2..])
+        let remaining = &args[2..];
+        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+            command_with_tail("grok", [os("--fork-session"), os("--resume"), id.clone()], &remaining[1..])
+        } else {
+            command_with_tail("grok", [os("--resume"), id.clone()], remaining)
+        }
     } else if args[0] == "--fork" {
         let (session, tail) = optional_selector(args, 1);
         let session = match session {
@@ -862,7 +879,12 @@ fn build_hyper(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Resu
         }
     } else if args[0] == "--session" {
         let id = required_selector(LauncherKind::Hyper, args, "--session")?;
-        command_with_tail(hyper, [os("--resume"), id.clone()], &args[2..])
+        let remaining = &args[2..];
+        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+            command_with_tail(hyper, [os("--fork-session"), os("--resume"), id.clone()], &remaining[1..])
+        } else {
+            command_with_tail(hyper, [os("--resume"), id.clone()], remaining)
+        }
     } else if args[0] == "--fork" {
         let explicit_session = args.get(1).filter(|value| is_uuid(value));
         let (session, fork_args) = if let Some(session) = explicit_session {
@@ -909,9 +931,16 @@ fn build_droid(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Resu
         command_with_tail("droid", base, &[os("--resume")])
     } else if args[0] == "--resume" {
         let id = required_selector(LauncherKind::Droid, args, "--resume")?;
-        let mut prefix = base.to_vec();
-        prefix.extend([os("--resume"), id.clone()]);
-        command_with_tail("droid", prefix, &args[2..])
+        let remaining = &args[2..];
+        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+            let mut prefix = base.to_vec();
+            prefix.extend([os("--fork"), id.clone()]);
+            command_with_tail("droid", prefix, &remaining[1..])
+        } else {
+            let mut prefix = base.to_vec();
+            prefix.extend([os("--resume"), id.clone()]);
+            command_with_tail("droid", prefix, remaining)
+        }
     } else if args[0] == "--fork" {
         let (session, tail) = optional_selector(args, 1);
         let session = match session {
@@ -944,9 +973,15 @@ fn build_codex(args: &[OsString]) -> Result<LaunchPlan> {
         command("codex", prefix)
     } else if args[0] == "--session" {
         let id = required_selector(LauncherKind::Codex, args, "--session")?;
+        let remaining = &args[2..];
         let mut prefix = base.to_vec();
-        prefix.extend([os("resume"), id.clone()]);
-        command_with_tail("codex", prefix, &args[2..])
+        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+            prefix.extend([os("fork"), id.clone()]);
+            command_with_tail("codex", prefix, &remaining[1..])
+        } else {
+            prefix.extend([os("resume"), id.clone()]);
+            command_with_tail("codex", prefix, remaining)
+        }
     } else if args[0] == "--fork" {
         let (session, tail) = optional_selector(args, 1);
         let mut prefix = base.to_vec();
@@ -978,11 +1013,20 @@ fn build_claude(args: &[OsString]) -> Result<LaunchPlan> {
             "--resume"
         };
         let id = required_selector(LauncherKind::Claude, args, option)?;
-        command_with_tail(
-            "claude",
-            [base[0].clone(), os("--resume"), id.clone()],
-            &args[2..],
-        )
+        let remaining = &args[2..];
+        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+            let mut prefix = base.to_vec();
+            prefix.push(os("--fork-session"));
+            prefix.push(os("--resume"));
+            prefix.push(id.clone());
+            command_with_tail("claude", prefix, &remaining[1..])
+        } else {
+            command_with_tail(
+                "claude",
+                [base[0].clone(), os("--resume"), id.clone()],
+                remaining,
+            )
+        }
     } else if args[0] == "--fork" || args[0] == "fork" {
         let (session, tail) = optional_selector(args, 1);
         let continuation = match session {
@@ -1020,9 +1064,15 @@ fn build_agent(args: &[OsString]) -> Result<LaunchPlan> {
     }
     let command = if args[0] == "--session" {
         let id = required_selector(LauncherKind::Agent, args, "--session")?;
+        let remaining = &args[2..];
+        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+            return Err(LauncherError::AgentForkRejected);
+        }
         let mut prefix = base.to_vec();
         prefix.extend([os("--resume"), id.clone()]);
-        command_with_tail("agent", prefix, &args[2..])
+        command_with_tail("agent", prefix, remaining)
+    } else if args[0] == "--fork" || args[0] == "fork" {
+        return Err(LauncherError::AgentForkRejected);
     } else if starts_with_hyphen(&args[0]) {
         command_with_tail("agent", base, args)
     } else {
@@ -2714,5 +2764,211 @@ mod tests {
         assert_eq!(remote_argv[1], os("omlo"));
         assert_eq!(remote_argv[2], os("--"));
         assert_eq!(OsStr::new(&remote_argv[3]).as_bytes(), non_utf8.as_bytes());
+    }
+
+    #[test]
+    fn omlo_session_fork_forks_the_session() {
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::Omp,
+                &strings(&["--session", "sid", "--fork"]),
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(command.program, "omp");
+        assert_eq!(command.args, strings(&["--fork", "sid"]));
+        assert!(command.cwd.is_none());
+    }
+
+    #[test]
+    fn pilo_session_fork_forks_the_session() {
+        let command = build_pi_family(
+            LauncherKind::Pi,
+            os("pi"),
+            &strings(&["--session", "sid", "--fork"]),
+            &test_home(),
+        )
+        .unwrap();
+        assert_eq!(command.program, "pi");
+        assert_eq!(command.args, strings(&["--fork", "sid"]));
+        assert!(command.cwd.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpilo_session_fork_forks_the_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let rpi_home = temp.path().join("managed-rpi");
+        let rpi = rpi_home.join("bin/rpi");
+        fs::create_dir_all(rpi.parent().unwrap()).unwrap();
+        fs::write(&rpi, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&rpi, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let program = preferred_rpi_executable_in(temp.path(), Some(rpi_home.as_os_str()));
+        let command = build_pi_family(
+            LauncherKind::Rpi,
+            program,
+            &strings(&["--session", "sid", "--fork"]),
+            temp.path(),
+        )
+        .unwrap();
+        assert_eq!(command.program, rpi.as_os_str());
+        assert_eq!(command.args, strings(&["--fork", "sid"]));
+        assert!(command.cwd.is_none());
+    }
+
+    #[test]
+    fn grolo_session_fork_forks_the_session() {
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::Grok,
+                &strings(&["--session", "sid", "--fork"]),
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(command.program, "grok");
+        assert_eq!(command.args, strings(&["--fork-session", "--resume", "sid"]));
+        assert!(command.cwd.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hyperlo_session_fork_forks_the_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let hyper = temp.path().join(".hyper/bin/hyper");
+        fs::create_dir_all(hyper.parent().unwrap()).unwrap();
+        fs::write(&hyper, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&hyper, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let command = assert_command(
+            build_hyper(
+                &strings(&["--session", "sid", "--fork"]),
+                temp.path(),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(command.program, preferred_hyper_executable(temp.path()));
+        assert_eq!(command.args, strings(&["--fork-session", "--resume", "sid"]));
+        assert!(command.cwd.is_none());
+    }
+
+    #[test]
+    fn dolo_resume_fork_forks_the_session() {
+        let home = test_home();
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::Droid,
+                &strings(&["--resume", "sid", "--fork"]),
+                &home,
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(command.program, "droid");
+        assert_eq!(
+            command.args,
+            vec![
+                os("--settings"),
+                home.join(".factory").join("settings.json").into_os_string(),
+                os("--auto"),
+                os("high"),
+                os("--fork"),
+                os("sid"),
+            ]
+        );
+        assert!(command.cwd.is_none());
+    }
+
+    #[test]
+    fn colo_session_fork_forks_the_session() {
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::Codex,
+                &strings(&["--session", "sid", "--fork"]),
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(command.program, "codex");
+        assert_eq!(
+            command.args,
+            strings(&[
+                "-c",
+                "check_for_update_on_startup=false",
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "danger-full-access",
+                "fork",
+                "sid",
+            ])
+        );
+        assert!(command.cwd.is_none());
+    }
+
+    #[test]
+    fn cclo_session_fork_forks_the_session() {
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::Claude,
+                &strings(&["--session", "sid", "--fork"]),
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(command.program, "claude");
+        assert_eq!(
+            command.args,
+            strings(&[
+                "--dangerously-skip-permissions",
+                "--fork-session",
+                "--resume",
+                "sid",
+            ])
+        );
+        assert!(command.cwd.is_none());
+    }
+
+    #[test]
+    fn agentlo_fork_is_rejected() {
+        let error = build_launcher(
+            LauncherKind::Agent,
+            &[os("--fork")],
+            &test_home(),
+            Path::new("/tmp"),
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(
+            error.to_string(),
+            "agentlo: Agent sessions are read-only and cannot be forked"
+        );
+    }
+
+    #[test]
+    fn agentlo_session_fork_is_rejected() {
+        let error = build_launcher(
+            LauncherKind::Agent,
+            &strings(&["--session", "sid", "--fork"]),
+            &test_home(),
+            Path::new("/tmp"),
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(
+            error.to_string(),
+            "agentlo: Agent sessions are read-only and cannot be forked"
+        );
     }
 }

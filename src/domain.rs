@@ -197,6 +197,10 @@ impl FromStr for Role {
 #[error("unsupported message role: {0}")]
 pub struct RoleParseError(String);
 
+#[derive(Debug, Error)]
+#[error("unsupported thinking level: {0}")]
+pub struct ThinkingLevelParseError(String);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
@@ -291,6 +295,130 @@ impl FromStr for ThinkingLevel {
     }
 }
 
-#[derive(Debug, Error)]
-#[error("unsupported thinking level: {0}")]
-pub struct ThinkingLevelParseError(String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn source_tool_from_str_accepts_all_spellings() {
+        for tool in SourceTool::ALL {
+            let parsed: SourceTool = tool.as_str().parse().expect("valid spelling");
+            assert_eq!(parsed, tool);
+        }
+        let error = "hyper".parse::<SourceTool>().expect_err("invalid tool");
+        assert_eq!(error.to_string(), "unsupported tool: hyper");
+    }
+
+    #[test]
+    fn target_tool_from_str_accepts_all_spellings() {
+        for tool in TargetTool::ALL {
+            let parsed: TargetTool = tool.as_str().parse().expect("valid spelling");
+            assert_eq!(parsed, tool);
+        }
+        let error = "hyperx".parse::<TargetTool>().expect_err("invalid tool");
+        assert_eq!(error.to_string(), "unsupported tool: hyperx");
+    }
+
+    #[test]
+    fn role_from_str_accepts_user_and_assistant_only() {
+        assert_eq!("user".parse::<Role>().unwrap(), Role::User);
+        assert_eq!("assistant".parse::<Role>().unwrap(), Role::Assistant);
+        let error = "system".parse::<Role>().expect_err("invalid role");
+        assert_eq!(error.to_string(), "unsupported message role: system");
+    }
+
+    #[test]
+    fn thinking_level_from_str_accepts_all_levels() {
+        let levels = [
+            ("off", ThinkingLevel::Off),
+            ("minimal", ThinkingLevel::Minimal),
+            ("low", ThinkingLevel::Low),
+            ("medium", ThinkingLevel::Medium),
+            ("high", ThinkingLevel::High),
+            ("xhigh", ThinkingLevel::XHigh),
+            ("max", ThinkingLevel::Max),
+            ("auto", ThinkingLevel::Auto),
+        ];
+        for (spelling, expected) in levels {
+            assert_eq!(spelling.parse::<ThinkingLevel>().unwrap(), expected);
+        }
+        let error = "turbo".parse::<ThinkingLevel>().expect_err("invalid level");
+        assert_eq!(error.to_string(), "unsupported thinking level: turbo");
+    }
+
+    #[test]
+    fn target_tool_source_maps_to_origin_tool() {
+        assert_eq!(TargetTool::Pi.source(), Some(SourceTool::Pi));
+        assert_eq!(TargetTool::Omp.source(), Some(SourceTool::Omp));
+        assert_eq!(TargetTool::Droid.source(), Some(SourceTool::Droid));
+        assert_eq!(TargetTool::Codex.source(), Some(SourceTool::Codex));
+        assert_eq!(TargetTool::Claude.source(), Some(SourceTool::Claude));
+        assert_eq!(TargetTool::Grok.source(), Some(SourceTool::Grok));
+        assert_eq!(TargetTool::Agent.source(), Some(SourceTool::Agent));
+        assert_eq!(TargetTool::Hyper.source(), None);
+        assert_eq!(TargetTool::Rpi.source(), None);
+    }
+
+    #[test]
+    fn target_tool_uses_grok_storage_only_for_grok_and_hyper() {
+        for tool in TargetTool::ALL {
+            assert_eq!(
+                tool.uses_grok_storage(),
+                matches!(tool, TargetTool::Grok | TargetTool::Hyper),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_tool_uses_pi_storage_only_for_pi_and_rpi() {
+        for tool in TargetTool::ALL {
+            assert_eq!(
+                tool.uses_pi_storage(),
+                matches!(tool, TargetTool::Pi | TargetTool::Rpi),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn flexible_record_unknown_raw_round_trips_with_extra_fields() {
+        let raw: Value =
+            serde_json::from_str(r#"{"type":"mystery","id":"x","extra":{"n":7},"flag":true}"#)
+                .unwrap();
+        let record: FlexibleRecord<u8> = FlexibleRecord::Unknown {
+            type_tag: Some("mystery".to_owned()),
+            raw: raw.clone(),
+        };
+        let FlexibleRecord::Unknown { type_tag, raw: record_raw } = &record else {
+            panic!("expected Unknown");
+        };
+        assert_eq!(type_tag.as_deref(), Some("mystery"));
+        assert_eq!(record_raw["extra"]["n"], 7);
+        let serialized = serde_json::to_string(record_raw).unwrap();
+        let round_tripped: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped, raw);
+        // A rebuilt record compares equal, so the extra fields survive the trip.
+        let rebuilt: FlexibleRecord<u8> = FlexibleRecord::Unknown {
+            type_tag: Some("mystery".to_owned()),
+            raw: round_tripped,
+        };
+        assert_eq!(record, rebuilt);
+    }
+
+    #[test]
+    fn extensions_flatten_round_trips_extra_fields() {
+        let mut extensions = Extensions::default();
+        extensions
+            .fields
+            .insert("future_field".to_owned(), json!({"nested": [1, 2]}));
+        extensions.fields.insert("count".to_owned(), json!(3));
+        let value = serde_json::to_value(&extensions).unwrap();
+        assert_eq!(value["count"], 3);
+        assert_eq!(value["future_field"]["nested"][1], 2);
+        let reparsed: Extensions = serde_json::from_value(value).unwrap();
+        assert_eq!(reparsed, extensions);
+    }
+}
