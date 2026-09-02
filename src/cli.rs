@@ -59,8 +59,6 @@ fn restore_raw_tail(cli: &mut Cli, arguments: &[OsString]) {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Sessions(SessionsCli),
-    Sks,
-    Skss(SkssArgs),
     Omlo(RawTail),
     Pilo(RawTail),
     Rpilo(RawTail),
@@ -89,6 +87,8 @@ pub struct SessionsCli {
 pub enum SessionsCommand {
     List(SessionListArgs),
     Search(SessionSearchArgs),
+    /// Search message bodies, then pick a session with fzf and open it.
+    Query(SessionQueryArgs),
     #[command(visible_alias = "migrate")]
     Convert(SessionConvertArgs),
     Fork(SessionForkArgs),
@@ -111,6 +111,7 @@ pub struct SessionListArgs {
         conflicts_with_all = ["fzf", "paths", "picker"]
     )]
     pub hosts: Vec<String>,
+    /// Interactively pick a session with fzf, choose a target, and open it.
     #[arg(long, group = "output")]
     pub fzf: bool,
     #[arg(long, group = "output")]
@@ -168,7 +169,7 @@ pub struct SessionSyncArgs {
 
 
 #[derive(Debug, Args, PartialEq, Eq)]
-pub struct SkssArgs {
+pub struct SessionQueryArgs {
     #[arg(required = true, num_args = 1.., value_parser = nonempty_query)]
     pub query: Vec<String>,
 }
@@ -249,8 +250,6 @@ pub fn run() -> anyhow::Result<()> {
 fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Sessions(sessions) => dispatch_sessions(sessions),
-        Command::Sks => dispatch_picker(None),
-        Command::Skss(args) => dispatch_picker(Some(args.query.join(" "))),
         Command::Omlo(args) => dispatch_launcher(crate::launcher::LauncherKind::Omp, args.argv),
         Command::Pilo(args) => dispatch_launcher(crate::launcher::LauncherKind::Pi, args.argv),
         Command::Rpilo(args) => dispatch_launcher(crate::launcher::LauncherKind::Rpi, args.argv),
@@ -270,6 +269,7 @@ fn dispatch_sessions(sessions: SessionsCli) -> anyhow::Result<()> {
         None => dispatch_list(sessions.default_list),
         Some(SessionsCommand::List(args)) => dispatch_list(args),
         Some(SessionsCommand::Search(args)) => dispatch_search(args),
+        Some(SessionsCommand::Query(args)) => dispatch_picker(Some(args.query.join(" "))),
         Some(SessionsCommand::Convert(args)) => dispatch_convert(args),
         Some(SessionsCommand::Fork(args)) => {
             dispatch_session_launch(args.session_ref, args.target_tool, args.print_command, true)
@@ -304,15 +304,15 @@ fn dispatch_list(args: SessionListArgs) -> anyhow::Result<()> {
 }
 
 fn dispatch_local_list(args: &SessionListArgs) -> anyhow::Result<()> {
+    if args.fzf {
+        return dispatch_picker(None);
+    }
     let rows = crate::sessions::list_rows(&crate::sessions::ListOptions {
         count: args.count,
         show_all: args.all,
         dedupe: args.dedupe,
         tools: Vec::new(),
     })?;
-    if args.fzf {
-        return finish_fzf(crate::picker::list_fzf(rows, None, true, false)?);
-    }
     if args.paths {
         print_byte_lines(&crate::sessions::render_paths_tsv(&rows))?;
     } else if args.picker {
@@ -459,14 +459,6 @@ fn dispatch_launcher(
             eprintln!("al: {error}");
             exit_with(error.exit_code())
         }
-    }
-}
-
-fn finish_fzf(outcome: crate::picker::FzfOutcome) -> anyhow::Result<()> {
-    match outcome {
-        crate::picker::FzfOutcome::Selected => Ok(()),
-        crate::picker::FzfOutcome::Cancelled => exit_with(1),
-        crate::picker::FzfOutcome::Error(code) => exit_with(code),
     }
 }
 
@@ -1120,18 +1112,30 @@ mod tests {
     }
 
     #[test]
-    fn sks_and_skss_parse_with_joinable_query_words() {
-        assert!(matches!(
-            Cli::try_parse_from(["al", "sks"]).unwrap().command,
-            Some(Command::Sks)
-        ));
-        let parsed = Cli::try_parse_from(["al", "skss", "one", "two"]).unwrap();
-        let Some(Command::Skss(args)) = parsed.command else {
-            panic!("expected skss command");
+    fn query_joins_words_and_rejects_empty() {
+        let parsed = Cli::try_parse_from(["al", "sessions", "query", "one", "two"]).unwrap();
+        let Some(Command::Sessions(sessions)) = parsed.command else {
+            panic!("expected sessions command");
+        };
+        let Some(SessionsCommand::Query(args)) = sessions.command else {
+            panic!("expected query command");
         };
         assert_eq!(args.query, ["one", "two"]);
-        assert!(Cli::try_parse_from(["al", "skss"]).is_err());
-        assert!(Cli::try_parse_from(["al", "skss", "   "]).is_err());
+        assert!(Cli::try_parse_from(["al", "sessions", "query"]).is_err());
+        assert!(Cli::try_parse_from(["al", "sessions", "query", "   "]).is_err());
+    }
+
+    #[test]
+    fn removed_sks_spellings_are_rejected_and_hidden_from_help() {
+        assert!(Cli::try_parse_from(["al", "sks"]).is_err());
+        assert!(Cli::try_parse_from(["al", "skss", "needle"]).is_err());
+
+        let mut root = Cli::command();
+        assert!(root.find_subcommand("sks").is_none());
+        assert!(root.find_subcommand("skss").is_none());
+        let help = root.render_long_help().to_string();
+        assert!(!help.contains("  sks"));
+        assert!(!help.contains("  skss"));
     }
 
     #[test]

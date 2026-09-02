@@ -7,6 +7,7 @@ use chrono::{TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, types::ValueRef};
 use serde::Deserialize;
 use serde_json::Value;
+use thiserror::Error;
 
 use crate::domain::{Message, Role, Session, SourceTool};
 use crate::formats::{normalize, summarize_messages};
@@ -23,6 +24,14 @@ struct Sidecar {
     updated_at_ms: Option<i64>,
 }
 
+/// Why an Agent store is unloadable. Catalog listing treats [`Self::Subagent`]
+/// as an expected skip rather than a corrupt file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AgentParseError {
+    #[error("Agent subagent session is not resumable")]
+    Subagent,
+}
+
 pub fn parse(path: &Path) -> Result<Session> {
     let metadata = fs::metadata(path).with_context(|| format!("reading Agent store metadata {}", path.display()))?;
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
@@ -34,7 +43,7 @@ pub fn parse(path: &Path) -> Result<Session> {
         .and_then(|value| value.get("subagentInfo"))
         .is_some_and(Value::is_object)
     {
-        anyhow::bail!("Agent subagent session is not resumable: {}", path.display());
+        return Err(AgentParseError::Subagent.into());
     }
     let messages = read_messages(&connection, path)?;
     let directory = path.parent().with_context(|| format!("Agent store has no parent: {}", path.display()))?;
@@ -299,7 +308,11 @@ mod tests {
             &[],
             None,
         );
-        assert!(parse(&path).unwrap_err().to_string().contains("subagent"));
+        let error = parse(&path).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<AgentParseError>().copied(),
+            Some(AgentParseError::Subagent)
+        );
     }
 
     #[cfg(unix)]

@@ -592,9 +592,10 @@ fn pick_session_with_fzf(
 /// High-level session picker: select rows, format picker TSV lines,
 /// run fzf with the given prompt, and return the parsed outcome.
 ///
-/// This is the primary entry point for `sks`/`skss` — the CLI builds
-/// `SessionRow`s (via the sessions module), calls this, then chains
-/// `target_tools_for_source` + `pick_target_tool` + `open`.
+/// This is the primary entry point for `sessions --fzf` and
+/// `sessions query` — the CLI builds `SessionRow`s (via the sessions
+/// module), calls this, then chains `target_tools_for_source` +
+/// `pick_target_tool` + `open`.
 pub fn select_session(
     rows: Vec<SessionRow>,
     count: Option<usize>,
@@ -633,22 +634,6 @@ fn path_from_picker_bytes(bytes: &[u8]) -> Result<PathBuf> {
 fn path_from_picker_bytes(bytes: &[u8]) -> Result<PathBuf> {
     let path = std::str::from_utf8(bytes).context("picker path field is not UTF-8")?;
     Ok(PathBuf::from(path))
-}
-
-/// High-level helper matching the `sessions list --fzf` command:
-/// select rows, format with picker-color decision, pipe to fzf.
-pub fn list_fzf(
-    rows: Vec<SessionRow>,
-    count: Option<usize>,
-    show_all: bool,
-    dedupe: bool,
-) -> Result<FzfOutcome> {
-    let use_color = use_color_for_picker();
-    let lines: Vec<String> = select_rows(rows, count, show_all, dedupe)
-        .iter()
-        .map(|row| format_row(row, use_color))
-        .collect();
-    run_fzf(&lines)
 }
 
 fn which_fzf() -> Result<PathBuf> {
@@ -1094,7 +1079,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sks_target_picker_can_select_rpi() {
+    fn target_picker_can_select_rpi() {
         let temp = tempfile::tempdir().unwrap();
         let fzf = temp.path().join("fzf");
         fs::write(&fzf, b"#!/bin/sh\nwhile IFS= read -r line; do if [ \"$line\" = rpi ]; then printf '%s\\n' \"$line\"; fi; done\n").unwrap();

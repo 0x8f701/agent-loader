@@ -475,6 +475,13 @@ fn removed_sessions_all_public_spellings_fail_to_parse() {
 }
 
 #[test]
+fn removed_sks_public_spellings_fail_to_parse() {
+    let home = TempDir::new().unwrap();
+    assert_eq!(run(home.path(), &["sks"]).status.code(), Some(2));
+    assert_eq!(run(home.path(), &["skss", "needle"]).status.code(), Some(2));
+}
+
+#[test]
 fn search_uppercase_query_finds_lowercase_message_body_and_summary() {
     let home = TempDir::new().unwrap();
     let dir = "--home-pi-int--";
@@ -829,5 +836,249 @@ fn agentlo_protected_tail_survives_without_shell_reparsing() {
     assert_eq!(
         recorded,
         format!("<--force>\n<--trust>\n<--approve-mcps>\n<--resume>\n<{payload}>\n")
+    );
+}
+
+#[cfg(unix)]
+fn write_picker_stubs(home: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let bin = home.join("bin");
+    let fzf_state = home.join("fzf-state");
+    let pi_invocations = home.join("pi-invocations");
+    write_fake_tool(
+        &bin,
+        "fzf",
+        r#"#!/bin/sh
+state="${AL_FZF_STATE:?}"
+n=0
+if [ -f "$state" ]; then
+    n=$(cat "$state")
+fi
+n=$((n + 1))
+printf '%s\n' "$n" > "$state"
+if [ "$n" -eq 1 ]; then
+    IFS= read -r line || true
+    cat >/dev/null
+    printf '%s\n' "$line"
+    exit 0
+fi
+while IFS= read -r line; do
+    if [ "$line" = pi ]; then
+        printf '%s\n' "$line"
+        exit 0
+    fi
+done
+exit 1
+"#,
+    );
+    write_fake_tool(
+        &bin,
+        "pi",
+        r#"#!/bin/sh
+for a in "$@"; do
+    printf '<%s>\n' "$a" >> "${AL_PI_INVOCATIONS:?}"
+done
+"#,
+    );
+    (bin, fzf_state, pi_invocations)
+}
+
+#[cfg(unix)]
+#[test]
+fn sessions_fzf_picks_session_and_opens_native_pi() {
+    let home = TempDir::new().unwrap();
+    let cwd = home.path().to_str().expect("utf8 temp home");
+    let session_id = "aaaaaaaa-0000-4000-8000-000000000011";
+    let path = write_pi_session(
+        home.path(),
+        "--home-pi-int--",
+        "2026-07-30T12-00-00-aaaaaaaa-0000-4000-8000-000000000011.jsonl",
+        &[
+            header(session_id, cwd),
+            message("u1", None, "user", "open this fixture from fzf"),
+        ],
+    );
+    let (bin, fzf_state, pi_invocations) = write_picker_stubs(home.path());
+    let path_var = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+        .unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "--fzf"],
+        &[
+            ("PATH", path_var.as_os_str()),
+            ("AL_FZF_STATE", fzf_state.as_os_str()),
+            ("AL_PI_INVOCATIONS", pi_invocations.as_os_str()),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "sessions --fzf failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(&fzf_state).unwrap().trim(), "2");
+    assert_eq!(
+        fs::read_to_string(&pi_invocations).unwrap(),
+        format!("<--session>\n<{}>\n", path.display())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sessions_list_fzf_matches_bare_fzf() {
+    let home = TempDir::new().unwrap();
+    let cwd = home.path().to_str().expect("utf8 temp home");
+    let path = write_pi_session(
+        home.path(),
+        "--home-pi-int--",
+        "2026-07-30T12-00-00-bbbbbbbb-0000-4000-8000-000000000012.jsonl",
+        &[
+            header("bbbbbbbb-0000-4000-8000-000000000012", cwd),
+            message("u1", None, "user", "explicit list fzf"),
+        ],
+    );
+    let (bin, fzf_state, pi_invocations) = write_picker_stubs(home.path());
+    let path_var = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+        .unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "list", "--fzf"],
+        &[
+            ("PATH", path_var.as_os_str()),
+            ("AL_FZF_STATE", fzf_state.as_os_str()),
+            ("AL_PI_INVOCATIONS", pi_invocations.as_os_str()),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "sessions list --fzf failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&pi_invocations).unwrap(),
+        format!("<--session>\n<{}>\n", path.display())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sessions_query_searches_then_opens_only_the_match() {
+    let home = TempDir::new().unwrap();
+    let cwd = home.path().to_str().expect("utf8 temp home");
+    let match_id = "cccccccc-0000-4000-8000-000000000013";
+    let match_path = write_pi_session(
+        home.path(),
+        "--home-pi-int--",
+        "2026-07-30T12-00-00-cccccccc-0000-4000-8000-000000000013.jsonl",
+        &[
+            header(match_id, cwd),
+            message("u1", None, "user", "unique needle in the body"),
+        ],
+    );
+    write_pi_session(
+        home.path(),
+        "--home-pi-int--",
+        "2026-07-30T12-01-00-dddddddd-0000-4000-8000-000000000014.jsonl",
+        &[
+            header("dddddddd-0000-4000-8000-000000000014", cwd),
+            message("u1", None, "user", "completely unrelated cats"),
+        ],
+    );
+    let (bin, fzf_state, pi_invocations) = write_picker_stubs(home.path());
+    let path_var = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+        .unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "query", "UNIQUE", "needle"],
+        &[
+            ("PATH", path_var.as_os_str()),
+            ("AL_FZF_STATE", fzf_state.as_os_str()),
+            ("AL_PI_INVOCATIONS", pi_invocations.as_os_str()),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "sessions query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&pi_invocations).unwrap(),
+        format!("<--session>\n<{}>\n", match_path.display())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sessions_query_without_match_cancels_without_launching() {
+    let home = TempDir::new().unwrap();
+    let cwd = home.path().to_str().expect("utf8 temp home");
+    write_pi_session(
+        home.path(),
+        "--home-pi-int--",
+        "2026-07-30T12-00-00-eeeeeeee-0000-4000-8000-000000000015.jsonl",
+        &[
+            header("eeeeeeee-0000-4000-8000-000000000015", cwd),
+            message("u1", None, "user", "no such term here"),
+        ],
+    );
+    let (bin, fzf_state, pi_invocations) = write_picker_stubs(home.path());
+    let path_var = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+        .unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "query", "missing-term-xyz"],
+        &[
+            ("PATH", path_var.as_os_str()),
+            ("AL_FZF_STATE", fzf_state.as_os_str()),
+            ("AL_PI_INVOCATIONS", pi_invocations.as_os_str()),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!fzf_state.exists(), "empty query results must not spawn fzf");
+    assert!(!pi_invocations.exists(), "empty query results must not launch");
+}
+
+#[test]
+fn sessions_fzf_on_empty_catalog_cancels() {
+    let home = TempDir::new().unwrap();
+    let output = run(home.path(), &["sessions", "--fzf"]);
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn sessions_query_requires_a_nonempty_query() {
+    let home = TempDir::new().unwrap();
+    assert_eq!(run(home.path(), &["sessions", "query"]).status.code(), Some(2));
+    assert_eq!(
+        run(home.path(), &["sessions", "query", "   "]).status.code(),
+        Some(2)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sessions_fzf_without_fzf_on_path_fails() {
+    let home = TempDir::new().unwrap();
+    let cwd = home.path().to_str().expect("utf8 temp home");
+    write_pi_session(
+        home.path(),
+        "--home-pi-int--",
+        "2026-07-30T12-00-00-ffffffff-0000-4000-8000-000000000016.jsonl",
+        &[
+            header("ffffffff-0000-4000-8000-000000000016", cwd),
+            message("u1", None, "user", "needs fzf"),
+        ],
+    );
+    let empty = home.path().join("empty-bin");
+    fs::create_dir_all(&empty).unwrap();
+    let path = std::env::join_paths([empty.as_path()]).unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "--fzf"],
+        &[("PATH", path.as_os_str())],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.to_lowercase().contains("fzf"),
+        "missing fzf must be reported: {stderr}"
     );
 }

@@ -36,7 +36,7 @@ The installer verifies every download against the release's `SHA256SUMS` and ins
 Pin a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.3.0
+curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.4.0
 ```
 
 If `al` is not on PATH after installation, open a new terminal or use the full path printed during install.
@@ -76,8 +76,8 @@ al sessions fork 00000000-0000-0000-0000-000000000000 grok --print-command
 al sessions open agent-session-id agent --print-command
 
 # Interactive fuzzy session picker (local only; requires fzf on PATH).
-al sks
-al skss "refactor auth"
+al sessions --fzf
+al sessions query "refactor auth"
 
 # Point-to-point session catalog sync (dry-run first).
 # Cursor Agent native SQLite stores are intentionally not synchronized.
@@ -104,14 +104,14 @@ Run `al --help` and `al COMMAND --help` for the current argument surface.
 - `al sessions [COUNT]` — list recent local sessions (default 5; use `--all` to show everything, `--dedupe` to keep the newest row per tool/cwd/summary).
   - `al sessions list [COUNT]` — explicit list with the same flags.
   - Repeatable `--host HOST` adds a remote host to query. `local` is reserved for the current machine. With `--host`, `al` runs `al sessions list` on each host over SSH and prints read-only results grouped under `== <host> ==`. It is not a sync: no files are copied. Hosts are queried in the order given; `--all`/`--dedupe`/COUNT are forwarded to each remote. Per-host deduplication only; there is no cross-host deduplication. The command continues after a failed host and exits nonzero if any host failed. Empty, whitespace-containing, control-character, or option-like host values are rejected. `--host` cannot be combined with `--paths`, `--picker`, or `--fzf`.
+  - `al sessions --fzf` / `al sessions list --fzf` — local interactive fuzzy filter over tool, time, session id, and summary, followed by a target picker that opens the session. Native Agent rows offer only `agent` and default to it. Requires `fzf` on PATH. Uses the full deduped catalog, not the default 5-row list.
   - `al sessions search QUERY` — search the text of user/assistant messages in discovered sessions. Search is local-only. `--dedupe` and `--picker` change output style.
+  - `al sessions query QUERY...` — the same picker-and-open flow as `--fzf`, after a local user/assistant message-body search, including parsed native Agent messages. Requires `fzf` on PATH.
   - `al sessions convert SOURCE TARGET INPUT [OUTPUT]` (visible alias `migrate`) — read `INPUT` in the native format of `SOURCE` and write a `TARGET`-compatible export. If `OUTPUT` is omitted, the export is written to the target tool's native session location and the path is printed. Cursor Agent is intentionally excluded because its store format is undocumented.
   - `al sessions fork SESSION_REF TARGET` — fork a session to another tool. Agent is not a fork target and native Agent sessions cannot be forked.
   - `al sessions open SESSION_REF TARGET` — reopen a session in the target tool. A native Agent session may only target `agent`; it runs `agent --force --trust --approve-mcps --resume <session-id>` in the recorded cwd.
   - `al sessions open|fork --print-command` — print the native command without launching the agent, then exit. A cross-tool fork may first write the forked export.
   - `al sessions sync SRC_OR_DST [DST] [--tool TOOL]... [--dry-run]` — synchronize supported session catalogs point-to-point. With one endpoint, the local catalog is uploaded to that endpoint. With two endpoints, the first is the source and the second is the destination; both cannot be `local`. `--tool` can be repeated to limit the transfer to specific source tools. Cursor Agent SQLite stores are excluded and `--tool agent` is rejected. This is separate from read-only multi-host listing.
-- `al sks` — local interactive fuzzy filter over tool, time, session id, and summary, followed by a target picker. Native Agent rows offer only `agent` and default to it. Requires `fzf` on PATH.
-- `al skss QUERY...` — the same picker flow after a local user/assistant message-body search, including parsed native Agent messages. Requires `fzf` on PATH.
 - `al omlo|pilo|rpilo|grolo|hyperlo|dolo|colo|cclo|agentlo [...]` — launch the corresponding coding agent (OMP, Pi, Rpi, Grok, Hyper, Droid, Codex, Claude, Cursor Agent). Common launcher flags:
   - `--host HOST` — run on a remote host over SSH (requires the current directory to be inside a git repository).
   - `--wt NAME` — use a named git worktree on the remote host (requires `--host`).
@@ -121,7 +121,7 @@ Run `al --help` and `al COMMAND --help` for the current argument surface.
 
   On macOS, remote launchers map `/Users/<user>` to `/home/<user>`. Additional component-aware mappings can be supplied through `AL_REMOTE_PATH_MAPS` as an ordered JSON array of absolute source/destination pairs, for example `[["/Volumes/workspace","/srv/workspace"]]`. Every source and destination must be an absolute path; malformed configuration fails before SSH is invoked. The remote host must have `al` installed and on PATH.
 
-  `al agentlo` launches Cursor's official `agent` CLI. With no tool args it first runs `agent --force --trust --approve-mcps --continue`; if that command exits nonzero, it retries as `agent --force --trust --approve-mcps` to create a new chat. Cursor's native local worktree options (`-w`/`--worktree [NAME]` and `--worktree-base REF`) pass through normally. The launcher-level `--wt NAME` remains the remote-host worktree control and therefore requires `--host`; `--tmux` works for both local and remote launches. A `--session ID` selector (or a positional chat id) maps to `--resume ID`; any other arguments are forwarded verbatim after the base approval flags. Separately, `al sessions`, `al sessions search`, `sks`, and `skss` discover native Cursor Agent sessions and can reopen them exactly; conversion and sync remain disabled because the native SQLite/blob format is undocumented and live stores may depend on WAL state.
+  `al agentlo` launches Cursor's official `agent` CLI. With no tool args it first runs `agent --force --trust --approve-mcps --continue`; if that command exits nonzero, it retries as `agent --force --trust --approve-mcps` to create a new chat. Cursor's native local worktree options (`-w`/`--worktree [NAME]` and `--worktree-base REF`) pass through normally. The launcher-level `--wt NAME` remains the remote-host worktree control and therefore requires `--host`; `--tmux` works for both local and remote launches. A `--session ID` selector (or a positional chat id) maps to `--resume ID`; any other arguments are forwarded verbatim after the base approval flags. Separately, `al sessions`, `al sessions search`, `al sessions --fzf`, and `al sessions query` discover native Cursor Agent sessions and can reopen them exactly; conversion and sync remain disabled because the native SQLite/blob format is undocumented and live stores may depend on WAL state.
 - `al tmux-run ...` — run a command inside the tmux integration wrapper (Unix only; Windows returns an explicit unsupported-platform error).
 
 ```sh
@@ -207,14 +207,14 @@ Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 ### Artifacts
 
 | Asset | Example |
-| macOS arm64 | `al-0.3.0-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `al-0.3.0-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc 2.31+) | `al-0.3.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc 2.31+) | `al-0.3.0-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `al-0.3.0-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `al-0.4.0-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `al-0.4.0-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 (glibc 2.31+) | `al-0.4.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc 2.31+) | `al-0.4.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `al-0.4.0-x86_64-pc-windows-msvc.zip` |
 | Checksums | `SHA256SUMS` |
 
-The tag must match `Cargo.toml` version exactly (`v0.3.0` ↔ `0.3.0`) or the build fails.
+The tag must match `Cargo.toml` version exactly (`v0.4.0` ↔ `0.4.0`) or the build fails.
 
 ## License
 

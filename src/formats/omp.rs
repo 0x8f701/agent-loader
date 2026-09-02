@@ -39,11 +39,12 @@ pub fn parse(path: &Path) -> Result<Session> {
     let modified_epoch = file_mtime(path);
 
     // Native OMP session files begin with a fixed-width title-slot record:
-    //   {"type":"title","v":1,"title":"…","updatedAt":"…","pad":"…"[,"source":"auto"|"user"]}
+    //   {"type":"title","v":1,"title":"…","updatedAt":"…","pad":"…"[,"source":…]}
     // (`src/session/title-slot.ts::parseTitleSlotObject`). The slot is split off
     // before the JSONL body is parsed; its non-empty title overrides the
     // `session` header title, and an empty slot title deletes it. The session
     // header must then be the first logical record of the remaining body.
+    // Native writers use source "auto"|"user"; converted exports use "converted".
     let mut start = 0;
     let mut slot_title: Option<String> = None;
     let mut slot_present = false;
@@ -54,12 +55,11 @@ pub fn parse(path: &Path) -> Result<Session> {
         {
             // `updatedAt` and `pad` are required strings in the native schema;
             // validate them so an unrelated `{"type":"title"}` object is not
-            // mistaken for a slot.
+            // mistaken for a slot. `source` is optional metadata: any string is
+            // accepted so converted exports stay loadable.
             let valid = object.get("updatedAt").and_then(Value::as_str).is_some()
                 && object.get("pad").and_then(Value::as_str).is_some()
-                && object
-                    .get("source")
-                    .is_none_or(|src| src.as_str().is_some_and(|s| s == "auto" || s == "user"));
+                && object.get("source").is_none_or(Value::is_string);
             if valid {
                 slot_present = true;
                 slot_title = object
@@ -384,6 +384,20 @@ mod tests {
         let session = parse(file.path()).expect("parse");
         assert_eq!(session.session_id, "s1");
         assert_eq!(session.summary, "Slot Title");
+    }
+
+    #[test]
+    fn converted_title_slot_source_is_accepted() {
+        let header = r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","title":"Header Title","titleSource":"converted"}"#;
+        let file = write_session(&[
+            r#"{"type":"title","v":1,"title":"Converted Title","source":"converted","updatedAt":"2026-01-01T00:00:00.000Z","pad":""}"#,
+            header,
+            &msg("a", None, "user", r#""first user text""#),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(session.session_id, "s1");
+        assert_eq!(session.summary, "Converted Title");
+        assert_eq!(session.messages[0].text, "first user text");
     }
 
     #[test]

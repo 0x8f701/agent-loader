@@ -318,8 +318,13 @@ impl Catalog {
                 let (modified_epoch, size) = session_file_stats(tool, &path, &metadata);
                 let session = match self.parse(tool, &path) {
                     Ok(session) => session,
+                    Err(error) if is_expected_skip(&error) => continue,
                     Err(error) => {
-                        eprintln!("skip {tool} session {}: {error:#}", path.display());
+                        eprintln!(
+                            "skip {tool} session {}: {}",
+                            path.display(),
+                            error.root_cause()
+                        );
                         continue;
                     }
                 };
@@ -446,6 +451,16 @@ fn selected_tools(filters: &[SourceTool]) -> Vec<SourceTool> {
         .into_iter()
         .filter(|tool| selected.contains(tool))
         .collect()
+}
+
+/// Empty OMP drafts and Cursor subagent stores are catalog-excluded by design.
+fn is_expected_skip(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<omp::OmpParseError>()
+        .is_some_and(|kind| *kind == omp::OmpParseError::Empty)
+        || error
+            .downcast_ref::<agent::AgentParseError>()
+            .is_some_and(|kind| *kind == agent::AgentParseError::Subagent)
 }
 
 fn matches_pattern(tool: SourceTool, path: &Path) -> bool {
@@ -1139,5 +1154,48 @@ mod tests {
         ).unwrap();
         assert!(catalog.scan(&[SourceTool::Agent]).is_empty());
         assert!(catalog.resolve_for_tool(SourceTool::Agent, "subagent-session").is_err());
+    }
+
+    #[test]
+    fn converted_omp_title_slot_is_listed() {
+        let (_home, catalog) = catalog();
+        let directory = catalog
+            .root_for_tool(SourceTool::Omp)
+            .path
+            .join("project");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("converted.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"title","v":1,"title":"Converted Title","source":"converted","updatedAt":"2026-01-01T00:00:00.000Z","pad":""}"#,
+                "\n",
+                r#"{"type":"session","version":3,"id":"converted-id","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","title":"Converted Title","titleSource":"converted"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"hello converted"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let rows = catalog.scan(&[SourceTool::Omp]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "converted-id");
+        assert_eq!(rows[0].summary, "Converted Title");
+        assert_eq!(rows[0].path, path);
+    }
+
+    #[test]
+    fn expected_skips_are_typed_and_quiet() {
+        let empty = anyhow::Error::new(omp::OmpParseError::Empty)
+            .context("parsing omp session /tmp/empty.jsonl");
+        let headerless = anyhow::Error::new(omp::OmpParseError::NoSessionHeader)
+            .context("parsing omp session /tmp/bad.jsonl");
+        let subagent = anyhow::Error::new(agent::AgentParseError::Subagent)
+            .context("parsing agent session /tmp/store.db");
+        let other = anyhow::anyhow!("disk full");
+        assert!(is_expected_skip(&empty));
+        assert!(is_expected_skip(&subagent));
+        assert!(!is_expected_skip(&headerless));
+        assert!(!is_expected_skip(&other));
     }
 }
