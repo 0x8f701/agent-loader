@@ -11,6 +11,7 @@ use thiserror::Error;
 #[serde(rename_all = "lowercase")]
 pub enum SourceTool {
     Pi,
+    Rpi,
     Omp,
     Droid,
     Codex,
@@ -20,8 +21,9 @@ pub enum SourceTool {
 }
 
 impl SourceTool {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Pi,
+        Self::Rpi,
         Self::Omp,
         Self::Droid,
         Self::Codex,
@@ -33,6 +35,7 @@ impl SourceTool {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pi => "pi",
+            Self::Rpi => "rpi",
             Self::Omp => "omp",
             Self::Droid => "droid",
             Self::Codex => "codex",
@@ -40,6 +43,11 @@ impl SourceTool {
             Self::Grok => "grok",
             Self::Agent => "agent",
         }
+    }
+
+    /// Pi and Rpi use the same JSONL tree on disk, in different catalog roots.
+    pub const fn uses_pi_jsonl(self) -> bool {
+        matches!(self, Self::Pi | Self::Rpi)
     }
 }
 
@@ -55,6 +63,7 @@ impl FromStr for SourceTool {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "pi" => Ok(Self::Pi),
+            "rpi" => Ok(Self::Rpi),
             "omp" => Ok(Self::Omp),
             "droid" => Ok(Self::Droid),
             "codex" => Ok(Self::Codex),
@@ -117,7 +126,7 @@ impl TargetTool {
             Self::Grok => Some(SourceTool::Grok),
             Self::Agent => Some(SourceTool::Agent),
             Self::Hyper => None,
-            Self::Rpi => None,
+            Self::Rpi => Some(SourceTool::Rpi),
         }
     }
 
@@ -358,7 +367,7 @@ mod tests {
         assert_eq!(TargetTool::Grok.source(), Some(SourceTool::Grok));
         assert_eq!(TargetTool::Agent.source(), Some(SourceTool::Agent));
         assert_eq!(TargetTool::Hyper.source(), None);
-        assert_eq!(TargetTool::Rpi.source(), None);
+        assert_eq!(TargetTool::Rpi.source(), Some(SourceTool::Rpi));
     }
 
     #[test]

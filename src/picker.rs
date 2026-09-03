@@ -156,6 +156,7 @@ pub fn size_color(size: u64) -> &'static str {
 pub fn tool_color(tool: SourceTool) -> &'static str {
     match tool {
         SourceTool::Pi => "\x1b[94m",
+        SourceTool::Rpi => "\x1b[35m",
         SourceTool::Omp => "\x1b[96m",
         SourceTool::Droid => "\x1b[91m",
         SourceTool::Codex => "\x1b[92m",
@@ -334,6 +335,7 @@ pub fn target_tools_for_source(source: SourceTool) -> Vec<TargetTool> {
     let mut tools = match source {
         SourceTool::Grok => vec![TargetTool::Hyper, TargetTool::Grok],
         SourceTool::Pi => vec![TargetTool::Rpi, TargetTool::Pi],
+        SourceTool::Rpi => vec![TargetTool::Rpi],
         SourceTool::Agent => return vec![TargetTool::Agent],
         _ => vec![source_to_target(source)],
     };
@@ -357,6 +359,7 @@ pub fn target_tools_for_source(source: SourceTool) -> Vec<TargetTool> {
 const fn source_to_target(source: SourceTool) -> TargetTool {
     match source {
         SourceTool::Pi => TargetTool::Pi,
+        SourceTool::Rpi => TargetTool::Rpi,
         SourceTool::Omp => TargetTool::Omp,
         SourceTool::Droid => TargetTool::Droid,
         SourceTool::Codex => TargetTool::Codex,
@@ -823,6 +826,7 @@ mod tests {
     #[test]
     fn tool_color_mapping() {
         assert_eq!(tool_color(SourceTool::Pi), "\x1b[94m");
+        assert_eq!(tool_color(SourceTool::Rpi), "\x1b[35m");
         assert_eq!(tool_color(SourceTool::Omp), "\x1b[96m");
         assert_eq!(tool_color(SourceTool::Droid), "\x1b[91m");
         assert_eq!(tool_color(SourceTool::Codex), "\x1b[92m");

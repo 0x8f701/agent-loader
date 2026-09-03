@@ -7,7 +7,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -310,6 +310,7 @@ struct RunEnvironment {
 enum ExecuteMode {
     Capture,
     Inherit,
+    InheritQuiet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,8 +350,13 @@ impl Executor for SystemExecutor {
                     stdout: output.stdout,
                 })
             }
-            ExecuteMode::Inherit => {
-                let status = Command::new(program).args(args).status()?;
+            ExecuteMode::Inherit | ExecuteMode::InheritQuiet => {
+                let mut command = Command::new(program);
+                command.args(args);
+                if mode == ExecuteMode::InheritQuiet {
+                    command.stderr(Stdio::null());
+                }
+                let status = command.status()?;
                 Ok(ExecuteOutput {
                     status: exit_status_code(status),
                     stdout: Vec::new(),
@@ -598,8 +604,13 @@ fn execute_direct<E: Executor>(
     executor: &mut E,
 ) -> Result<i32> {
     let (program, args) = command_program(shell, request.command_mode, &request.command)?;
+    let primary_mode = if request.fallback.is_some() {
+        ExecuteMode::InheritQuiet
+    } else {
+        ExecuteMode::Inherit
+    };
     let output = executor
-        .execute(&program, &args, ExecuteMode::Inherit)
+        .execute(&program, &args, primary_mode)
         .with_context(|| format!("executing {:?}", program))?;
     if output.status == 0 {
         return Ok(0);
@@ -1024,6 +1035,14 @@ trait ChildHandle {
 
 trait ChildRuntime {
     fn spawn(&mut self, program: &OsStr, args: &[OsString]) -> io::Result<Box<dyn ChildHandle>>;
+    fn spawn_quiet(
+        &mut self,
+        program: &OsStr,
+        args: &[OsString],
+    ) -> io::Result<Box<dyn ChildHandle>> {
+        self.spawn(program, args)
+    }
+    fn clear_pane(&mut self) {}
     fn login_shell(&mut self, shell: &OsStr, args: &[OsString]) -> io::Result<i32>;
     fn sleep(&mut self, duration: Duration);
 }
@@ -1033,6 +1052,24 @@ struct SystemChildRuntime;
 impl ChildRuntime for SystemChildRuntime {
     fn spawn(&mut self, program: &OsStr, args: &[OsString]) -> io::Result<Box<dyn ChildHandle>> {
         Ok(Box::new(Command::new(program).args(args).spawn()?))
+    }
+
+    fn spawn_quiet(
+        &mut self,
+        program: &OsStr,
+        args: &[OsString],
+    ) -> io::Result<Box<dyn ChildHandle>> {
+        Ok(Box::new(
+            Command::new(program)
+                .args(args)
+                .stderr(Stdio::null())
+                .spawn()?,
+        ))
+    }
+
+    fn clear_pane(&mut self) {
+        let _ = write!(io::stdout(), "\x1b[H\x1b[2J");
+        let _ = io::stdout().flush();
     }
 
     fn login_shell(&mut self, shell: &OsStr, args: &[OsString]) -> io::Result<i32> {
@@ -1060,7 +1097,12 @@ fn run_child_with<R: ChildRuntime>(payload: &Path, ready: &Path, runtime: &mut R
     let (program, args) = command_program(&payload.shell, payload.mode, &payload.argv)?;
     let ready_cleanup = FileCleanup(ready.to_owned());
     let mut active_program = program;
-    let mut child = match runtime.spawn(&active_program, &args) {
+    let hide_primary_status = payload.fallback.is_some();
+    let mut child = match if hide_primary_status {
+        runtime.spawn_quiet(&active_program, &args)
+    } else {
+        runtime.spawn(&active_program, &args)
+    } {
         Ok(child) => child,
         Err(error) => {
             return report_spawn_error(
@@ -1077,6 +1119,7 @@ fn run_child_with<R: ChildRuntime>(payload: &Path, ready: &Path, runtime: &mut R
     if let Some(status) = startup_exit(&mut *child, runtime)? {
         if status != 0 {
             if let Some(fallback) = payload.fallback.take() {
+                runtime.clear_pane();
                 active_program = fallback.program;
                 child = match runtime.spawn(&active_program, &fallback.args) {
                     Ok(child) => child,
@@ -1106,6 +1149,7 @@ fn run_child_with<R: ChildRuntime>(payload: &Path, ready: &Path, runtime: &mut R
     let status = child.wait().context("waiting for tmux child command")?;
     if status != 0 {
         if let Some(fallback) = payload.fallback.take() {
+            runtime.clear_pane();
             let mut child = match runtime.spawn(&fallback.program, &fallback.args) {
                 Ok(child) => child,
                 Err(error) => {
@@ -1604,7 +1648,9 @@ mod tests {
             .collect();
         assert_eq!(direct.len(), 2);
         assert_eq!(direct[0].program, OsStr::new("primary"));
+        assert_eq!(direct[0].mode, ExecuteMode::InheritQuiet);
         assert_eq!(direct[1].program, OsStr::new("fallback ; literal"));
+        assert_eq!(direct[1].mode, ExecuteMode::Inherit);
         assert_eq!(direct[1].args, strings(&["two words", "$(not-shell)"]));
     }
 

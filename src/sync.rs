@@ -53,7 +53,7 @@ impl Endpoint {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncOptions {
-    /// Empty means all six source tools. Duplicates are ignored.
+    /// Empty means every source except Agent. Duplicates are ignored.
     pub tools: Vec<SourceTool>,
     pub dry_run: bool,
 }
@@ -768,7 +768,7 @@ fn matches_tool_path(tool: SourceTool, path: &Path) -> bool {
         return false;
     };
     match tool {
-        SourceTool::Pi | SourceTool::Omp => {
+        SourceTool::Pi | SourceTool::Rpi | SourceTool::Omp => {
             depth == 2 && path.extension() == Some(OsStr::new("jsonl"))
         }
         SourceTool::Droid | SourceTool::Claude => {
@@ -794,7 +794,7 @@ fn remote_inventory_script(tool: SourceTool, root: &Path) -> Result<OsString> {
     script.push(quote_posix(root.as_os_str())?);
     script.push(" || exit 3; find . ");
     script.push(match tool {
-        SourceTool::Pi | SourceTool::Omp => {
+        SourceTool::Pi | SourceTool::Rpi | SourceTool::Omp => {
             "-mindepth 2 -maxdepth 2 -type f -name '*.jsonl'"
         }
         SourceTool::Droid | SourceTool::Claude => "-type f -name '*.jsonl'",

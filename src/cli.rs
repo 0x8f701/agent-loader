@@ -91,6 +91,8 @@ pub enum SessionsCommand {
     Query(SessionQueryArgs),
     #[command(visible_alias = "migrate")]
     Convert(SessionConvertArgs),
+    /// Move sessions from one directory to another.
+    Move(SessionMoveArgs),
     Fork(SessionForkArgs),
     Open(SessionOpenArgs),
     Sync(SessionSyncArgs),
@@ -138,6 +140,16 @@ pub struct SessionConvertArgs {
     pub target_tool: TargetTool,
     pub input: OsString,
     pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub struct SessionMoveArgs {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    #[arg(long = "tool", value_parser = non_agent_source)]
+    pub tools: Vec<SourceTool>,
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -192,7 +204,7 @@ pub struct TmuxChildArgs {
 fn non_agent_source(value: &str) -> Result<SourceTool, String> {
     let tool = value.parse::<SourceTool>().map_err(|error| error.to_string())?;
     if tool == SourceTool::Agent {
-        Err("Agent sessions do not support conversion or sync".to_owned())
+        Err("Agent sessions do not support conversion, move, or sync".to_owned())
     } else {
         Ok(tool)
     }
@@ -271,6 +283,7 @@ fn dispatch_sessions(sessions: SessionsCli) -> anyhow::Result<()> {
         Some(SessionsCommand::Search(args)) => dispatch_search(args),
         Some(SessionsCommand::Query(args)) => dispatch_picker(Some(args.query.join(" "))),
         Some(SessionsCommand::Convert(args)) => dispatch_convert(args),
+        Some(SessionsCommand::Move(args)) => dispatch_move(args),
         Some(SessionsCommand::Fork(args)) => {
             dispatch_session_launch(args.session_ref, args.target_tool, args.print_command, true)
         }
@@ -576,6 +589,23 @@ fn dispatch_convert(args: SessionConvertArgs) -> anyhow::Result<()> {
     write_stdout_line(&emitted.path.display().to_string())
 }
 
+fn dispatch_move(args: SessionMoveArgs) -> anyhow::Result<()> {
+    let catalog = crate::sessions::Catalog::from_env()?;
+    let moved = crate::relocate::move_sessions(
+        &catalog,
+        &crate::relocate::MoveOptions {
+            from: args.from,
+            to: args.to,
+            tools: args.tools,
+            dry_run: args.dry_run,
+        },
+    )?;
+    for item in moved {
+        write_stdout_line(&item.destination.display().to_string())?;
+    }
+    Ok(())
+}
+
 fn dispatch_session_launch(
     session_ref: OsString,
     target: TargetTool,
@@ -594,7 +624,7 @@ fn dispatch_session_launch(
     }
     let same_format = target.source() == Some(session.tool)
         || (session.tool == SourceTool::Grok && target == TargetTool::Hyper)
-        || (session.tool == SourceTool::Pi && target == TargetTool::Rpi);
+        || (session.tool.uses_pi_jsonl() && target.uses_pi_storage());
 
     let (path, session_id, created_output) = prepare_session_launch(
         &session,
@@ -966,9 +996,53 @@ mod tests {
     }
 
     #[test]
+    fn move_takes_from_and_to_directories() {
+        let parsed = Cli::try_parse_from([
+            "al",
+            "sessions",
+            "move",
+            "/old/project",
+            "/new/project",
+            "--tool",
+            "pi",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Some(Command::Sessions(sessions)) = parsed.command else {
+            panic!("expected sessions command");
+        };
+        let Some(SessionsCommand::Move(moved)) = sessions.command else {
+            panic!("expected move command");
+        };
+        assert_eq!(moved.from, std::path::PathBuf::from("/old/project"));
+        assert_eq!(moved.to, std::path::PathBuf::from("/new/project"));
+        assert_eq!(moved.tools, [SourceTool::Pi]);
+        assert!(moved.dry_run);
+        assert!(Cli::try_parse_from(["al", "sessions", "move", "/only-one"]).is_err());
+        let rpi = Cli::try_parse_from([
+            "al",
+            "sessions",
+            "move",
+            "/old",
+            "/new",
+            "--tool",
+            "rpi",
+        ])
+        .unwrap();
+        let Some(Command::Sessions(sessions)) = rpi.command else {
+            panic!("expected sessions command");
+        };
+        let Some(SessionsCommand::Move(moved)) = sessions.command else {
+            panic!("expected move command");
+        };
+        assert_eq!(moved.tools, [SourceTool::Rpi]);
+    }
+
+    #[test]
     fn agent_is_open_only_on_the_cli_surface() {
         assert!(Cli::try_parse_from(["al", "sessions", "convert", "agent", "omp", "id"]).is_err());
         assert!(Cli::try_parse_from(["al", "sessions", "convert", "omp", "agent", "id"]).is_err());
+        assert!(Cli::try_parse_from(["al", "sessions", "move", "/old", "/new", "--tool", "agent"]).is_err());
         assert!(Cli::try_parse_from(["al", "sessions", "fork", "id", "agent"]).is_err());
         assert!(Cli::try_parse_from(["al", "sessions", "sync", "host", "--tool", "agent"]).is_err());
 

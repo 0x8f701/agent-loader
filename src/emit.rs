@@ -110,6 +110,7 @@ pub struct CodexRuntime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetRoots {
     pub pi: PathBuf,
+    pub rpi: PathBuf,
     pub omp: PathBuf,
     pub droid: PathBuf,
     pub codex: PathBuf,
@@ -121,6 +122,7 @@ impl TargetRoots {
     pub fn from_home(home: &Path) -> Self {
         Self {
             pi: home.join(".pi/agent/sessions"),
+            rpi: home.join(".rpi/sessions"),
             omp: home.join(".omp/agent/sessions"),
             droid: home.join(".factory/sessions"),
             codex: home.join(".codex/sessions"),
@@ -897,9 +899,18 @@ fn target_path(
     context: &EmitContext,
 ) -> Result<PathBuf> {
     let path = match target {
-        TargetTool::Pi | TargetTool::Rpi => context
+        TargetTool::Pi => context
             .roots
             .pi
+            .join(crate::formats::pi::encode_cwd(Path::new(cwd))?)
+            .join(format!(
+                "{}_{}.jsonl",
+                file_safe_timestamp(start),
+                session_id
+            )),
+        TargetTool::Rpi => context
+            .roots
+            .rpi
             .join(crate::formats::pi::encode_cwd(Path::new(cwd))?)
             .join(format!(
                 "{}_{}.jsonl",
@@ -1114,7 +1125,7 @@ fn zero_usage() -> Value {
     })
 }
 
-fn encode_single_dash_cwd(cwd: &str) -> String {
+pub(crate) fn encode_single_dash_cwd(cwd: &str) -> String {
     let stripped = cwd.trim_matches('/');
     if stripped.is_empty() {
         "-".to_owned()
@@ -1123,7 +1134,7 @@ fn encode_single_dash_cwd(cwd: &str) -> String {
     }
 }
 
-fn encode_grok_cwd(cwd: &str) -> String {
+pub(crate) fn encode_grok_cwd(cwd: &str) -> String {
     let encoded = utf8_percent_encode(cwd, URL_PATH_ENCODE_SET).to_string();
     if encoded.len() <= MAX_FILESYSTEM_COMPONENT_BYTES {
         return encoded;
@@ -1438,6 +1449,26 @@ mod tests {
             native_dir,
             crate::formats::pi::encode_cwd(&session.cwd).unwrap()
         );
+    }
+
+    #[test]
+    fn rpi_emits_into_rpi_sessions_not_pi() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let session = fixture(home);
+        let emitted = emit_with_defaults(
+            &session,
+            TargetTool::Rpi,
+            &EmitContext::new(home).with_session_id("rpi-session"),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        assert!(
+            emitted.path.starts_with(home.join(".rpi/sessions")),
+            "{}",
+            emitted.path.display()
+        );
+        assert!(!emitted.path.starts_with(home.join(".pi/agent/sessions")));
     }
 
     #[test]

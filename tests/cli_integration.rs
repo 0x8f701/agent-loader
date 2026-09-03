@@ -47,7 +47,21 @@ fn message(id: &str, parent: Option<&str>, role: &str, text: &str) -> String {
 /// `is_tree_top_level_session` (`root/<project>/<session>.jsonl`); the file
 /// name carries the native `timestamp_uuid.jsonl` shape.
 fn write_pi_session(home: &Path, dir: &str, file: &str, lines: &[String]) -> PathBuf {
-    let session_dir = home.join(".pi/agent/sessions").join(dir);
+    write_jsonl_session(home, ".pi/agent/sessions", dir, file, lines)
+}
+
+fn write_rpi_session(home: &Path, dir: &str, file: &str, lines: &[String]) -> PathBuf {
+    write_jsonl_session(home, ".rpi/sessions", dir, file, lines)
+}
+
+fn write_jsonl_session(
+    home: &Path,
+    root: &str,
+    dir: &str,
+    file: &str,
+    lines: &[String],
+) -> PathBuf {
+    let session_dir = home.join(root).join(dir);
     fs::create_dir_all(&session_dir)
         .unwrap_or_else(|e| panic!("creating session dir: {e}"));
     let path = session_dir.join(file);
@@ -1081,4 +1095,229 @@ fn sessions_fzf_without_fzf_on_path_fails() {
         stderr.to_lowercase().contains("fzf"),
         "missing fzf must be reported: {stderr}"
     );
+}
+
+#[test]
+fn sessions_move_rehomes_pi_workspace_directory() {
+    let home = TempDir::new().unwrap();
+    let session_id = "aaaaaaaa-0000-4000-8000-000000000020";
+    let file = "2026-07-30T12-00-00-aaaaaaaa-0000-4000-8000-000000000020.jsonl";
+    let source = write_pi_session(
+        home.path(),
+        "--workspace-project--",
+        file,
+        &[
+            header(session_id, "/workspace/project"),
+            message("m1", None, "user", "move this session"),
+            message("m2", Some("m1"), "assistant", "moved"),
+        ],
+    );
+
+    let output = run(
+        home.path(),
+        &[
+            "sessions",
+            "move",
+            "/workspace/project",
+            "/workspace/moved",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "move failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let dest = String::from_utf8(output.stdout).unwrap();
+    let dest = dest.trim();
+    assert!(
+        dest.contains("/.pi/agent/sessions/--workspace-moved--/"),
+        "expected re-homed Pi path, got {dest:?}"
+    );
+    assert!(Path::new(dest).is_file(), "moved destination is missing: {dest}");
+    assert!(
+        !source.exists(),
+        "source session should be deleted after move: {}",
+        source.display()
+    );
+    let text = fs::read_to_string(dest).unwrap();
+    assert!(text.contains("/workspace/moved"), "{text}");
+    assert!(!text.contains("/workspace/project"), "{text}");
+}
+
+#[test]
+fn sessions_move_copies_catalog_folder_without_rewriting_cwd() {
+    let home = TempDir::new().unwrap();
+    let session_id = "bbbbbbbb-0000-4000-8000-000000000021";
+    let file = "2026-07-30T12-00-00-bbbbbbbb-0000-4000-8000-000000000021.jsonl";
+    let source = write_pi_session(
+        home.path(),
+        "--home-pi-int--",
+        file,
+        &[
+            header(session_id, "/workspace/project"),
+            message("m1", None, "user", "folder move"),
+        ],
+    );
+    let from = source.parent().unwrap();
+    let to = home.path().join(".pi/agent/sessions/--home-pi-dst--");
+
+    let output = run(
+        home.path(),
+        &[
+            "sessions",
+            "move",
+            from.to_str().expect("utf8 from"),
+            to.to_str().expect("utf8 to"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "catalog move failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let dest = to.join(file);
+    assert!(!source.exists(), "source should be gone: {}", source.display());
+    assert!(dest.is_file(), "destination missing: {}", dest.display());
+    let text = fs::read_to_string(&dest).unwrap();
+    assert!(
+        text.contains("/workspace/project"),
+        "folder move must keep recorded cwd: {text}"
+    );
+}
+
+#[test]
+fn sessions_move_dry_run_prints_destination_without_moving() {
+    let home = TempDir::new().unwrap();
+    let session_id = "cccccccc-0000-4000-8000-000000000022";
+    let source = write_pi_session(
+        home.path(),
+        "--workspace-project--",
+        "2026-07-30T12-00-00-cccccccc-0000-4000-8000-000000000022.jsonl",
+        &[
+            header(session_id, "/workspace/project"),
+            message("m1", None, "user", "dry run"),
+        ],
+    );
+    let output = run(
+        home.path(),
+        &[
+            "sessions",
+            "move",
+            "/workspace/project",
+            "/workspace/moved",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let dest = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        dest.contains("--workspace-moved--"),
+        "dry-run should print the destination: {dest:?}"
+    );
+    assert!(source.exists(), "dry-run must not delete the source");
+    assert!(!Path::new(dest.trim()).exists(), "dry-run must not write");
+}
+
+#[test]
+fn sessions_move_feat_a_project_x_to_feat_b() {
+    let home = TempDir::new().unwrap();
+    let from = "/home/cj/Projects/feat-a/projectX";
+    let to = "/home/cj/Projects/feat-b/projectX";
+    let file = "2026-07-30T12-00-00-dddddddd-0000-4000-8000-000000000023.jsonl";
+    let source = write_pi_session(
+        home.path(),
+        "--home-cj-Projects-feat-a-projectX--",
+        file,
+        &[
+            header("dddddddd-0000-4000-8000-000000000023", from),
+            message("m1", None, "user", "feat a session"),
+        ],
+    );
+    let sibling = write_pi_session(
+        home.path(),
+        "--home-cj-Projects-feat-a-projectX-extra--",
+        "2026-07-30T12-00-00-eeeeeeee-0000-4000-8000-000000000024.jsonl",
+        &[
+            header(
+                "eeeeeeee-0000-4000-8000-000000000024",
+                "/home/cj/Projects/feat-a/projectX-extra",
+            ),
+            message("m1", None, "user", "should stay"),
+        ],
+    );
+
+    let output = run(home.path(), &["sessions", "move", from, to]);
+    assert!(
+        output.status.success(),
+        "feat move failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let dest = String::from_utf8(output.stdout).unwrap();
+    let dest = dest.trim();
+    assert!(
+        dest.ends_with(&format!(
+            "/.pi/agent/sessions/--home-cj-Projects-feat-b-projectX--/{file}"
+        )),
+        "unexpected dest {dest:?}"
+    );
+    assert!(Path::new(dest).is_file());
+    assert!(!source.exists());
+    assert!(sibling.exists(), "sibling projectX-extra must stay");
+    let text = fs::read_to_string(dest).unwrap();
+    assert!(text.contains(to), "{text}");
+    assert!(!text.contains(from), "{text}");
+}
+
+#[test]
+fn sessions_move_rpi_workspace() {
+    let home = TempDir::new().unwrap();
+    let from = "/home/cj/Projects/mainnet-beta/psy-node";
+    let to = "/home/cj/Projects/audit";
+    let file = "2026-09-03T00-00-00-01a05de9-10d7-7c20-8281-2d7d79fa4d54.jsonl";
+    let source = write_rpi_session(
+        home.path(),
+        "--home-cj-Projects-mainnet-beta-psy-node--",
+        file,
+        &[
+            header("01a05de9-10d7-7c20-8281-2d7d79fa4d54", from),
+            message("m1", None, "user", "rpi session"),
+        ],
+    );
+    let pi_twin = write_pi_session(
+        home.path(),
+        "--home-cj-Projects-mainnet-beta-psy-node--",
+        file,
+        &[
+            header("01a05de9-10d7-7c20-8281-2d7d79fa4d54", from),
+            message("m1", None, "user", "pi twin stays unless asked"),
+        ],
+    );
+
+    let output = run(
+        home.path(),
+        &["sessions", "move", from, to, "--tool", "rpi"],
+    );
+    assert!(
+        output.status.success(),
+        "rpi move failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let dest = String::from_utf8(output.stdout).unwrap();
+    let dest = dest.trim();
+    assert!(
+        dest.ends_with(&format!(
+            "/.rpi/sessions/--home-cj-Projects-audit--/{file}"
+        )),
+        "unexpected dest {dest:?}"
+    );
+    assert!(Path::new(dest).is_file());
+    assert!(!source.exists());
+    assert!(pi_twin.exists(), "pi catalog must stay when --tool rpi");
+    let text = fs::read_to_string(dest).unwrap();
+    assert!(text.contains(to), "{text}");
+    assert!(!text.contains(from), "{text}");
 }

@@ -8,7 +8,8 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::Metadata;
+use std::fs::{self, Metadata};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -104,6 +105,10 @@ impl Catalog {
         &self.user_home
     }
 
+    pub fn absolute_path(&self, path: impl AsRef<Path>) -> PathBuf {
+        make_absolute(expand_tilde(path.as_ref(), &self.user_home))
+    }
+
     pub fn root_for_tool(&self, tool: SourceTool) -> SessionRoot {
         let (relative, pattern) = root_spec(tool);
         SessionRoot {
@@ -166,7 +171,9 @@ impl Catalog {
             return false;
         }
         match tool {
-            SourceTool::Pi | SourceTool::Omp => is_tree_top_level_session(path, &root),
+            SourceTool::Pi | SourceTool::Rpi | SourceTool::Omp => {
+                is_tree_top_level_session(path, &root)
+            }
             SourceTool::Grok => is_grok_summary(path, &root),
             SourceTool::Agent => is_agent_store(path, &root),
             SourceTool::Droid | SourceTool::Codex | SourceTool::Claude => true,
@@ -175,7 +182,7 @@ impl Catalog {
 
     pub fn parse(&self, tool: SourceTool, path: &Path) -> Result<Session> {
         let mut session = match tool {
-            SourceTool::Pi => pi::parse(path),
+            SourceTool::Pi | SourceTool::Rpi => pi::parse(path),
             SourceTool::Omp => omp::parse(path),
             SourceTool::Droid => droid::parse(path),
             SourceTool::Codex => codex::parse(path),
@@ -414,6 +421,151 @@ pub fn resolve_any_session(input: impl AsRef<OsStr>) -> Result<Session> {
     Catalog::from_env()?.resolve_any(input)
 }
 
+/// Path `remove_source_session` will delete: the session file, or the Grok session directory.
+pub fn source_removal_path(session: &Session) -> PathBuf {
+    if session.tool == SourceTool::Grok {
+        session
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| session.path.clone())
+    } else {
+        session.path.clone()
+    }
+}
+
+/// Whether writing or deleting `destination` would also remove `source`.
+pub fn destination_overlaps_source(source: &Path, destination: &Path) -> bool {
+    let source = resolved_path(source);
+    let destination = resolved_path(destination);
+    destination == source || destination.starts_with(&source)
+}
+
+/// Delete the source export after a successful move. Grok sessions remove the
+/// whole session directory (locks and native extras included). Other tools
+/// remove the session file; callers move sidecars separately.
+pub fn remove_source_session(session: &Session) -> Result<()> {
+    if session.tool == SourceTool::Grok {
+        remove_grok_session_dir(&session.path)
+    } else {
+        remove_regular_file(&session.path)
+    }
+}
+
+/// Delete a file or directory without following symlinks.
+pub fn remove_path_nofollow(path: &Path) -> Result<()> {
+    refuse_symlinks(path)?;
+    remove_path_nofollow_after_check(path)
+}
+
+fn refuse_symlinks(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("refusing to delete symlink {}", path.display());
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)
+            .with_context(|| format!("reading {}", path.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("reading entry under {}", path.display()))?;
+            refuse_symlinks(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path_nofollow_after_check(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("refusing to delete symlink {}", path.display());
+    }
+    if metadata.is_file() {
+        return fs::remove_file(path)
+            .with_context(|| format!("deleting {}", path.display()));
+    }
+    if !metadata.is_dir() {
+        bail!("refusing to delete special file {}", path.display());
+    }
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("reading {}", path.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading entry under {}", path.display()))?;
+        remove_path_nofollow_after_check(&entry.path())?;
+    }
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("removing directory {}", path.display()))
+        }
+    }
+}
+
+fn resolved_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    if let Some(parent) = path.parent() {
+        if let (Ok(parent), Some(name)) = (parent.canonicalize(), path.file_name()) {
+            return parent.join(name);
+        }
+    }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+fn remove_regular_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting source session {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("refusing to delete symlink {}", path.display());
+    }
+    if !metadata.is_file() {
+        bail!("refusing to delete non-file {}", path.display());
+    }
+    fs::remove_file(path).with_context(|| format!("deleting source session {}", path.display()))
+}
+
+fn remove_grok_session_dir(summary: &Path) -> Result<()> {
+    if summary.file_name() != Some(OsStr::new("summary.json")) {
+        bail!(
+            "grok session path is not summary.json: {}",
+            summary.display()
+        );
+    }
+    let directory = summary.parent().with_context(|| {
+        format!("grok session has no directory: {}", summary.display())
+    })?;
+    let metadata = fs::symlink_metadata(directory).with_context(|| {
+        format!(
+            "inspecting grok session directory {}",
+            directory.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to delete symlink directory {}",
+            directory.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!(
+            "refusing to delete non-directory {}",
+            directory.display()
+        );
+    }
+
+    remove_path_nofollow(directory)
+}
+
 /// Render the `--paths` data contract without ANSI escapes.
 ///
 /// Each emitted line has exactly five TSV fields:
@@ -433,6 +585,7 @@ pub fn render_paths_tsv(rows: &[SessionRow]) -> Vec<u8> {
 fn root_spec(tool: SourceTool) -> (&'static Path, &'static str) {
     match tool {
         SourceTool::Pi => (Path::new(".pi/agent/sessions"), "*.jsonl"),
+        SourceTool::Rpi => (Path::new(".rpi/sessions"), "*.jsonl"),
         SourceTool::Omp => (Path::new(".omp/agent/sessions"), "*.jsonl"),
         SourceTool::Droid => (Path::new(".factory/sessions"), "*.jsonl"),
         SourceTool::Codex => (Path::new(".codex/sessions"), "rollout-*.jsonl"),
@@ -468,7 +621,7 @@ fn matches_pattern(tool: SourceTool, path: &Path) -> bool {
         return false;
     };
     match tool {
-        SourceTool::Pi | SourceTool::Omp | SourceTool::Droid | SourceTool::Claude => {
+        SourceTool::Pi | SourceTool::Rpi | SourceTool::Omp | SourceTool::Droid | SourceTool::Claude => {
             path.extension() == Some(OsStr::new("jsonl"))
         }
         SourceTool::Codex => {
@@ -1197,5 +1350,96 @@ mod tests {
         assert!(is_expected_skip(&subagent));
         assert!(!is_expected_skip(&headerless));
         assert!(!is_expected_skip(&other));
+    }
+
+    fn stub_session(tool: SourceTool, path: PathBuf) -> Session {
+        Session {
+            tool,
+            session_id: "sid".into(),
+            cwd: PathBuf::from("/tmp"),
+            start_timestamp: None,
+            summary: "summary".into(),
+            messages: Vec::new(),
+            path,
+            modified_epoch: None,
+        }
+    }
+
+    #[test]
+    fn remove_source_session_deletes_jsonl_file() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join("session.jsonl");
+        fs::write(&path, "{}\n").unwrap();
+        remove_source_session(&stub_session(SourceTool::Pi, path.clone())).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_source_session_deletes_known_grok_files_and_empty_dir() {
+        let home = TempDir::new().unwrap();
+        let encoded = home.path().join("encoded");
+        let directory = encoded.join("sid");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("summary.json"), "{}").unwrap();
+        fs::write(directory.join("chat_history.jsonl"), "{}\n").unwrap();
+        fs::write(directory.join("updates.jsonl"), "{}\n").unwrap();
+        fs::write(encoded.join(".cwd"), "/tmp").unwrap();
+        remove_source_session(&stub_session(
+            SourceTool::Grok,
+            directory.join("summary.json"),
+        ))
+        .unwrap();
+        assert!(!directory.exists());
+        assert!(encoded.join(".cwd").is_file());
+    }
+
+    #[test]
+    fn remove_source_session_deletes_native_grok_extras() {
+        let home = TempDir::new().unwrap();
+        let directory = home.path().join("encoded/sid");
+        fs::create_dir_all(&directory).unwrap();
+        let summary = directory.join("summary.json");
+        fs::write(&summary, "{}").unwrap();
+        fs::write(directory.join("prompt_context.json"), "{}").unwrap();
+        fs::write(directory.join("system_prompt.txt"), "p").unwrap();
+        remove_source_session(&stub_session(SourceTool::Grok, summary)).unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_source_session_refuses_grok_symlink() {
+        let home = TempDir::new().unwrap();
+        let directory = home.path().join("encoded/sid");
+        fs::create_dir_all(&directory).unwrap();
+        let summary = directory.join("summary.json");
+        fs::write(&summary, "{}").unwrap();
+        std::os::unix::fs::symlink(&summary, directory.join("linked.json")).unwrap();
+        let error = remove_source_session(&stub_session(SourceTool::Grok, summary.clone()))
+            .unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert!(summary.is_file());
+    }
+
+    #[test]
+    fn destination_overlaps_source_detects_same_file_and_nested_grok_path() {
+        let home = TempDir::new().unwrap();
+        let file = home.path().join("session.jsonl");
+        fs::write(&file, "{}\n").unwrap();
+        assert!(destination_overlaps_source(&file, &file));
+        assert!(!destination_overlaps_source(
+            &file,
+            &home.path().join("other.jsonl")
+        ));
+
+        let directory = home.path().join("encoded/sid");
+        fs::create_dir_all(&directory).unwrap();
+        let summary = directory.join("summary.json");
+        fs::write(&summary, "{}").unwrap();
+        assert!(destination_overlaps_source(&directory, &summary));
+        assert!(!destination_overlaps_source(
+            &directory,
+            &home.path().join("encoded/other/summary.json")
+        ));
     }
 }
