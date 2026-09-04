@@ -6,7 +6,6 @@
 //! diagnostics, target-tool ordering, and fzf args/status — match the
 //! reference implementation in `scripts/sessions`.
 
-use std::collections::HashMap;
 use std::env;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -18,112 +17,11 @@ use anyhow::{bail, Context, Result};
 
 use crate::domain::{SessionRow, SourceTool, TargetTool};
 
+pub use crate::sessions::{dedupe_rows, select_rows};
+
 // ── ANSI constants ────────────────────────────────────────────────────── //
 
 const RESET: &str = "\x1b[0m";
-
-// ── Row selection / dedupe ────────────────────────────────────────────── //
-
-/// Keep the newest session for each tool / cwd / normalized-summary
-/// combination by comparing `modified_epoch`. Input order does not
-/// matter; the result is sorted newest-first.
-///
-/// When the cwd or normalized summary is empty the key falls back to
-/// `(tool, session_id, "")` so sessions that lack a usable summary are
-/// still deduplicated by identity rather than collapsing together.
-pub fn dedupe_rows(rows: &[SessionRow]) -> Vec<SessionRow> {
-    let mut best: HashMap<(SourceTool, String, String), SessionRow> = HashMap::new();
-    for row in rows {
-        let normalized_summary = normalize_summary(&row.summary);
-        let cwd_empty = row.cwd.as_os_str().is_empty();
-        let key = if cwd_empty || normalized_summary.is_empty() {
-            (row.tool, row.session_id.clone(), String::new())
-        } else {
-            let normalized_cwd = normalize_cwd(&row.cwd);
-            (row.tool, normalized_cwd, normalized_summary)
-        };
-        match best.get(&key) {
-            Some(existing) if existing.modified_epoch >= row.modified_epoch => {}
-            _ => {
-                best.insert(key, row.clone());
-            }
-        }
-    }
-    let mut result: Vec<SessionRow> = best.into_values().collect();
-    result.sort_by(|a, b| {
-        b.modified_epoch
-            .partial_cmp(&a.modified_epoch)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    result
-}
-
-/// Apply optional dedupe, then truncate to `count` (default 5) unless
-/// `show_all` is true. `count` of 0 yields no rows; `show_all` always
-/// wins over `count`.
-pub fn select_rows(
-    rows: Vec<SessionRow>,
-    count: Option<usize>,
-    show_all: bool,
-    dedupe: bool,
-) -> Vec<SessionRow> {
-    let selected = if dedupe {
-        dedupe_rows(&rows)
-    } else {
-        rows
-    };
-    if show_all {
-        selected
-    } else {
-        let limit = count.unwrap_or(5);
-        selected.into_iter().take(limit).collect()
-    }
-}
-
-fn normalize_summary(summary: &str) -> String {
-    summary
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
-/// Expand a leading `~` then canonicalize symlinks, falling back to
-/// the expanded path when the target does not exist.
-fn normalize_cwd(cwd: &Path) -> String {
-    let expanded = expand_user(cwd);
-    expanded
-        .canonicalize()
-        .unwrap_or(expanded)
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn home_dir() -> Option<PathBuf> {
-    if let Some(home) = env::var_os("HOME") {
-        return Some(PathBuf::from(home));
-    }
-    #[cfg(windows)]
-    {
-        if let Some(profile) = env::var_os("USERPROFILE") {
-            return Some(PathBuf::from(profile));
-        }
-    }
-    None
-}
-
-fn expand_user(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if s == "~" {
-        return home_dir().unwrap_or_else(|| path.to_path_buf());
-    }
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return home.join(rest);
-        }
-    }
-    path.to_path_buf()
-}
 
 // ── Display helpers ───────────────────────────────────────────────────── //
 
@@ -280,6 +178,21 @@ pub fn format_paths_line(row: &SessionRow) -> Option<Vec<u8>> {
     .into_bytes();
     line.extend_from_slice(path);
     Some(line)
+}
+
+/// Render the `--paths` data contract without ANSI escapes.
+///
+/// Each emitted line has exactly five TSV fields:
+/// `tool`, local timestamp, session id, sanitized summary, and exact path.
+pub fn render_paths_tsv(rows: &[SessionRow]) -> Vec<u8> {
+    let mut rendered = Vec::new();
+    for line in rows.iter().filter_map(format_paths_line) {
+        if !rendered.is_empty() {
+            rendered.push(b'\n');
+        }
+        rendered.extend_from_slice(&line);
+    }
+    rendered
 }
 
 /// Emit a six-field picker TSV row: colored display + `tool\ttimestamp
@@ -1262,24 +1175,32 @@ mod tests {
         assert_eq!(result.unwrap(), FzfOutcome::Selected);
     }
 
-    // -- normalize_summary / normalize_cwd --
-
     #[test]
-    fn normalize_summary_collapses_whitespace_and_lowercases() {
-        assert_eq!(normalize_summary("  Hello   World  "), "hello world");
-        assert_eq!(normalize_summary("ABC"), "abc");
-        assert_eq!(normalize_summary(""), "");
+    fn paths_renderer_has_five_ansi_free_fields_and_sanitizes_summary() {
+        let mut sample = row("row-id", SourceTool::Pi, "summary", "/tmp", 1.0);
+        sample.summary = "first\tsecond\nthird\rfourth".to_owned();
+        let rendered = render_paths_tsv(&[sample]);
+        assert!(!rendered.windows(2).any(|part| part == b"\x1b["));
+        let fields = rendered.split(|byte| *byte == b'\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[0], b"pi");
+        assert_eq!(fields[2], b"row-id");
+        assert_eq!(fields[3], b"first second third fourth");
+        assert_eq!(fields[4], b"/tmp/sessions/row-id.jsonl");
     }
 
-    // -- expand_user --
-
+    #[cfg(unix)]
     #[test]
-    fn expand_user_tilde() {
-        let home = env::var_os("HOME").map(PathBuf::from);
-        if let Some(home) = home {
-            assert_eq!(expand_user(Path::new("~")), home);
-            assert_eq!(expand_user(Path::new("~/foo")), home.join("foo"));
-        }
-        assert_eq!(expand_user(Path::new("/abs/path")), PathBuf::from("/abs/path"));
+    fn paths_renderer_preserves_non_utf8_path_bytes_and_skips_unsafe_paths() {
+        let exact_path = b"/tmp/sessions/render-\xff.jsonl";
+        let mut exact = row("exact", SourceTool::Omp, "summary", "/tmp", 1.0);
+        exact.path = PathBuf::from(std::ffi::OsString::from_vec(exact_path.to_vec()));
+        let rendered = render_paths_tsv(&[exact.clone()]);
+        let fields = rendered.split(|byte| *byte == b'\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[4], exact_path);
+
+        exact.path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/unsafe\npath".to_vec()));
+        assert!(render_paths_tsv(&[exact]).is_empty());
     }
 }

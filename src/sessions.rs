@@ -19,7 +19,6 @@ use walkdir::WalkDir;
 use crate::domain::{Session, SessionRow, SourceTool};
 use crate::formats::{agent, claude, codex, droid, grok, omp, pi};
 use crate::fs::{is_agent_store, is_grok_summary, is_tree_top_level_session, path_under_root};
-use crate::picker::{dedupe_rows, format_paths_line, select_rows};
 
 pub const DEFAULT_RECENT_COUNT: usize = 5;
 
@@ -421,6 +420,90 @@ pub fn resolve_any_session(input: impl AsRef<OsStr>) -> Result<Session> {
     Catalog::from_env()?.resolve_any(input)
 }
 
+/// Keep the newest session for each tool / cwd / normalized-summary
+/// combination by comparing `modified_epoch`.
+///
+/// When the cwd or normalized summary is empty the key falls back to
+/// `(tool, session_id, "")` so sessions that lack a usable summary are
+/// still deduplicated by identity rather than collapsing together.
+pub fn dedupe_rows(rows: &[SessionRow]) -> Vec<SessionRow> {
+    let mut best: std::collections::HashMap<(SourceTool, String, String), SessionRow> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let normalized_summary = normalize_summary(&row.summary);
+        let cwd_empty = row.cwd.as_os_str().is_empty();
+        let key = if cwd_empty || normalized_summary.is_empty() {
+            (row.tool, row.session_id.clone(), String::new())
+        } else {
+            let normalized_cwd = normalize_cwd(&row.cwd);
+            (row.tool, normalized_cwd, normalized_summary)
+        };
+        match best.get(&key) {
+            Some(existing) if existing.modified_epoch >= row.modified_epoch => {}
+            _ => {
+                best.insert(key, row.clone());
+            }
+        }
+    }
+    let mut result: Vec<SessionRow> = best.into_values().collect();
+    result.sort_by(|a, b| {
+        b.modified_epoch
+            .partial_cmp(&a.modified_epoch)
+            .unwrap_or(Ordering::Equal)
+    });
+    result
+}
+
+/// Apply optional dedupe, then truncate to `count` (default
+/// [`DEFAULT_RECENT_COUNT`]) unless `show_all` is true.
+pub fn select_rows(
+    rows: Vec<SessionRow>,
+    count: Option<usize>,
+    show_all: bool,
+    dedupe: bool,
+) -> Vec<SessionRow> {
+    let selected = if dedupe { dedupe_rows(&rows) } else { rows };
+    if show_all {
+        selected
+    } else {
+        let limit = count.unwrap_or(DEFAULT_RECENT_COUNT);
+        selected.into_iter().take(limit).collect()
+    }
+}
+
+fn normalize_summary(summary: &str) -> String {
+    summary
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn normalize_cwd(cwd: &Path) -> String {
+    let expanded = expand_tilde(cwd, &user_home_path());
+    expanded
+        .canonicalize()
+        .unwrap_or(expanded)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn user_home_path() -> PathBuf {
+    nonempty_os_path(env::var_os("HOME"))
+        .or_else(|| {
+            #[cfg(windows)]
+            {
+                nonempty_os_path(env::var_os("USERPROFILE"))
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        })
+        .or_else(|| nonempty_os_path(user_home_fallback()))
+        .unwrap_or_default()
+}
+
 /// Path `remove_source_session` will delete: the session file, or the Grok session directory.
 pub fn source_removal_path(session: &Session) -> PathBuf {
     if session.tool == SourceTool::Grok {
@@ -564,22 +647,6 @@ fn remove_grok_session_dir(summary: &Path) -> Result<()> {
     }
 
     remove_path_nofollow(directory)
-}
-
-/// Render the `--paths` data contract without ANSI escapes.
-///
-/// Each emitted line has exactly five TSV fields:
-/// `tool`, local timestamp, session id, sanitized summary, and exact path.
-/// Unsafe structural fields are skipped by the shared row formatter.
-pub fn render_paths_tsv(rows: &[SessionRow]) -> Vec<u8> {
-    let mut rendered = Vec::new();
-    for line in rows.iter().filter_map(format_paths_line) {
-        if !rendered.is_empty() {
-            rendered.push(b'\n');
-        }
-        rendered.extend_from_slice(&line);
-    }
-    rendered
 }
 
 fn root_spec(tool: SourceTool) -> (&'static Path, &'static str) {
@@ -1210,53 +1277,6 @@ mod tests {
         assert!(message.contains(&pi_path.display().to_string()));
         assert!(message.contains("droid:"));
         assert!(message.contains(&droid_path.display().to_string()));
-    }
-
-    #[test]
-    fn paths_renderer_has_five_ansi_free_fields_and_sanitizes_summary() {
-        let (_home, catalog) = catalog();
-        let path = write_pi(
-            &catalog,
-            "project",
-            "row.jsonl",
-            "row-id",
-            "/tmp",
-            &[("user", "summary")],
-        );
-        let mut row = catalog.scan(&[SourceTool::Pi]).remove(0);
-        row.summary = "first\tsecond\nthird\rfourth".to_owned();
-
-        let rendered = render_paths_tsv(&[row]);
-        assert!(!rendered.windows(2).any(|part| part == b"\x1b["));
-        let fields = rendered.split(|byte| *byte == b'\t').collect::<Vec<_>>();
-        assert_eq!(fields.len(), 5);
-        assert_eq!(fields[0], b"pi");
-        assert_eq!(fields[2], b"row-id");
-        assert_eq!(fields[3], b"first second third fourth");
-        assert_eq!(fields[4], path.as_os_str().as_encoded_bytes());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn paths_renderer_preserves_non_utf8_path_bytes_and_skips_unsafe_paths() {
-        let exact_path = b"/tmp/sessions/render-\xff.jsonl";
-        let mut exact = SessionRow {
-            modified_epoch: 1.0,
-            tool: SourceTool::Omp,
-            display_time: "2024-01-15 10:30:00".to_owned(),
-            session_id: "exact".to_owned(),
-            summary: "summary".to_owned(),
-            path: PathBuf::from(OsString::from_vec(exact_path.to_vec())),
-            size: 1,
-            cwd: PathBuf::from("/tmp"),
-        };
-        let rendered = render_paths_tsv(&[exact.clone()]);
-        let fields = rendered.split(|byte| *byte == b'\t').collect::<Vec<_>>();
-        assert_eq!(fields.len(), 5);
-        assert_eq!(fields[4], exact_path);
-
-        exact.path = PathBuf::from(OsString::from_vec(b"/tmp/unsafe\npath".to_vec()));
-        assert!(render_paths_tsv(&[exact]).is_empty());
     }
 
     fn write_agent(catalog: &Catalog, id: &str, message: &str) -> PathBuf {

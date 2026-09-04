@@ -166,6 +166,7 @@ pub struct SessionOpenArgs {
     #[arg(long)]
     pub print_command: bool,
     pub session_ref: OsString,
+    #[arg(value_parser = parse_target_tool)]
     pub target_tool: TargetTool,
 }
 
@@ -201,6 +202,10 @@ pub struct TmuxChildArgs {
     pub ready: PathBuf,
 }
 
+fn parse_target_tool(value: &str) -> Result<TargetTool, String> {
+    value.parse::<TargetTool>().map_err(|error| error.to_string())
+}
+
 fn non_agent_source(value: &str) -> Result<SourceTool, String> {
     let tool = value.parse::<SourceTool>().map_err(|error| error.to_string())?;
     if tool == SourceTool::Agent {
@@ -211,7 +216,7 @@ fn non_agent_source(value: &str) -> Result<SourceTool, String> {
 }
 
 fn non_agent_target(value: &str) -> Result<TargetTool, String> {
-    let tool = value.parse::<TargetTool>().map_err(|error| error.to_string())?;
+    let tool = parse_target_tool(value)?;
     if tool == TargetTool::Agent {
         Err("Agent is not a conversion or fork target".to_owned())
     } else {
@@ -327,7 +332,7 @@ fn dispatch_local_list(args: &SessionListArgs) -> anyhow::Result<()> {
         tools: Vec::new(),
     })?;
     if args.paths {
-        print_byte_lines(&crate::sessions::render_paths_tsv(&rows))?;
+        print_byte_lines(&crate::picker::render_paths_tsv(&rows))?;
     } else if args.picker {
         let use_color = crate::picker::use_color_for_picker();
         let lines = join_byte_lines(
