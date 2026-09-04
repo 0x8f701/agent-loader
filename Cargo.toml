@@ -1,6 +1,6 @@
 [package]
 name = "agent-loader"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Session catalog and format adapters for AI coding assistants"
