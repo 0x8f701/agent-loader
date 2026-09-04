@@ -1225,12 +1225,12 @@ fn sessions_move_dry_run_prints_destination_without_moving() {
 #[test]
 fn sessions_move_feat_a_project_x_to_feat_b() {
     let home = TempDir::new().unwrap();
-    let from = "/home/cj/Projects/feat-a/projectX";
-    let to = "/home/cj/Projects/feat-b/projectX";
+    let from = "/workspace/feat-a/projectX";
+    let to = "/workspace/feat-b/projectX";
     let file = "2026-07-30T12-00-00-dddddddd-0000-4000-8000-000000000023.jsonl";
     let source = write_pi_session(
         home.path(),
-        "--home-cj-Projects-feat-a-projectX--",
+        "--workspace-feat-a-projectX--",
         file,
         &[
             header("dddddddd-0000-4000-8000-000000000023", from),
@@ -1239,12 +1239,12 @@ fn sessions_move_feat_a_project_x_to_feat_b() {
     );
     let sibling = write_pi_session(
         home.path(),
-        "--home-cj-Projects-feat-a-projectX-extra--",
+        "--workspace-feat-a-projectX-extra--",
         "2026-07-30T12-00-00-eeeeeeee-0000-4000-8000-000000000024.jsonl",
         &[
             header(
                 "eeeeeeee-0000-4000-8000-000000000024",
-                "/home/cj/Projects/feat-a/projectX-extra",
+                "/workspace/feat-a/projectX-extra",
             ),
             message("m1", None, "user", "should stay"),
         ],
@@ -1260,7 +1260,7 @@ fn sessions_move_feat_a_project_x_to_feat_b() {
     let dest = dest.trim();
     assert!(
         dest.ends_with(&format!(
-            "/.pi/agent/sessions/--home-cj-Projects-feat-b-projectX--/{file}"
+            "/.pi/agent/sessions/--workspace-feat-b-projectX--/{file}"
         )),
         "unexpected dest {dest:?}"
     );
@@ -1275,24 +1275,24 @@ fn sessions_move_feat_a_project_x_to_feat_b() {
 #[test]
 fn sessions_move_rpi_workspace() {
     let home = TempDir::new().unwrap();
-    let from = "/home/cj/Projects/mainnet-beta/psy-node";
-    let to = "/home/cj/Projects/audit";
-    let file = "2026-09-03T00-00-00-01a05de9-10d7-7c20-8281-2d7d79fa4d54.jsonl";
+    let from = "/workspace/old-project";
+    let to = "/workspace/new-project";
+    let file = "2026-09-03T00-00-00-aaaaaaaa-0000-4000-8000-000000000001.jsonl";
     let source = write_rpi_session(
         home.path(),
-        "--home-cj-Projects-mainnet-beta-psy-node--",
+        "--workspace-old-project--",
         file,
         &[
-            header("01a05de9-10d7-7c20-8281-2d7d79fa4d54", from),
+            header("aaaaaaaa-0000-4000-8000-000000000001", from),
             message("m1", None, "user", "rpi session"),
         ],
     );
     let pi_twin = write_pi_session(
         home.path(),
-        "--home-cj-Projects-mainnet-beta-psy-node--",
+        "--workspace-old-project--",
         file,
         &[
-            header("01a05de9-10d7-7c20-8281-2d7d79fa4d54", from),
+            header("aaaaaaaa-0000-4000-8000-000000000001", from),
             message("m1", None, "user", "pi twin stays unless asked"),
         ],
     );
@@ -1310,7 +1310,7 @@ fn sessions_move_rpi_workspace() {
     let dest = dest.trim();
     assert!(
         dest.ends_with(&format!(
-            "/.rpi/sessions/--home-cj-Projects-audit--/{file}"
+            "/.rpi/sessions/--workspace-new-project--/{file}"
         )),
         "unexpected dest {dest:?}"
     );

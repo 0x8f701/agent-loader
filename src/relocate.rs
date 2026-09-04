@@ -826,8 +826,8 @@ mod tests {
         );
     }
 
-    const FEAT_A: &str = "/home/cj/Projects/feat-a/projectX";
-    const FEAT_B: &str = "/home/cj/Projects/feat-b/projectX";
+    const FEAT_A: &str = "/workspace/feat-a/projectX";
+    const FEAT_B: &str = "/workspace/feat-b/projectX";
 
     fn move_feat(catalog: &Catalog, tools: Vec<SourceTool>) -> Vec<MovedSession> {
         move_sessions(
@@ -923,7 +923,7 @@ mod tests {
         let catalog = Catalog::new(home.path());
         let pi = write_pi(
             home.path(),
-            "--home-cj-Projects-feat-a-projectX--",
+            "--workspace-feat-a-projectX--",
             "2026-01-01T00-00-00_pi.jsonl",
             FEAT_A,
             "pi-id",
@@ -931,7 +931,7 @@ mod tests {
         );
         let rpi = write_rpi(
             home.path(),
-            "--home-cj-Projects-feat-a-projectX--",
+            "--workspace-feat-a-projectX--",
             "2026-01-01T00-00-00_rpi.jsonl",
             FEAT_A,
             "rpi-id",
@@ -939,27 +939,27 @@ mod tests {
         );
         let omp = write_omp(
             home.path(),
-            "--home-cj-Projects-feat-a-projectX--",
+            "--workspace-feat-a-projectX--",
             "2026-01-01T00-00-00_omp.jsonl",
             FEAT_A,
             "omp-id",
         );
         let claude = write_claude(
             home.path(),
-            "-home-cj-Projects-feat-a-projectX",
+            "-workspace-feat-a-projectX",
             "claude-id.jsonl",
             FEAT_A,
             "claude-id",
         );
         let droid = write_droid(
             home.path(),
-            "-home-cj-Projects-feat-a-projectX",
+            "-workspace-feat-a-projectX",
             "droid-id",
             FEAT_A,
         );
         let grok = write_grok(
             home.path(),
-            "%2Fhome%2Fcj%2FProjects%2Ffeat-a%2FprojectX",
+            "%2Fworkspace%2Ffeat-a%2FprojectX",
             "grok-id",
             FEAT_A,
         );
@@ -973,10 +973,10 @@ mod tests {
         assert_eq!(moved.len(), 7, "{moved:?}");
 
         let pi_dest = home.path().join(
-            ".pi/agent/sessions/--home-cj-Projects-feat-b-projectX--/2026-01-01T00-00-00_pi.jsonl",
+            ".pi/agent/sessions/--workspace-feat-b-projectX--/2026-01-01T00-00-00_pi.jsonl",
         );
         let rpi_dest = home.path().join(
-            ".rpi/sessions/--home-cj-Projects-feat-b-projectX--/2026-01-01T00-00-00_rpi.jsonl",
+            ".rpi/sessions/--workspace-feat-b-projectX--/2026-01-01T00-00-00_rpi.jsonl",
         );
         let omp_home = crate::formats::omp::encode_omp_cwd_with(
             Path::new(FEAT_B),
@@ -989,13 +989,13 @@ mod tests {
             .join(omp_home)
             .join("2026-01-01T00-00-00_omp.jsonl");
         let claude_dest = home.path().join(
-            ".claude/projects/-home-cj-Projects-feat-b-projectX/claude-id.jsonl",
+            ".claude/projects/-workspace-feat-b-projectX/claude-id.jsonl",
         );
         let droid_dest = home
             .path()
-            .join(".factory/sessions/-home-cj-Projects-feat-b-projectX/droid-id.jsonl");
+            .join(".factory/sessions/-workspace-feat-b-projectX/droid-id.jsonl");
         let grok_dest = home.path().join(
-            ".grok/sessions/%2Fhome%2Fcj%2FProjects%2Ffeat-b%2FprojectX/grok-id/summary.json",
+            ".grok/sessions/%2Fworkspace%2Ffeat-b%2FprojectX/grok-id/summary.json",
         );
 
         assert!(!pi.exists());
@@ -1034,11 +1034,11 @@ mod tests {
     fn feat_a_nested_cwd_is_rewritten_and_sibling_name_is_ignored() {
         let home = TempDir::new().unwrap();
         let nested = format!("{FEAT_A}/crates/foo");
-        let sibling = "/home/cj/Projects/feat-a/projectX-extra";
-        let parent = "/home/cj/Projects/feat-a";
+        let sibling = "/workspace/feat-a/projectX-extra";
+        let parent = "/workspace/feat-a";
         let keep_nested = write_pi(
             home.path(),
-            "--home-cj-Projects-feat-a-projectX-crates-foo--",
+            "--workspace-feat-a-projectX-crates-foo--",
             "nested.jsonl",
             &nested,
             "nested",
@@ -1046,7 +1046,7 @@ mod tests {
         );
         let keep_sibling = write_pi(
             home.path(),
-            "--home-cj-Projects-feat-a-projectX-extra--",
+            "--workspace-feat-a-projectX-extra--",
             "sibling.jsonl",
             sibling,
             "sibling",
@@ -1054,7 +1054,7 @@ mod tests {
         );
         let keep_parent = write_pi(
             home.path(),
-            "--home-cj-Projects-feat-a--",
+            "--workspace-feat-a--",
             "parent.jsonl",
             parent,
             "parent",
@@ -1064,7 +1064,7 @@ mod tests {
         let moved = move_feat(&catalog, vec![SourceTool::Pi]);
         assert_eq!(moved.len(), 1);
         let dest = home.path().join(
-            ".pi/agent/sessions/--home-cj-Projects-feat-b-projectX-crates-foo--/nested.jsonl",
+            ".pi/agent/sessions/--workspace-feat-b-projectX-crates-foo--/nested.jsonl",
         );
         assert_eq!(moved[0].destination, dest);
         assert!(!keep_nested.exists());
@@ -1082,7 +1082,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let source = write_pi(
             home.path(),
-            "--home-cj-Projects-feat-a-projectX--",
+            "--workspace-feat-a-projectX--",
             "gone.jsonl",
             FEAT_A,
             "gone",
@@ -1140,7 +1140,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let pi = write_pi(
             home.path(),
-            "--home-cj-Projects-feat-a-projectX--",
+            "--workspace-feat-a-projectX--",
             "pi.jsonl",
             FEAT_A,
             "pi",
@@ -1148,7 +1148,7 @@ mod tests {
         );
         let grok = write_grok(
             home.path(),
-            "%2Fhome%2Fcj%2FProjects%2Ffeat-a%2FprojectX",
+            "%2Fworkspace%2Ffeat-a%2FprojectX",
             "gid",
             FEAT_A,
         );
@@ -1164,7 +1164,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let source = write_pi(
             home.path(),
-            "--home-cj-Projects-feat-a-projectX--",
+            "--workspace-feat-a-projectX--",
             "2026-01-01T00-00-00_sid.jsonl",
             FEAT_A,
             "sid",
@@ -1180,7 +1180,7 @@ mod tests {
         fs::write(&child, "{}\n").unwrap();
         let droid = write_droid(
             home.path(),
-            "-home-cj-Projects-feat-a-projectX",
+            "-workspace-feat-a-projectX",
             "droid-id",
             FEAT_A,
         );
@@ -1188,7 +1188,7 @@ mod tests {
         fs::write(&settings, "{}\n").unwrap();
         let omp = write_omp(
             home.path(),
-            "--home-cj-Projects-feat-a-projectX--",
+            "--workspace-feat-a-projectX--",
             "2026-01-01T00-00-00_omp.jsonl",
             FEAT_A,
             "omp-id",
@@ -1204,7 +1204,7 @@ mod tests {
         );
 
         let pi_dest = home.path().join(
-            ".pi/agent/sessions/--home-cj-Projects-feat-b-projectX--/2026-01-01T00-00-00_sid.jsonl",
+            ".pi/agent/sessions/--workspace-feat-b-projectX--/2026-01-01T00-00-00_sid.jsonl",
         );
         assert!(pi_dest.is_file());
         assert!(pi_dest
@@ -1220,7 +1220,7 @@ mod tests {
 
         let droid_dest = home
             .path()
-            .join(".factory/sessions/-home-cj-Projects-feat-b-projectX/droid-id.jsonl");
+            .join(".factory/sessions/-workspace-feat-b-projectX/droid-id.jsonl");
         assert!(droid_dest.is_file());
         assert!(droid_dest
             .with_file_name("droid-id.settings.json")
@@ -1250,7 +1250,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         write_pi(
             home.path(),
-            "--home-cj-Projects-feat-a-projectX--",
+            "--workspace-feat-a-projectX--",
             "pi.jsonl",
             FEAT_A,
             "pi",
@@ -1298,10 +1298,10 @@ mod tests {
     #[test]
     fn wt_style_projectx_feat_a_directory_is_a_different_cwd() {
         let home = TempDir::new().unwrap();
-        let wt = "/home/cj/Projects/projectX-feat-a";
+        let wt = "/workspace/projectX-feat-a";
         write_pi(
             home.path(),
-            "--home-cj-Projects-projectX-feat-a--",
+            "--workspace-projectX-feat-a--",
             "wt.jsonl",
             wt,
             "wt",
