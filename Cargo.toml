@@ -1,6 +1,6 @@
 [package]
 name = "agent-loader"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Session catalog and format adapters for AI coding assistants"
@@ -11,15 +11,21 @@ default-run = "al"
 [[bin]]
 name = "al"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "catalog"]
+catalog = ["dep:rusqlite"]
 
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 blake3 = { version = "1.8", features = ["pure"] }
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 libc = "0.2"
 percent-encoding = "2"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

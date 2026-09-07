@@ -36,7 +36,7 @@ The installer verifies every download against the release's `SHA256SUMS` and ins
 Pin a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.6.0
+curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.7.0
 ```
 
 If `al` is not on PATH after installation, open a new terminal or use the full path printed during install.
@@ -159,7 +159,7 @@ Common `tmux-run` flags: `--no-attach`, `--fresh`, `-s session`, `-n window`, `-
 | Source (discover/search) | `pi`, `rpi`, `omp`, `droid`, `codex`, `claude`, `grok`, `agent` |
 | Target (convert to / launch) | `pi`, `rpi`, `omp`, `droid`, `codex`, `claude`, `grok`, `hyper`; `agent` is open-only for native Agent sessions |
 
-`grok` and `hyper` share the same storage layout; a Grok session can be converted to Hyper in place, and Hyper targets reuse Grok's native format. Rpi is a separate catalog at `~/.rpi/sessions`; the on-disk JSONL is Pi-compatible, so `al` can open a Pi session with `rpi` (and the reverse) without converting.
+`grok` and `hyper` share the same storage layout; a Grok session can be converted to Hyper in place, and Hyper targets reuse Grok's native format. Rpi is a separate catalog at `~/.rpi/sessions`; the on-disk JSONL is Pi-compatible, so `al` can open a Pi session with `rpi` (and the reverse) without converting. When emitting to `rpi`, `tool_result` blocks that arrived inside a user turn (Claude-style) are written as native top-level `toolResult` records; leftover user text and images stay on the user turn.
 
 Cursor Agent discovery reads `.cursor/chats/<32-hex-workspace-hash>/<session-id>/store.db` exactly two directories beneath the chats root, plus the sibling `meta.json` sidecar for cwd, title, and timestamps. The SQLite database is opened read-only. Cursor's store format is undocumented and `al` never emits or converts sessions into it; malformed individual stores are skipped without hiding other catalog rows.
 
@@ -175,7 +175,7 @@ Session conversion preserves the portable conversation:
 - Session metadata that has no target equivalent (Claude attachments, Codex world_state, Grok hooks, todos, labels) is still dropped.
 - Empty lines are skipped. After a successful native load, unparseable records and non-message entries may be skipped.
 - Generated summaries normalize whitespace and are truncated to 100 characters; projected message text is preserved.
-- `grok` and `hyper` targets reuse Grok's storage layout; `pi` writes `~/.pi/agent/sessions` and `rpi` writes `~/.rpi/sessions` using the same JSONL shape; other targets write their own native formats.
+- `grok` and `hyper` targets reuse Grok's storage layout; `pi` writes `~/.pi/agent/sessions` and `rpi` writes `~/.rpi/sessions` using the same JSONL tree. Rpi additionally splits user-embedded tool results into `role: "toolResult"` records so the native journal reader does not drop them.
 
 Cursor Agent remains parse/search/open only: its SQLite blob store is not a conversion target.
 
@@ -206,6 +206,8 @@ cargo build --profile release-dist
 
 The `release-dist` profile strips symbols and enables thin LTO for a small, single-file binary.
 
+As a library, `domain` / `formats` / `emit` build with `--no-default-features` and do not pull in `clap` or `rusqlite`. The `al` binary enables the default `cli` feature, which also turns on `catalog` (bundled SQLite for Cursor Agent stores).
+
 ## Releasing
 
 1. Update `Cargo.toml` `[package] version` to the release version.
@@ -225,14 +227,14 @@ Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 ### Artifacts
 
 | Asset | Example |
-| macOS arm64 | `al-0.6.0-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `al-0.6.0-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc 2.31+) | `al-0.6.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc 2.31+) | `al-0.6.0-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `al-0.6.0-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `al-0.7.0-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `al-0.7.0-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 (glibc 2.31+) | `al-0.7.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc 2.31+) | `al-0.7.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `al-0.7.0-x86_64-pc-windows-msvc.zip` |
 | Checksums | `SHA256SUMS` |
 
-The tag must match `Cargo.toml` version exactly (`v0.6.0` ↔ `0.6.0`) or the build fails.
+The tag must match `Cargo.toml` version exactly (`v0.7.0` ↔ `0.7.0`) or the build fails.
 
 ## License
 

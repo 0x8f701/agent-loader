@@ -1529,6 +1529,7 @@ mod tests {
         assert!(message.contains(&droid_path.display().to_string()));
     }
 
+    #[cfg(feature = "catalog")]
     fn write_agent(catalog: &Catalog, id: &str, message: &str) -> PathBuf {
         let directory = catalog
             .root_for_tool(SourceTool::Agent)
@@ -1569,6 +1570,7 @@ mod tests {
         path
     }
 
+    #[cfg(feature = "catalog")]
     #[test]
     fn agent_discovery_search_and_row_stats_use_native_artifacts() {
         let (_home, catalog) = catalog();
@@ -1602,6 +1604,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "catalog")]
     #[test]
     fn agent_subagents_are_excluded_from_catalog_rows() {
         let (_home, catalog) = catalog();

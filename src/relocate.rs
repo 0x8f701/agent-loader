@@ -1245,6 +1245,7 @@ mod tests {
         assert!(!omp_dir.exists());
     }
 
+    #[cfg(feature = "catalog")]
     #[test]
     fn agent_sessions_with_matching_cwd_are_not_moved() {
         let home = TempDir::new().unwrap();

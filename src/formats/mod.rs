@@ -1,4 +1,24 @@
+#[cfg(feature = "catalog")]
 pub mod agent;
+#[cfg(not(feature = "catalog"))]
+pub mod agent {
+    use std::path::Path;
+
+    use anyhow::Result;
+    use thiserror::Error;
+
+    use crate::domain::Session;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+    pub enum AgentParseError {
+        #[error("Agent subagent session is not resumable")]
+        Subagent,
+    }
+
+    pub fn parse(_path: &Path) -> Result<Session> {
+        anyhow::bail!("Agent session parsing requires the `catalog` feature")
+    }
+}
 pub mod claude;
 pub mod codex;
 pub mod droid;

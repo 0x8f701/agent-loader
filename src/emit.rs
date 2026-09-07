@@ -396,7 +396,14 @@ pub fn emit_with_defaults<D: EmitDefaults>(
 
     match target {
         TargetTool::Pi | TargetTool::Rpi => {
-            let records = emit_pi(session, cwd, &session_id, start, defaults);
+            let records = emit_pi(
+                session,
+                cwd,
+                &session_id,
+                start,
+                target == TargetTool::Rpi,
+                defaults,
+            );
             write_jsonl(&output, &records)?;
         }
         TargetTool::Omp => {
@@ -448,6 +455,7 @@ fn emit_pi<D: EmitDefaults>(
     cwd: &str,
     session_id: &str,
     start: DateTime<Utc>,
+    split_user_tool_results: bool,
     defaults: &mut D,
 ) -> Vec<Value> {
     let provider = session
@@ -514,24 +522,75 @@ fn emit_pi<D: EmitDefaults>(
         if rest.is_empty() {
             continue;
         }
-        let rest_message = Message::from_parts(message.role, rest, message.timestamp.clone());
-        let message_id = short_id(defaults.next_uuid());
-        records.push(json!({
-            "type": "message",
-            "id": message_id,
-            "parentId": parent_id,
-            "timestamp": fmt_iso(timestamp),
-            "message": pi_message_payload(
-                &rest_message,
+        let fragments = if split_user_tool_results && message.role == Role::User {
+            rpi_user_fragments(rest, message.timestamp.clone())
+        } else {
+            vec![Message::from_parts(
+                message.role,
+                rest,
+                message.timestamp.clone(),
+            )]
+        };
+        for fragment in fragments {
+            push_pi_message_record(
+                &mut records,
+                &mut parent_id,
+                &fragment,
                 timestamp,
                 defaults,
                 &provider,
                 &model,
-            ),
-        }));
-        parent_id = message_id;
+            );
+        }
     }
     records
+}
+
+fn rpi_user_fragments(parts: Vec<ContentPart>, timestamp: Option<String>) -> Vec<Message> {
+    let mut fragments = Vec::new();
+    let mut user_parts = Vec::new();
+    for part in parts {
+        if matches!(part, ContentPart::ToolResult { .. }) {
+            if !user_parts.is_empty() {
+                fragments.push(Message::from_parts(
+                    Role::User,
+                    std::mem::take(&mut user_parts),
+                    timestamp.clone(),
+                ));
+            }
+            fragments.push(Message::from_parts(
+                Role::Tool,
+                vec![part],
+                timestamp.clone(),
+            ));
+        } else {
+            user_parts.push(part);
+        }
+    }
+    if !user_parts.is_empty() {
+        fragments.push(Message::from_parts(Role::User, user_parts, timestamp));
+    }
+    fragments
+}
+
+fn push_pi_message_record<D: EmitDefaults>(
+    records: &mut Vec<Value>,
+    parent_id: &mut String,
+    message: &Message,
+    timestamp: DateTime<Utc>,
+    defaults: &mut D,
+    provider: &str,
+    model: &str,
+) {
+    let message_id = short_id(defaults.next_uuid());
+    records.push(json!({
+        "type": "message",
+        "id": message_id,
+        "parentId": parent_id.clone(),
+        "timestamp": fmt_iso(timestamp),
+        "message": pi_message_payload(message, timestamp, defaults, provider, model),
+    }));
+    *parent_id = message_id;
 }
 
 fn emit_omp<D: EmitDefaults>(
@@ -2491,6 +2550,141 @@ mod tests {
             emitted.path.display()
         );
         assert!(!emitted.path.starts_with(home.join(".pi/agent/sessions")));
+    }
+
+    #[test]
+    fn rpi_splits_user_tool_results_into_native_records() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let mut session = fixture(home);
+        session.messages = vec![
+            Message::from_parts(
+                Role::User,
+                vec![
+                    ContentPart::Text("list the file".to_owned()),
+                    ContentPart::ToolResult {
+                        tool_use_id: "call-1".to_owned(),
+                        content: "fn main() {}".to_owned(),
+                        is_error: false,
+                    },
+                    ContentPart::Image {
+                        mime_type: Some("image/png".to_owned()),
+                        data: "toolImgData".to_owned(),
+                    },
+                    ContentPart::ToolResult {
+                        tool_use_id: "call-2".to_owned(),
+                        content: "second result".to_owned(),
+                        is_error: true,
+                    },
+                ],
+                Some("2026-07-30T10:11:13.000Z".to_owned()),
+            ),
+            Message::plain(
+                Role::Assistant,
+                "done",
+                Some("2026-07-30T10:11:14.000Z".to_owned()),
+            ),
+        ];
+        let emitted = emit_with_defaults(
+            &session,
+            TargetTool::Rpi,
+            &EmitContext::new(home).with_session_id("rpi-tool-result"),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        let records = read_jsonl(&emitted.path);
+        let messages: Vec<&Value> = records
+            .iter()
+            .filter(|record| record.get("type").and_then(Value::as_str) == Some("message"))
+            .collect();
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0]["message"]["role"], "user");
+        assert_eq!(messages[0]["message"]["content"][0]["text"], "list the file");
+        assert!(
+            messages[0]["message"]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block.get("type").and_then(Value::as_str) != Some("tool_result"))
+        );
+        assert_eq!(messages[1]["message"]["role"], "toolResult");
+        assert_eq!(messages[1]["message"]["toolCallId"], "call-1");
+        assert_eq!(messages[1]["message"]["content"], "fn main() {}");
+        assert_eq!(messages[1]["message"]["isError"], false);
+        assert_eq!(messages[2]["message"]["role"], "user");
+        assert_eq!(messages[2]["message"]["content"][0]["type"], "image");
+        assert_eq!(messages[2]["message"]["content"][0]["data"], "toolImgData");
+        assert_eq!(messages[3]["message"]["role"], "toolResult");
+        assert_eq!(messages[3]["message"]["toolCallId"], "call-2");
+        assert_eq!(messages[3]["message"]["content"], "second result");
+        assert_eq!(messages[3]["message"]["isError"], true);
+        assert_eq!(messages[4]["message"]["role"], "assistant");
+        assert!(
+            records
+                .iter()
+                .filter(|record| record.get("type").and_then(Value::as_str) == Some("message"))
+                .all(|record| {
+                    record["message"]["role"].as_str() == Some("toolResult")
+                        || record["message"]["content"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .all(|block| {
+                                block.get("type").and_then(Value::as_str) != Some("tool_result")
+                            })
+                })
+        );
+
+        let pi = emit_with_defaults(
+            &session,
+            TargetTool::Pi,
+            &EmitContext::new(home).with_session_id("pi-tool-result"),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        let pi_messages: Vec<Value> = read_jsonl(&pi.path)
+            .into_iter()
+            .filter(|record| record.get("type").and_then(Value::as_str) == Some("message"))
+            .collect();
+        assert_eq!(pi_messages[0]["message"]["role"], "user");
+        assert!(
+            pi_messages[0]["message"]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && block.get("toolCallId").and_then(Value::as_str) == Some("call-1"))
+        );
+    }
+
+    #[test]
+    fn rpi_omits_empty_user_after_splitting_only_tool_results() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let mut session = fixture(home);
+        session.messages = vec![Message::from_parts(
+            Role::User,
+            vec![ContentPart::ToolResult {
+                tool_use_id: "call-1".to_owned(),
+                content: "fn main() {}".to_owned(),
+                is_error: false,
+            }],
+            Some("2026-07-30T10:11:13.000Z".to_owned()),
+        )];
+        let emitted = emit_with_defaults(
+            &session,
+            TargetTool::Rpi,
+            &EmitContext::new(home).with_session_id("rpi-only-tool"),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        let messages: Vec<Value> = read_jsonl(&emitted.path)
+            .into_iter()
+            .filter(|record| record.get("type").and_then(Value::as_str) == Some("message"))
+            .collect();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["message"]["role"], "toolResult");
+        assert_eq!(messages[0]["message"]["toolCallId"], "call-1");
     }
 
     #[test]

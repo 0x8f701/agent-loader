@@ -1,3 +1,4 @@
+#![cfg(feature = "cli")]
 //! Standalone binary-level integration tests for the `al` CLI.
 //!
 //! The suite drives the compiled binary against isolated temporary homes. It
