@@ -12,7 +12,7 @@ use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{Local, TimeZone};
 use walkdir::WalkDir;
 
@@ -40,6 +40,8 @@ pub struct ListOptions {
     pub count: Option<usize>,
     pub show_all: bool,
     pub dedupe: bool,
+    /// Include workflow/subagent child sessions. Default hides them.
+    pub include_children: bool,
     /// An empty list selects every source. Repeated values are harmless.
     pub tools: Vec<SourceTool>,
 }
@@ -47,6 +49,8 @@ pub struct ListOptions {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchOptions {
     pub dedupe: bool,
+    /// Include workflow/subagent child sessions. Default hides them.
+    pub include_children: bool,
     /// An empty list selects every source. Repeated values are harmless.
     pub tools: Vec<SourceTool>,
 }
@@ -72,10 +76,7 @@ impl Catalog {
         )
     }
 
-    pub fn with_homes(
-        sessions_home: impl Into<PathBuf>,
-        user_home: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn with_homes(sessions_home: impl Into<PathBuf>, user_home: impl Into<PathBuf>) -> Self {
         let user_home = make_absolute(user_home.into());
         let sessions_home = expand_tilde(&sessions_home.into(), &user_home);
         Self {
@@ -204,7 +205,10 @@ impl Catalog {
     }
 
     pub fn list(&self, options: &ListOptions) -> Vec<SessionRow> {
-        let rows = self.scan(&options.tools);
+        let include_children = options.include_children;
+        let rows = self.scan_matching(&options.tools, |session| {
+            include_children || !session.is_catalog_child()
+        });
         select_rows(rows, options.count, options.show_all, options.dedupe)
     }
 
@@ -213,11 +217,13 @@ impl Catalog {
             bail!("search query must not be empty");
         }
         let needle = query.to_lowercase();
+        let include_children = options.include_children;
         let rows = self.scan_matching(&options.tools, |session| {
-            session
-                .messages
-                .iter()
-                .any(|message| message.text.to_lowercase().contains(&needle))
+            (include_children || !session.is_catalog_child())
+                && session
+                    .messages
+                    .iter()
+                    .any(|message| message.text.to_lowercase().contains(&needle))
         });
         Ok(if options.dedupe {
             dedupe_rows(&rows)
@@ -254,11 +260,7 @@ impl Catalog {
         }
     }
 
-    pub fn resolve_for_tool(
-        &self,
-        tool: SourceTool,
-        input: impl AsRef<OsStr>,
-    ) -> Result<Session> {
+    pub fn resolve_for_tool(&self, tool: SourceTool, input: impl AsRef<OsStr>) -> Result<Session> {
         let path = self.resolve_path_for_tool(tool, input)?;
         self.parse(tool, &path)
     }
@@ -272,7 +274,10 @@ impl Catalog {
                     return Ok((tool, candidate));
                 }
             }
-            bail!("cannot infer source tool from path: {}", candidate.display());
+            bail!(
+                "cannot infer source tool from path: {}",
+                candidate.display()
+            );
         }
 
         let input = input
@@ -542,17 +547,14 @@ pub fn remove_path_nofollow(path: &Path) -> Result<()> {
 }
 
 fn refuse_symlinks(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspecting {}", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
     if metadata.file_type().is_symlink() {
         bail!("refusing to delete symlink {}", path.display());
     }
     if metadata.is_dir() {
-        for entry in fs::read_dir(path)
-            .with_context(|| format!("reading {}", path.display()))?
-        {
-            let entry =
-                entry.with_context(|| format!("reading entry under {}", path.display()))?;
+        for entry in fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
+            let entry = entry.with_context(|| format!("reading entry under {}", path.display()))?;
             refuse_symlinks(&entry.path())?;
         }
     }
@@ -560,30 +562,25 @@ fn refuse_symlinks(path: &Path) -> Result<()> {
 }
 
 fn remove_path_nofollow_after_check(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspecting {}", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
     if metadata.file_type().is_symlink() {
         bail!("refusing to delete symlink {}", path.display());
     }
     if metadata.is_file() {
-        return fs::remove_file(path)
-            .with_context(|| format!("deleting {}", path.display()));
+        return fs::remove_file(path).with_context(|| format!("deleting {}", path.display()));
     }
     if !metadata.is_dir() {
         bail!("refusing to delete special file {}", path.display());
     }
-    for entry in fs::read_dir(path)
-        .with_context(|| format!("reading {}", path.display()))?
-    {
+    for entry in fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
         let entry = entry.with_context(|| format!("reading entry under {}", path.display()))?;
         remove_path_nofollow_after_check(&entry.path())?;
     }
     match fs::remove_dir(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("removing directory {}", path.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("removing directory {}", path.display())),
     }
 }
 
@@ -624,15 +621,11 @@ fn remove_grok_session_dir(summary: &Path) -> Result<()> {
             summary.display()
         );
     }
-    let directory = summary.parent().with_context(|| {
-        format!("grok session has no directory: {}", summary.display())
-    })?;
-    let metadata = fs::symlink_metadata(directory).with_context(|| {
-        format!(
-            "inspecting grok session directory {}",
-            directory.display()
-        )
-    })?;
+    let directory = summary
+        .parent()
+        .with_context(|| format!("grok session has no directory: {}", summary.display()))?;
+    let metadata = fs::symlink_metadata(directory)
+        .with_context(|| format!("inspecting grok session directory {}", directory.display()))?;
     if metadata.file_type().is_symlink() {
         bail!(
             "refusing to delete symlink directory {}",
@@ -640,10 +633,7 @@ fn remove_grok_session_dir(summary: &Path) -> Result<()> {
         );
     }
     if !metadata.is_dir() {
-        bail!(
-            "refusing to delete non-directory {}",
-            directory.display()
-        );
+        bail!("refusing to delete non-directory {}", directory.display());
     }
 
     remove_path_nofollow(directory)
@@ -688,9 +678,11 @@ fn matches_pattern(tool: SourceTool, path: &Path) -> bool {
         return false;
     };
     match tool {
-        SourceTool::Pi | SourceTool::Rpi | SourceTool::Omp | SourceTool::Droid | SourceTool::Claude => {
-            path.extension() == Some(OsStr::new("jsonl"))
-        }
+        SourceTool::Pi
+        | SourceTool::Rpi
+        | SourceTool::Omp
+        | SourceTool::Droid
+        | SourceTool::Claude => path.extension() == Some(OsStr::new("jsonl")),
         SourceTool::Codex => {
             path.extension() == Some(OsStr::new("jsonl"))
                 && file_name
@@ -729,9 +721,7 @@ fn make_absolute(path: PathBuf) -> PathBuf {
 }
 
 fn nonempty_os_path(value: Option<OsString>) -> Option<PathBuf> {
-    value
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
 #[cfg(windows)]
@@ -814,9 +804,9 @@ fn display_paths<'a>(paths: impl Iterator<Item = (Option<SourceTool>, &'a PathBu
 mod tests {
     use std::fs::{self, File, FileTimes};
     use std::io::Write;
-    use std::time::{Duration, UNIX_EPOCH};
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use tempfile::TempDir;
 
@@ -868,11 +858,12 @@ mod tests {
     }
 
     fn set_modified(path: &Path, seconds: u64) {
-        let file = File::options().write(true).open(path).expect("open for times");
-        file.set_times(
-            FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)),
-        )
-        .expect("set modified");
+        let file = File::options()
+            .write(true)
+            .open(path)
+            .expect("open for times");
+        file.set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)))
+            .expect("set modified");
     }
 
     fn write_grok(catalog: &Catalog, encoded: &str, id: &str, valid: bool) -> PathBuf {
@@ -905,7 +896,10 @@ mod tests {
             None,
         )
         .expect("catalog");
-        assert_eq!(catalog.sessions_home(), Path::new("/workspace/user/catalog"));
+        assert_eq!(
+            catalog.sessions_home(),
+            Path::new("/workspace/user/catalog")
+        );
         let roots = catalog.roots();
         assert_eq!(roots.len(), SourceTool::ALL.len());
         assert_eq!(
@@ -935,12 +929,9 @@ mod tests {
 
     #[test]
     fn from_environment_uses_fallback_when_home_missing_or_empty() {
-        let missing_home = Catalog::from_environment(
-            None,
-            None,
-            Some(OsString::from("/workspace/fallback")),
-        )
-        .expect("catalog from fallback");
+        let missing_home =
+            Catalog::from_environment(None, None, Some(OsString::from("/workspace/fallback")))
+                .expect("catalog from fallback");
         assert_eq!(missing_home.user_home(), Path::new("/workspace/fallback"));
 
         let empty_home = Catalog::from_environment(
@@ -958,8 +949,8 @@ mod tests {
 
     #[test]
     fn from_environment_rejects_missing_home_with_platform_message() {
-        let err = Catalog::from_environment(None, None, None)
-            .expect_err("missing home should fail");
+        let err =
+            Catalog::from_environment(None, None, None).expect_err("missing home should fail");
         assert_eq!(err.to_string(), missing_user_home_message());
 
         let err = Catalog::from_environment(
@@ -1047,12 +1038,17 @@ mod tests {
 
         let rows = catalog.scan(&[SourceTool::Grok]);
         assert_eq!(
-            rows.iter().map(|row| row.session_id.as_str()).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["new", "old"]
         );
         assert_eq!(rows[0].path, new);
         assert_eq!(rows[0].modified_epoch, 30.0);
-        assert_eq!(rows[0].size, fs::metadata(&rows[0].path).expect("metadata").len());
+        assert_eq!(
+            rows[0].size,
+            fs::metadata(&rows[0].path).expect("metadata").len()
+        );
         assert!(rows.iter().all(|row| row.path != corrupt));
     }
 
@@ -1063,12 +1059,15 @@ mod tests {
             let (cwd, summary) = if index == 0 || index == 5 {
                 ("/tmp/same", "Duplicate summary")
             } else {
-                ("/tmp/other", match index {
-                    1 => "one",
-                    2 => "two",
-                    3 => "three",
-                    _ => "four",
-                })
+                (
+                    "/tmp/other",
+                    match index {
+                        1 => "one",
+                        2 => "two",
+                        3 => "three",
+                        _ => "four",
+                    },
+                )
             };
             let path = write_pi(
                 &catalog,
@@ -1097,13 +1096,15 @@ mod tests {
         assert!(rows.iter().all(|row| row.tool == SourceTool::Pi));
         assert_eq!(rows[0].session_id, "session-5");
 
-        assert!(catalog
-            .list(&ListOptions {
-                count: Some(0),
-                tools: vec![SourceTool::Pi],
-                ..ListOptions::default()
-            })
-            .is_empty());
+        assert!(
+            catalog
+                .list(&ListOptions {
+                    count: Some(0),
+                    tools: vec![SourceTool::Pi],
+                    ..ListOptions::default()
+                })
+                .is_empty()
+        );
         assert_eq!(
             catalog
                 .list(&ListOptions {
@@ -1127,6 +1128,259 @@ mod tests {
     }
 
     #[test]
+    fn list_hides_workflow_children_unless_requested() {
+        let (_home, catalog) = catalog();
+        write_pi(
+            &catalog,
+            "project",
+            "parent.jsonl",
+            "parent",
+            "/workspace/project",
+            &[("user", "parent work")],
+        );
+        let child = catalog
+            .root_for_tool(SourceTool::Pi)
+            .path
+            .join("project/child.jsonl");
+        fs::write(
+            &child,
+            concat!(
+                r#"{"type":"session","id":"child","cwd":"/workspace/project","timestamp":"2026-01-01T00:00:00Z","sessionKind":"workflowWorker"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"worker task"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write child");
+        let fork = catalog
+            .root_for_tool(SourceTool::Pi)
+            .path
+            .join("project/fork.jsonl");
+        fs::write(
+            &fork,
+            concat!(
+                r#"{"type":"session","id":"fork","cwd":"/workspace/project","timestamp":"2026-01-01T00:00:00Z","parentSession":"/workspace/parent.jsonl"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"user fork"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write fork");
+        let user = catalog
+            .root_for_tool(SourceTool::Pi)
+            .path
+            .join("project/user.jsonl");
+        fs::write(
+            &user,
+            concat!(
+                r#"{"type":"session","id":"user","cwd":"/workspace/project","timestamp":"2026-01-01T00:00:00Z","sessionKind":"user"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"explicit user"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write user");
+
+        let hidden = catalog.list(&ListOptions {
+            show_all: true,
+            tools: vec![SourceTool::Pi],
+            ..ListOptions::default()
+        });
+        let ids: Vec<&str> = hidden.iter().map(|row| row.session_id.as_str()).collect();
+        assert!(ids.contains(&"parent"));
+        assert!(ids.contains(&"fork"));
+        assert!(ids.contains(&"user"));
+        assert!(!ids.contains(&"child"));
+
+        let shown = catalog.list(&ListOptions {
+            show_all: true,
+            include_children: true,
+            tools: vec![SourceTool::Pi],
+            ..ListOptions::default()
+        });
+        assert!(shown.iter().any(|row| row.session_id == "child"));
+        assert_eq!(
+            catalog
+                .resolve_for_tool(SourceTool::Pi, "child")
+                .expect("resolve child")
+                .hints
+                .session_kind
+                .as_deref(),
+            Some("workflowWorker")
+        );
+    }
+
+    #[test]
+    fn list_hides_grok_subagent_and_hidden_summaries() {
+        let (_home, catalog) = catalog();
+        write_grok(&catalog, "enc", "parent", true);
+        let sub_dir = catalog
+            .root_for_tool(SourceTool::Grok)
+            .path
+            .join("enc/child");
+        fs::create_dir_all(&sub_dir).expect("create grok child");
+        fs::write(
+            sub_dir.join("summary.json"),
+            r#"{"info":{"id":"child","cwd":"/tmp/grok"},"session_kind":"subagent_resume","created_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .expect("write subagent");
+        let hidden_dir = catalog
+            .root_for_tool(SourceTool::Grok)
+            .path
+            .join("enc/hidden");
+        fs::create_dir_all(&hidden_dir).expect("create hidden grok");
+        fs::write(
+            hidden_dir.join("summary.json"),
+            r#"{"info":{"id":"hidden","cwd":"/tmp/grok"},"hidden":true,"created_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .expect("write hidden");
+
+        let rows = catalog.list(&ListOptions {
+            show_all: true,
+            tools: vec![SourceTool::Grok],
+            ..ListOptions::default()
+        });
+        let ids: Vec<&str> = rows.iter().map(|row| row.session_id.as_str()).collect();
+        assert_eq!(ids, ["parent"]);
+
+        let all = catalog.list(&ListOptions {
+            show_all: true,
+            include_children: true,
+            tools: vec![SourceTool::Grok],
+            ..ListOptions::default()
+        });
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn search_hides_children_unless_requested() {
+        let (_home, catalog) = catalog();
+        write_pi(
+            &catalog,
+            "project",
+            "parent.jsonl",
+            "parent",
+            "/workspace/project",
+            &[("user", "parent unique token")],
+        );
+        let child = catalog
+            .root_for_tool(SourceTool::Pi)
+            .path
+            .join("project/child.jsonl");
+        fs::write(
+            &child,
+            concat!(
+                r#"{"type":"session","id":"child","cwd":"/workspace/project","timestamp":"2026-01-01T00:00:00Z","sessionKind":"workflowPlanner"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"child unique token"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write child");
+
+        let hidden = catalog
+            .search("unique token", &SearchOptions::default())
+            .expect("search");
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["parent"]
+        );
+
+        let shown = catalog
+            .search(
+                "unique token",
+                &SearchOptions {
+                    include_children: true,
+                    ..SearchOptions::default()
+                },
+            )
+            .expect("search children");
+        let ids: Vec<&str> = shown.iter().map(|row| row.session_id.as_str()).collect();
+        assert!(ids.contains(&"parent"));
+        assert!(ids.contains(&"child"));
+    }
+
+    #[test]
+    fn list_keeps_grok_user_forks_with_parent_session_id() {
+        let (_home, catalog) = catalog();
+        let directory = catalog
+            .root_for_tool(SourceTool::Grok)
+            .path
+            .join("enc/fork");
+        fs::create_dir_all(&directory).expect("create grok fork");
+        fs::write(
+            directory.join("summary.json"),
+            r#"{"info":{"id":"fork","cwd":"/tmp/grok"},"parent_session_id":"parent","created_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .expect("write fork");
+        let rows = catalog.list(&ListOptions {
+            show_all: true,
+            tools: vec![SourceTool::Grok],
+            ..ListOptions::default()
+        });
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["fork"]
+        );
+    }
+
+    #[test]
+    fn list_hides_omp_workflow_workers_and_keeps_explicit_user_kind() {
+        let (_home, catalog) = catalog();
+        let directory = catalog.root_for_tool(SourceTool::Omp).path.join("project");
+        fs::create_dir_all(&directory).expect("create omp dir");
+        fs::write(
+            directory.join("worker.jsonl"),
+            concat!(
+                r#"{"type":"title","v":1,"title":"Worker","updatedAt":"2026-01-01T00:00:00.000Z","pad":""}"#,
+                "\n",
+                r#"{"type":"session","version":3,"id":"worker","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","sessionKind":"workflowWorker"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"worker prompt"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write worker");
+        fs::write(
+            directory.join("user.jsonl"),
+            concat!(
+                r#"{"type":"title","v":1,"title":"User","updatedAt":"2026-01-01T00:00:00.000Z","pad":""}"#,
+                "\n",
+                r#"{"type":"session","version":3,"id":"user","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","sessionKind":"user"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"user prompt"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write user");
+
+        let hidden = catalog.list(&ListOptions {
+            show_all: true,
+            tools: vec![SourceTool::Omp],
+            ..ListOptions::default()
+        });
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["user"]
+        );
+        let shown = catalog.list(&ListOptions {
+            show_all: true,
+            include_children: true,
+            tools: vec![SourceTool::Omp],
+            ..ListOptions::default()
+        });
+        assert_eq!(shown.len(), 2);
+    }
+
+    #[test]
     fn search_is_case_insensitive_and_checks_non_summary_messages() {
         let (_home, catalog) = catalog();
         write_pi(
@@ -1135,7 +1389,10 @@ mod tests {
             "match.jsonl",
             "match",
             "/tmp",
-            &[("user", "ordinary summary"), ("assistant", "Hidden MiXeD Needle")],
+            &[
+                ("user", "ordinary summary"),
+                ("assistant", "Hidden MiXeD Needle"),
+            ],
         );
         write_pi(
             &catalog,
@@ -1211,14 +1468,7 @@ mod tests {
     #[test]
     fn resolve_path_for_tool_reports_missing_session_id() {
         let (_home, catalog) = catalog();
-        write_pi(
-            &catalog,
-            "project",
-            "known.jsonl",
-            "known-id",
-            "/tmp",
-            &[],
-        );
+        write_pi(&catalog, "project", "known.jsonl", "known-id", "/tmp", &[]);
         let error = catalog
             .resolve_path_for_tool(SourceTool::Pi, OsStr::new("absent-session-xyz"))
             .expect_err("absent id must not resolve");
@@ -1288,12 +1538,33 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("store.db");
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)", []).unwrap();
-        connection.execute("CREATE TABLE blobs(id TEXT PRIMARY KEY,data BLOB)", []).unwrap();
-        connection.execute("INSERT INTO meta VALUES('0', ?1)", [format!(r#"{{"agentId":"{id}","name":"New Agent"}}"#)]).unwrap();
-        connection.execute("INSERT INTO blobs VALUES('message', ?1)", [serde_json::to_vec(&serde_json::json!({"role":"user","content":message})).unwrap()]).unwrap();
+        connection
+            .execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)", [])
+            .unwrap();
+        connection
+            .execute("CREATE TABLE blobs(id TEXT PRIMARY KEY,data BLOB)", [])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO meta VALUES('0', ?1)",
+                [format!(r#"{{"agentId":"{id}","name":"New Agent"}}"#)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO blobs VALUES('message', ?1)",
+                [
+                    serde_json::to_vec(&serde_json::json!({"role":"user","content":message}))
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
         drop(connection);
-        fs::write(directory.join("meta.json"), r#"{"cwd":"/workspace/agent","title":"Agent title","updatedAtMs":1767225660000}"#).unwrap();
+        fs::write(
+            directory.join("meta.json"),
+            r#"{"cwd":"/workspace/agent","title":"Agent title","updatedAtMs":1767225660000}"#,
+        )
+        .unwrap();
         fs::write(directory.join("store.db-wal"), b"wal").unwrap();
         path
     }
@@ -1306,14 +1577,29 @@ mod tests {
         fs::create_dir_all(nested.parent().unwrap()).unwrap();
         fs::write(&nested, b"ignored").unwrap();
         assert_eq!(catalog.discover(SourceTool::Agent), [path.clone()]);
-        let rows = catalog.search("needle", &SearchOptions { dedupe: false, tools: vec![SourceTool::Agent] }).unwrap();
+        let rows = catalog
+            .search(
+                "needle",
+                &SearchOptions {
+                    dedupe: false,
+                    include_children: false,
+                    tools: vec![SourceTool::Agent],
+                },
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, SourceTool::Agent);
         assert_eq!(rows[0].session_id, "agent-session");
         assert_eq!(rows[0].summary, "Agent title");
         assert_eq!(rows[0].cwd, Path::new("/workspace/agent"));
         assert!(rows[0].size > fs::metadata(&path).unwrap().len());
-        assert_eq!(catalog.resolve_for_tool(SourceTool::Agent, "agent-session").unwrap().path, path);
+        assert_eq!(
+            catalog
+                .resolve_for_tool(SourceTool::Agent, "agent-session")
+                .unwrap()
+                .path,
+            path
+        );
     }
 
     #[test]
@@ -1321,21 +1607,24 @@ mod tests {
         let (_home, catalog) = catalog();
         let path = write_agent(&catalog, "subagent-session", "internal work");
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute(
-            "UPDATE meta SET value = ?1 WHERE key = '0'",
-            [r#"{"agentId":"subagent-session","subagentInfo":{"parentAgentId":"parent"}}"#],
-        ).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = '0'",
+                [r#"{"agentId":"subagent-session","subagentInfo":{"parentAgentId":"parent"}}"#],
+            )
+            .unwrap();
         assert!(catalog.scan(&[SourceTool::Agent]).is_empty());
-        assert!(catalog.resolve_for_tool(SourceTool::Agent, "subagent-session").is_err());
+        assert!(
+            catalog
+                .resolve_for_tool(SourceTool::Agent, "subagent-session")
+                .is_err()
+        );
     }
 
     #[test]
     fn converted_omp_title_slot_is_listed() {
         let (_home, catalog) = catalog();
-        let directory = catalog
-            .root_for_tool(SourceTool::Omp)
-            .path
-            .join("project");
+        let directory = catalog.root_for_tool(SourceTool::Omp).path.join("project");
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("converted.jsonl");
         fs::write(
@@ -1382,6 +1671,7 @@ mod tests {
             messages: Vec::new(),
             path,
             modified_epoch: None,
+            hints: crate::domain::SessionHints::default(),
         }
     }
 
@@ -1435,8 +1725,8 @@ mod tests {
         let summary = directory.join("summary.json");
         fs::write(&summary, "{}").unwrap();
         std::os::unix::fs::symlink(&summary, directory.join("linked.json")).unwrap();
-        let error = remove_source_session(&stub_session(SourceTool::Grok, summary.clone()))
-            .unwrap_err();
+        let error =
+            remove_source_session(&stub_session(SourceTool::Grok, summary.clone())).unwrap_err();
         assert!(error.to_string().contains("symlink"), "{error:#}");
         assert!(summary.is_file());
     }

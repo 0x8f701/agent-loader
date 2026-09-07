@@ -2,7 +2,7 @@
 //!
 //! Claude stores a session as an append-only JSONL graph at
 //! `~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl`. This adapter
-//! follows the native 2.1.220 loader's active-leaf, compaction, parent recovery,
+//! follows the native 2.1.226 loader's active-leaf, compaction, parent recovery,
 //! and parallel-response rules before projecting the intentionally lossy
 //! user/assistant text contract.
 
@@ -14,8 +14,8 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::domain::{Message, Role, Session, SourceTool};
-use crate::formats::{normalize, read_jsonl_values, summarize_messages};
+use crate::domain::{ContentPart, Message, Role, Session, SessionHints, SourceTool};
+use crate::formats::{normalize, parsed_message, read_jsonl_values, summarize_messages};
 
 const PARENT_TIMESTAMP_FALLBACK_MS: i64 = 5_000;
 
@@ -40,12 +40,14 @@ pub fn parse(path: &Path) -> Result<Session> {
         }
     }
 
-    let active_path = reconstruct_active_path(&records);
+    let include_sidechain = sidechain_only_session(&records);
+    let active_path = reconstruct_active_path(&records, include_sidechain);
     let start_timestamp = active_path
         .first()
         .and_then(|index| records[*index].timestamp());
-    let messages = project_messages(&records, &active_path);
+    let messages = project_messages(&records, &active_path, include_sidechain);
     let summary = summary.unwrap_or_else(|| summarize_messages(&messages));
+    let hints = session_hints(&records);
 
     Ok(Session {
         tool: SourceTool::Claude,
@@ -56,6 +58,7 @@ pub fn parse(path: &Path) -> Result<Session> {
         messages,
         path: path.to_path_buf(),
         modified_epoch,
+        hints,
     })
 }
 
@@ -94,9 +97,25 @@ impl GraphIndex {
         graph
     }
 
-    fn foreground(&self, uuid: &str) -> bool {
-        self.nodes.get(uuid).is_some_and(|node| !node.is_sidechain)
+    fn visible(&self, uuid: &str, include_sidechain: bool) -> bool {
+        self.nodes
+            .get(uuid)
+            .is_some_and(|node| include_sidechain || !node.is_sidechain)
     }
+}
+
+fn sidechain_only_session(records: &[Record]) -> bool {
+    let mut saw_conversation = false;
+    for record in records {
+        if !record.is_conversation_record() {
+            continue;
+        }
+        saw_conversation = true;
+        if !record.is_sidechain() {
+            return false;
+        }
+    }
+    saw_conversation
 }
 
 #[derive(Debug, Default)]
@@ -107,15 +126,16 @@ struct LeafState {
     is_cleared: bool,
 }
 
-fn reconstruct_active_path(records: &[Record]) -> Vec<usize> {
-    let leaf_state = scan_leaf_state(records);
+fn reconstruct_active_path(records: &[Record], include_sidechain: bool) -> Vec<usize> {
+    let leaf_state = scan_leaf_state(records, include_sidechain);
     if leaf_state.is_cleared {
         return Vec::new();
     }
 
     let mut graph = GraphIndex::from_records(records);
     let compacted_tail = apply_latest_compaction(records, &mut graph);
-    let Some(leaf_uuid) = select_leaf(&leaf_state, compacted_tail, &graph) else {
+    let Some(leaf_uuid) = select_leaf(&leaf_state, compacted_tail, &graph, include_sidechain)
+    else {
         return Vec::new();
     };
 
@@ -125,10 +145,13 @@ fn reconstruct_active_path(records: &[Record]) -> Vec<usize> {
     path
 }
 
-fn scan_leaf_state(records: &[Record]) -> LeafState {
+fn scan_leaf_state(records: &[Record], include_sidechain: bool) -> LeafState {
     let mut state = LeafState::default();
     for record in records {
-        if let Some(uuid) = record.uuid().filter(|_| !record.is_sidechain()) {
+        if let Some(uuid) = record
+            .uuid()
+            .filter(|_| include_sidechain || !record.is_sidechain())
+        {
             state.latest_foreground_uuid = Some(uuid);
             state.is_preferred_explicit = false;
             state.is_cleared = false;
@@ -160,11 +183,12 @@ fn select_leaf(
     state: &LeafState,
     compacted_tail: Option<String>,
     graph: &GraphIndex,
+    include_sidechain: bool,
 ) -> Option<String> {
     let preferred = state
         .preferred_uuid
         .as_ref()
-        .filter(|uuid| graph.foreground(uuid));
+        .filter(|uuid| graph.visible(uuid, include_sidechain));
     if state.is_preferred_explicit && preferred.is_some() {
         return preferred.cloned();
     }
@@ -172,7 +196,7 @@ fn select_leaf(
         if let Some(latest) = state
             .latest_foreground_uuid
             .as_ref()
-            .filter(|uuid| graph.foreground(uuid))
+            .filter(|uuid| graph.visible(uuid, include_sidechain))
         {
             if latest != preferred && is_descendant(graph, latest, preferred) {
                 return Some(latest.clone());
@@ -183,15 +207,15 @@ fn select_leaf(
     state
         .latest_foreground_uuid
         .as_ref()
-        .filter(|uuid| graph.foreground(uuid))
+        .filter(|uuid| graph.visible(uuid, include_sidechain))
         .cloned()
-        .or_else(|| compacted_tail.filter(|uuid| graph.foreground(uuid)))
+        .or_else(|| compacted_tail.filter(|uuid| graph.visible(uuid, include_sidechain)))
         .or_else(|| {
             graph
                 .order
                 .iter()
                 .rev()
-                .find(|uuid| graph.foreground(uuid))
+                .find(|uuid| graph.visible(uuid, include_sidechain))
                 .cloned()
         })
 }
@@ -540,40 +564,154 @@ fn sort_record_indices(records: &[Record], indices: &mut [usize]) {
     indices.sort_by(|left, right| records[*left].timestamp().cmp(&records[*right].timestamp()));
 }
 
-fn project_messages(records: &[Record], path: &[usize]) -> Vec<Message> {
+fn project_messages(records: &[Record], path: &[usize], include_sidechain: bool) -> Vec<Message> {
     path.iter()
         .map(|index| &records[*index])
-        .filter(|record| record.is_conversation_record())
-        .filter(|record| !record.is_sidechain() && !record.is_meta())
-        .filter_map(project_message)
+        .filter(|record| (include_sidechain || !record.is_sidechain()) && !record.is_meta())
+        .filter_map(project_record)
         .collect()
 }
 
-fn project_message(record: &Record) -> Option<Message> {
-    let (role, content, timestamp) = record.message_payload()?;
-    let role = role?.parse::<Role>().ok()?;
-    let text = first_direct_text(content?)?;
-    Some(Message {
-        role,
-        text: text.to_owned(),
-        timestamp: timestamp.map(str::to_owned),
-    })
+fn project_record(record: &Record) -> Option<Message> {
+    if record.is_compact_summary() {
+        let text = record
+            .message_payload()
+            .and_then(|(_, content, _)| content.and_then(crate::formats::first_text_from_content))
+            .filter(|text| !text.is_empty())?;
+        return Some(Message::from_parts(
+            Role::Assistant,
+            vec![ContentPart::Note {
+                kind: "compaction".to_owned(),
+                text: text.to_owned(),
+            }],
+            record.timestamp(),
+        ));
+    }
+    if record.is_conversation_record() {
+        let (role, content, timestamp) = record.message_payload()?;
+        return parsed_message(role, content, timestamp);
+    }
+    project_attachment(record)
 }
 
-fn first_direct_text(content: &Value) -> Option<&str> {
-    match content {
-        Value::String(text) if !text.is_empty() => Some(text),
-        Value::Array(items) => items.iter().find_map(|item| {
-            let object = item.as_object()?;
-            let item_type = object.get("type").and_then(Value::as_str);
-            let text = object.get("text").and_then(Value::as_str);
-            matches!(item_type, Some("text" | "input_text" | "output_text"))
-                .then_some(text)
-                .flatten()
-                .filter(|value| !value.is_empty())
-        }),
-        _ => None,
+fn project_attachment(record: &Record) -> Option<Message> {
+    let RecordKind::Attachment(attachment) = &record.kind else {
+        return None;
+    };
+    let payload = attachment.attachment.as_ref()?;
+    let kind = payload
+        .raw
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("attachment");
+    let text = attachment_note_text(&payload.kind, &payload.raw)?;
+    Some(Message::from_parts(
+        Role::User,
+        vec![ContentPart::Note {
+            kind: kind.to_owned(),
+            text,
+        }],
+        record.timestamp(),
+    ))
+}
+
+fn attachment_note_text(kind: &AttachmentKind, raw: &Value) -> Option<String> {
+    let from_raw = || {
+        raw.get("content")
+            .and_then(|value| match value {
+                Value::String(text) if !text.is_empty() => Some(text.clone()),
+                other => {
+                    let joined = crate::domain::joined_text(&crate::formats::content_parts(other));
+                    (!joined.is_empty()).then_some(joined)
+                }
+            })
+            .or_else(|| {
+                raw.get("filename")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+    };
+    match kind {
+        AttachmentKind::SkillListing { content, .. } => Some(content.clone()),
+        AttachmentKind::ReadTruncationNotice { banner } => Some(banner.clone()),
+        AttachmentKind::CompactFileReference { filename } => Some(filename.clone()),
+        AttachmentKind::AudioTranscript { filename, .. } => Some(filename.clone()),
+        AttachmentKind::AgentMention { agent_type } => Some(agent_type.clone()),
+        AttachmentKind::DynamicSkill { skill_dir, .. } => Some(skill_dir.clone()),
+        AttachmentKind::HookSuccess {
+            hook_name, command, ..
+        }
+        | AttachmentKind::HookNonBlockingError {
+            hook_name, command, ..
+        }
+        | AttachmentKind::HookErrorDuringExecution {
+            hook_name, command, ..
+        }
+        | AttachmentKind::HookCancelled {
+            hook_name, command, ..
+        } => Some(format!("{hook_name}: {command}")),
+        AttachmentKind::Unknown => from_raw(),
+        _ => from_raw(),
     }
+}
+
+fn session_hints(records: &[Record]) -> SessionHints {
+    let mut hints = SessionHints::default();
+    for record in records {
+        if let RecordKind::Assistant(assistant) = &record.kind {
+            if hints.model.is_none() {
+                if let Some(model) = assistant
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.model.as_deref())
+                    .filter(|value| !value.is_empty())
+                {
+                    hints.model = Some(model.to_owned());
+                }
+            }
+            if hints.thinking_level.is_none() {
+                hints.thinking_level = assistant
+                    .effort
+                    .as_deref()
+                    .and_then(|value| value.parse().ok());
+            }
+        }
+        if let Some(summary) = compact_summary_text(record) {
+            hints.compaction_summary = Some(summary);
+        }
+    }
+    hints
+}
+
+fn compact_summary_text(record: &Record) -> Option<String> {
+    if record.is_compact_summary() {
+        return record
+            .message_payload()
+            .and_then(|(_, content, _)| content.and_then(crate::formats::first_text_from_content))
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned);
+    }
+    if !record.is_compact_boundary() {
+        return None;
+    }
+    let metadata = record.raw.get("compactMetadata").and_then(Value::as_object);
+    let from_meta = metadata.and_then(|metadata| {
+        ["compactSummary", "summary", "preCompactSummary", "preamble"]
+            .into_iter()
+            .find_map(|key| metadata.get(key).and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    });
+    from_meta.or_else(|| {
+        record
+            .raw
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 fn parse_timestamp_ms(value: &str) -> Option<i64> {
@@ -726,6 +864,13 @@ impl Record {
     fn is_compact_boundary(&self) -> bool {
         self.type_tag() == Some("system")
             && self.raw_str("subtype").as_deref() == Some("compact_boundary")
+    }
+
+    fn is_compact_summary(&self) -> bool {
+        match &self.kind {
+            RecordKind::User(user) if user.is_compact_summary == Some(true) => true,
+            _ => self.raw_bool("isCompactSummary"),
+        }
     }
 
     fn message_id(&self) -> Option<String> {
@@ -1342,7 +1487,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
-    use crate::domain::Role;
+    use crate::domain::{ContentPart, Role};
 
     fn write_session(lines: &[&str]) -> NamedTempFile {
         let mut file = NamedTempFile::new().expect("temp file");
@@ -1435,6 +1580,17 @@ mod tests {
         let session = parse(file.path()).expect("parse");
         let texts: Vec<&str> = session.messages.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, ["real", "ans"]);
+    }
+
+    #[test]
+    fn sidechain_only_transcript_is_projected() {
+        let file = write_session(&[
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"isSidechain":true,"timestamp":"2026-07-21T06:13:11.040Z","sessionId":"sub","cwd":"/workspace/project","message":{"role":"user","content":"task"}}"#,
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","isSidechain":true,"timestamp":"2026-07-21T06:13:12.040Z","sessionId":"sub","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["task", "done"]);
     }
 
     #[test]
@@ -1536,6 +1692,40 @@ mod tests {
     }
 
     #[test]
+    fn skill_listing_on_the_active_path_projects_as_a_note() {
+        let attachment = r#"{"type":"attachment","uuid":"att1","parentUuid":"u1","timestamp":"2026-07-21T06:13:11.500Z","sessionId":"s1","cwd":"/tmp","attachment":{"type":"skill_listing","content":"Skills available","skillCount":3,"isInitial":true}}"#;
+        let file = write_session(&[
+            &user("u1", None, r#""hi""#),
+            attachment,
+            &assistant("a1", "att1", r#"[{"type":"text","text":"ans"}]"#),
+            &last_prompt("a1"),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    crate::domain::ContentPart::Note { kind, text }
+                        if kind == "skill_listing" && text == "Skills available"
+                )
+            })
+        }));
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role == Role::User || message.role == Role::Assistant)
+                .filter(|message| message
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, crate::domain::ContentPart::Text(_))))
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            ["hi", "ans"]
+        );
+    }
+
+    #[test]
     fn known_attachment_payload_is_typed() {
         let line = r#"{"type":"attachment","uuid":"att1","parentUuid":"u1","timestamp":"2026-07-21T06:13:11.040Z","sessionId":"s1","cwd":"/tmp","attachment":{"type":"skill_listing","content":"Skills available","skillCount":3,"isInitial":true}}"#;
         let value: Value = serde_json::from_str(line).expect("json");
@@ -1616,7 +1806,12 @@ mod tests {
                 .messages
                 .iter()
                 .find(|m| m.role == Role::User)
-                .map(|m| m.text.as_str());
+                .and_then(|message| {
+                    message.parts.iter().find_map(|part| match part {
+                        crate::domain::ContentPart::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                });
             assert_eq!(user_text, *expected, "content = {content}");
         }
     }
@@ -1766,7 +1961,11 @@ mod tests {
         let final_answer = r#"{"type":"assistant","uuid":"a2","parentUuid":"c1","timestamp":"2026-07-21T06:13:15.000Z","sessionId":"s1","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"final"}]}}"#;
         let file = write_session(&[
             &user("old-a", None, r#""dropped older context""#),
-            &assistant("old-b", "old-a", r#"[{"type":"text","text":"dropped answer"}]"#),
+            &assistant(
+                "old-b",
+                "old-a",
+                r#"[{"type":"text","text":"dropped answer"}]"#,
+            ),
             boundary,
             preserved_user,
             preserved_assistant,
@@ -1821,7 +2020,7 @@ mod tests {
             .iter()
             .map(|message| message.text.as_str())
             .collect();
-        assert_eq!(texts, ["prompt", "done"]);
+        assert_eq!(texts, ["prompt", "Read", "tool output", "done"]);
     }
 
     #[test]
@@ -1837,6 +2036,38 @@ mod tests {
         assert_eq!(
             session.start_timestamp.as_deref(),
             Some("2026-07-21T06:13:11.040Z")
+        );
+    }
+
+    #[test]
+    fn compact_summary_lands_on_hints_and_projects_as_a_note() {
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","uuid":"c1","parentUuid":null,"timestamp":"2026-07-21T06:13:12.000Z","sessionId":"s1","cwd":"/workspace/project","compactMetadata":{"compactSummary":"from metadata"}}"#;
+        let summary = r#"{"type":"user","uuid":"s1u","parentUuid":"c1","timestamp":"2026-07-21T06:13:12.500Z","sessionId":"s1","cwd":"/workspace/project","isCompactSummary":true,"message":{"role":"user","content":"prior context"}}"#;
+        let file = write_session(&[
+            boundary,
+            summary,
+            &user("u1", Some("s1u"), r#""hello""#),
+            &last_prompt("u1"),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(
+            session.hints.compaction_summary.as_deref(),
+            Some("prior context")
+        );
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::Note { kind, text }
+                        if kind == "compaction" && text == "prior context"
+                )
+            })
+        }));
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.text == "hello")
         );
     }
 
@@ -1926,7 +2157,7 @@ mod tests {
             .iter()
             .map(|message| message.text.as_str())
             .collect();
-        assert_eq!(texts, ["prompt", "first", "second"]);
+        assert_eq!(texts, ["prompt", "first", "second", "tool output"]);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::domain::{Message, Role, Session, SourceTool};
-use crate::formats::{first_text_from_content, normalize, summarize_messages};
+use crate::formats::{content_parts, normalize, parsed_message, summarize_messages};
 use crate::fs::{open_directory_under_root, open_regular_file_at};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +40,8 @@ pub struct GrokSummary {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub session_kind: Option<String>,
+    #[serde(default)]
+    pub hidden: bool,
     #[serde(default)]
     pub parent_session_id: Option<String>,
     #[serde(default)]
@@ -101,6 +103,11 @@ pub fn parse(path: &Path, grok_root: &Path) -> Result<Session> {
     if let Some((chat_file, _)) = open_regular_file_at(&directory, "chat_history.jsonl") {
         parse_chat_history(chat_file, &mut messages);
     }
+    if messages.is_empty() {
+        if let Some((updates_file, _)) = open_regular_file_at(&directory, "updates.jsonl") {
+            parse_updates(updates_file, &mut messages);
+        }
+    }
 
     let session_id = if summary.info.id.is_empty() {
         session_directory
@@ -144,7 +151,266 @@ pub fn parse(path: &Path, grok_root: &Path) -> Result<Session> {
         messages,
         path: path.to_path_buf(),
         modified_epoch: Some(metadata_epoch(&summary_metadata)),
+        hints: crate::domain::SessionHints {
+            model: (!summary.current_model_id.is_empty()).then(|| summary.current_model_id.clone()),
+            thinking_level: summary
+                .reasoning_effort
+                .as_deref()
+                .and_then(|value| value.parse().ok()),
+            session_kind: summary.session_kind.clone().filter(|kind| !kind.is_empty()),
+            hidden: summary.hidden,
+            ..crate::domain::SessionHints::default()
+        },
     })
+}
+
+fn grok_history_message(
+    object: &serde_json::Map<String, Value>,
+    record_type: Option<&str>,
+    timestamp: Option<String>,
+) -> Option<Message> {
+    let content = object.get("content");
+    match record_type {
+        Some("reasoning") => {
+            let text = ["content", "summary"].into_iter().find_map(|key| {
+                object.get(key).and_then(|value| {
+                    first_text_like(value).or_else(|| {
+                        let joined = crate::domain::joined_text(&content_parts(value));
+                        (!joined.is_empty()).then_some(joined)
+                    })
+                })
+            })?;
+            Some(Message::from_parts(
+                Role::Assistant,
+                vec![crate::domain::ContentPart::Thinking {
+                    text,
+                    signature: None,
+                }],
+                timestamp,
+            ))
+        }
+        Some("tool" | "tool_call") => Some(Message::from_parts(
+            Role::Assistant,
+            vec![crate::domain::ContentPart::ToolUse {
+                id: object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                name: object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                input: crate::formats::object_or_json(
+                    object
+                        .get("arguments")
+                        .or_else(|| object.get("input"))
+                        .or(content)
+                        .cloned()
+                        .unwrap_or(serde_json::json!({})),
+                ),
+            }],
+            timestamp,
+        )),
+        Some("tool_result") => {
+            let mut parts = vec![crate::domain::ContentPart::ToolResult {
+                tool_use_id: object
+                    .get("tool_call_id")
+                    .or_else(|| object.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                content: content.and_then(first_text_like).unwrap_or_default(),
+                is_error: object
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }];
+            if let Some(content) = content {
+                parts.extend(
+                    content_parts(content)
+                        .into_iter()
+                        .filter(|part| matches!(part, crate::domain::ContentPart::Image { .. })),
+                );
+            }
+            if let Some(Value::Array(images)) = object.get("images") {
+                parts.extend(
+                    images
+                        .iter()
+                        .flat_map(content_parts)
+                        .filter(|part| matches!(part, crate::domain::ContentPart::Image { .. })),
+                );
+            }
+            Some(Message::from_parts(Role::Tool, parts, timestamp))
+        }
+        Some("backend_tool_call") => backend_tool_call(object, timestamp),
+        _ => {
+            let role = object.get("role").and_then(Value::as_str).or(record_type);
+            let mut message = match content
+                .and_then(|value| parsed_message(role, Some(value), timestamp.as_deref()))
+            {
+                Some(message) => message,
+                None => Message::from_parts(
+                    role.and_then(|value| value.parse().ok())?,
+                    Vec::new(),
+                    timestamp,
+                ),
+            };
+            if let Some(Value::Array(calls)) = object.get("tool_calls") {
+                for call in calls {
+                    message.parts.push(crate::domain::ContentPart::ToolUse {
+                        id: call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        name: call
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        input: crate::formats::object_or_json(
+                            call.get("arguments")
+                                .or_else(|| call.get("input"))
+                                .cloned()
+                                .unwrap_or(serde_json::json!({})),
+                        ),
+                    });
+                }
+                message.text = crate::domain::joined_text(&message.parts);
+            }
+            (!message.parts.is_empty()).then_some(message)
+        }
+    }
+}
+
+fn backend_tool_call(
+    object: &serde_json::Map<String, Value>,
+    timestamp: Option<String>,
+) -> Option<Message> {
+    let kind = object.get("kind").and_then(Value::as_object);
+    let name = kind
+        .and_then(|kind| kind.get("tool_type"))
+        .or_else(|| object.get("name"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("backend_tool");
+    let id = kind
+        .and_then(|kind| kind.get("id"))
+        .or_else(|| object.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let input = kind
+        .and_then(|kind| kind.get("action"))
+        .cloned()
+        .or_else(|| object.get("kind").cloned())
+        .unwrap_or(serde_json::json!({}));
+    Some(Message::from_parts(
+        Role::Assistant,
+        vec![crate::domain::ContentPart::ToolUse {
+            id,
+            name: name.to_owned(),
+            input: crate::formats::object_or_json(input),
+        }],
+        timestamp,
+    ))
+}
+
+fn first_text_like(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        _ => {
+            let joined = crate::domain::joined_text(&content_parts(content));
+            if joined.is_empty() {
+                crate::formats::first_text_from_content(content).map(str::to_owned)
+            } else {
+                Some(joined)
+            }
+        }
+    }
+}
+
+fn parse_updates(file: File, messages: &mut Vec<Message>) {
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let Some(update) = record.pointer("/params/update") else {
+            continue;
+        };
+        if let Some(message) = grok_update_message(update) {
+            messages.push(message);
+        }
+    }
+}
+
+fn grok_update_message(update: &Value) -> Option<Message> {
+    let kind = update.get("sessionUpdate").and_then(Value::as_str)?;
+    let timestamp = update
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    match kind {
+        "user_message_chunk" => {
+            parsed_message(Some("user"), update.get("content"), timestamp.as_deref())
+        }
+        "agent_message_chunk" => parsed_message(
+            Some("assistant"),
+            update.get("content"),
+            timestamp.as_deref(),
+        ),
+        "agent_thought_chunk" => first_text_like(update.get("content")?).map(|text| {
+            Message::from_parts(
+                Role::Assistant,
+                vec![crate::domain::ContentPart::Thinking {
+                    text,
+                    signature: None,
+                }],
+                timestamp,
+            )
+        }),
+        "tool_call" => {
+            let id = update
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let name = update.get("title").and_then(Value::as_str).unwrap_or("");
+            let status = update.get("status").and_then(Value::as_str);
+            if matches!(status, Some("completed" | "failed")) {
+                Some(Message::from_parts(
+                    Role::Tool,
+                    vec![crate::domain::ContentPart::ToolResult {
+                        tool_use_id: id.to_owned(),
+                        content: update
+                            .get("content")
+                            .and_then(first_text_like)
+                            .unwrap_or_default(),
+                        is_error: status == Some("failed"),
+                    }],
+                    timestamp,
+                ))
+            } else {
+                Some(Message::from_parts(
+                    Role::Assistant,
+                    vec![crate::domain::ContentPart::ToolUse {
+                        id: id.to_owned(),
+                        name: name.to_owned(),
+                        input: update
+                            .get("rawInput")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({})),
+                    }],
+                    timestamp,
+                ))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn decode_cwd_fallback(session_directory: &Path, grok_root: &Path) -> Option<String> {
@@ -174,32 +440,16 @@ fn parse_chat_history(file: File, messages: &mut Vec<Message>) {
             continue;
         };
         let record_type = object.get("type").and_then(Value::as_str);
-        if matches!(
-            record_type,
-            Some("system" | "reasoning" | "tool" | "tool_call" | "tool_result")
-        ) {
+        if record_type == Some("system") {
             continue;
         }
-        let role = object
-            .get("role")
-            .and_then(Value::as_str)
-            .or(record_type)
-            .and_then(|role| role.parse::<Role>().ok());
-        let Some(role) = role else {
-            continue;
-        };
-        let Some(text) = object.get("content").and_then(first_text_from_content) else {
-            continue;
-        };
         let timestamp = ["timestamp", "created_at", "updated_at", "time"]
             .into_iter()
             .find_map(|key| object.get(key).and_then(Value::as_str))
             .map(str::to_owned);
-        messages.push(Message {
-            role,
-            text: text.to_owned(),
-            timestamp,
-        });
+        if let Some(message) = grok_history_message(object, record_type, timestamp) {
+            messages.push(message);
+        }
     }
 }
 
@@ -254,6 +504,57 @@ mod tests {
         let session = parse(&path, &root).expect("parse");
         assert_eq!(session.cwd, PathBuf::from("/tmp/right-cwd"));
         assert_eq!(session.session_id, "sid");
+    }
+
+    #[test]
+    fn updates_are_used_when_chat_history_is_empty() {
+        let home = TempDir::new().expect("temp home");
+        let root = home.path().join(".grok/sessions");
+        fs::create_dir_all(&root).expect("create grok root");
+        let summary = r#"{"info":{"id":"sid","cwd":"/tmp/grok"},"session_summary":"t","created_at":"2026-01-01T00:00:00Z"}"#;
+        let path = write_session(&root, "%2Ftmp%2Fgrok", "sid", summary, "");
+        fs::write(
+            path.parent().unwrap().join("updates.jsonl"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"list the file"}}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"I should read it"}}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"Read","status":"pending","rawInput":{"path":"src/lib.rs"}}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"call-1","status":"completed","content":{"type":"text","text":"fn main() {}"}}}}"#,
+                "\n",
+            ),
+        )
+        .expect("write updates");
+        let session = parse(&path, &root).expect("parse");
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.text.contains("list the file")),
+            "{:?}",
+            session
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+        );
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, crate::domain::ContentPart::Thinking { text, .. } if text.contains("I should read it"))
+            })
+        }));
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, crate::domain::ContentPart::ToolUse { name, .. } if name == "Read")
+            })
+        }));
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, crate::domain::ContentPart::ToolResult { content, .. } if content.contains("fn main()"))
+            })
+        }));
     }
 
     #[test]
@@ -369,10 +670,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (Role::User, "hello user"),
-                (Role::Assistant, "hi assistant"),
-                (Role::User, "second text"),
+                (Role::Assistant, "hi assistant\nWebSearch"),
+                (Role::Assistant, "thinking"),
+                (Role::Tool, "result"),
+                (Role::User, "[Image]\nsecond text"),
             ]
         );
+    }
+
+    #[test]
+    fn backend_tool_call_and_tool_result_images_are_projected() {
+        let home = TempDir::new().expect("temp home");
+        let root = home.path().join(".grok/sessions");
+        fs::create_dir_all(&root).expect("create grok root");
+        let summary = r#"{"info":{"id":"sid","cwd":"/tmp/grok"},"session_summary":"t","created_at":"2026-01-01T00:00:00Z"}"#;
+        let chat = concat!(
+            r#"{"type":"user","content":[{"type":"text","text":"search it"}]}"#,
+            "\n",
+            r#"{"type":"backend_tool_call","kind":{"tool_type":"web_search","id":"ws_1","action":{"type":"search","query":"capybaras"}}}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_call_id":"ws_1","content":"found","images":[{"type":"image","url":"iVBORw0KGgo="}]}"#,
+            "\n",
+        );
+        let path = write_session(&root, "%2Ftmp%2Fgrok", "sid", summary, chat);
+        let session = parse(&path, &root).expect("parse");
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, crate::domain::ContentPart::ToolUse { id, name, input } if id == "ws_1" && name == "web_search" && input.get("query").and_then(Value::as_str) == Some("capybaras"))
+            })
+        }));
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, crate::domain::ContentPart::ToolResult { content, .. } if content == "found")
+            }) && message.parts.iter().any(|part| {
+                matches!(part, crate::domain::ContentPart::Image { data, .. } if data == "iVBORw0KGgo=")
+            })
+        }));
     }
 
     #[test]
@@ -386,6 +719,11 @@ mod tests {
         let session = parse(&path, &root).expect("parse");
         assert_eq!(session.session_id, "sid");
         assert_eq!(session.cwd, PathBuf::from("/tmp/grok"));
+        assert_eq!(
+            session.hints.session_kind.as_deref(),
+            Some("subagent_resume")
+        );
+        assert!(session.is_catalog_child());
 
         // Re-deserialize the same bytes through the typed struct to prove the
         // flatten maps capture unknown fields verbatim and typed fields parse.

@@ -14,7 +14,10 @@ use thiserror::Error;
 
 use crate::domain::{Message, Session, SourceTool};
 use crate::formats::tree::TreeNode;
-use crate::formats::{normalize, read_jsonl_values, summarize_messages, tree};
+use crate::formats::{
+    compaction_note, hints_from_tree_records, normalize, read_jsonl_values, summarize_messages,
+    tree,
+};
 
 /// Why an OMP session file is unloadable, surfaced through `parse`'s
 /// `anyhow::Result` (downcastable via `error.downcast_ref::<OmpParseError>()`)
@@ -80,7 +83,7 @@ pub fn parse(path: &Path) -> Result<Session> {
     // `read_jsonl_values` silently drops malformed lines, so an empty `Vec`
     // alone is ambiguous: it can mean a 0-byte file or a nonempty file whose
     // every line is malformed. The physical file size disambiguates.
-    let (session_id, raw_cwd, raw_timestamp, header_title) = values
+    let (session_id, raw_cwd, raw_timestamp, header_title, session_kind) = values
         .get(start)
         .and_then(Value::as_object)
         .filter(|object| object.get("type").and_then(Value::as_str) == Some("session"))
@@ -107,6 +110,11 @@ pub fn parse(path: &Path) -> Result<Session> {
                             .and_then(Value::as_str)
                             .filter(|title| !title.is_empty())
                             .map(str::to_owned),
+                        object
+                            .get("sessionKind")
+                            .and_then(Value::as_str)
+                            .filter(|kind| !kind.is_empty())
+                            .map(str::to_owned),
                     )
                 })
         })
@@ -129,10 +137,13 @@ pub fn parse(path: &Path) -> Result<Session> {
 
     crate::formats::pi::migrate_legacy_entries(&mut values[start..]);
 
-    // Remaining records form the append-only tree. Every entry type participates
-    // via id/parentId; only native user/assistant message payloads project.
-    let mut nodes: Vec<TreeNode<'_>> = Vec::with_capacity(values.len().saturating_sub(start + 1));
-    for record in &values[start + 1..] {
+    let body = &values[start + 1..];
+    let synthesized: Vec<Option<Value>> = body
+        .iter()
+        .map(crate::formats::pi::synthesized_tree_content)
+        .collect();
+    let mut nodes: Vec<TreeNode<'_>> = Vec::with_capacity(body.len());
+    for (record, extra) in body.iter().zip(synthesized.iter()) {
         let Some(object) = record.as_object() else {
             continue;
         };
@@ -148,8 +159,8 @@ pub fn parse(path: &Path) -> Result<Session> {
             id,
             parent_id: parent_id.filter(|value| !value.is_empty()),
             entry_type,
-            role,
-            content,
+            role: crate::formats::pi::tree_role(object, role),
+            content: extra.as_ref().or(content),
             timestamp: entry_timestamp,
             summary: object.get("summary").and_then(Value::as_str),
             short_summary: object.get("shortSummary").and_then(Value::as_str),
@@ -158,12 +169,21 @@ pub fn parse(path: &Path) -> Result<Session> {
     }
 
     let active_path = tree::active_path(&nodes);
-    let messages: Vec<Message> = tree::project_native_messages(&active_path);
+    let path_ids: Vec<&str> = active_path.iter().map(|node| node.id).collect();
+    let mut hints = hints_from_tree_records(&values, &path_ids);
+    hints.session_kind = session_kind;
+    let mut messages: Vec<Message> = tree::project_native_messages(&active_path);
+    if let Some(note) = compaction_note(hints.compaction_summary.as_deref()) {
+        messages.insert(0, note);
+    }
     let compaction_title = active_path
         .iter()
         .filter(|node| node.entry_type == Some("compaction"))
         .filter_map(|node| node.short_summary)
         .next_back();
+    if hints.compaction_summary.is_none() {
+        hints.compaction_summary = compaction_title.map(str::to_owned);
+    }
 
     let cwd = PathBuf::from(raw_cwd);
     let start_timestamp = if raw_timestamp.is_empty() {
@@ -189,6 +209,7 @@ pub fn parse(path: &Path) -> Result<Session> {
         messages,
         path: path.to_path_buf(),
         modified_epoch,
+        hints,
     })
 }
 
@@ -434,6 +455,23 @@ mod tests {
         let file = write_session(&[header, &msg("a", None, "user", r#""ignored for summary""#)]);
         let session = parse(file.path()).expect("parse");
         assert_eq!(session.summary, "Header Title Here");
+        assert_eq!(session.hints.session_kind, None);
+    }
+
+    #[test]
+    fn session_header_kind_lands_on_hints() {
+        let header = r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","sessionKind":"workflowPlanner"}"#;
+        let file = write_session(&[
+            r#"{"type":"title","v":1,"title":"Planner","updatedAt":"2026-01-01T00:00:00.000Z","pad":""}"#,
+            header,
+            &msg("a", None, "user", r#""plan""#),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(
+            session.hints.session_kind.as_deref(),
+            Some("workflowPlanner")
+        );
+        assert!(session.is_catalog_child());
     }
 
     #[test]
@@ -520,9 +558,10 @@ mod tests {
             &msg("m4", Some("m3"), "developer", r#""dev""#),
         ]);
         let session = parse(file.path()).expect("parse");
-        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages.len(), 3);
         assert_eq!(session.messages[0].role, Role::User);
         assert_eq!(session.messages[1].role, Role::Assistant);
+        assert_eq!(session.messages[2].role, Role::Tool);
     }
 
     #[test]
@@ -564,8 +603,12 @@ mod tests {
             .iter()
             .map(|message| message.text.as_str())
             .collect();
-        assert_eq!(texts, ["kept", "done"]);
+        assert_eq!(texts, ["full summary", "kept", "done"]);
         assert_eq!(session.summary, "compact title");
+        assert_eq!(
+            session.hints.compaction_summary.as_deref(),
+            Some("full summary")
+        );
     }
 
     #[test]

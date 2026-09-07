@@ -5,8 +5,10 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::domain::{FlexibleRecord, Message, Session, SourceTool};
-use crate::formats::{normalize, parsed_message, read_jsonl_values, summarize_messages};
+use crate::domain::{FlexibleRecord, Message, Session, SessionHints, SourceTool};
+use crate::formats::{
+    compaction_note, normalize, parsed_message, read_jsonl_values, summarize_messages,
+};
 
 /// Droid session-start record: strongly typed known fields with the remaining
 /// fields preserved verbatim in `extra`.
@@ -69,12 +71,25 @@ const PLACEHOLDER_TITLE: &str = "New Session";
 /// the lossy output. Malformed lines are isolated by `read_jsonl_values`.
 pub fn parse(path: &Path) -> Result<Session> {
     let values = read_jsonl_values(path)?;
-    let modified_epoch = fs::metadata(path).ok().map(|metadata| metadata_epoch(&metadata));
+    let modified_epoch = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata_epoch(&metadata));
 
     let mut session_start: Option<DroidSessionStart> = None;
     let mut messages: Vec<Message> = Vec::new();
+    let mut compaction_summary = None;
 
     for value in values {
+        if value.get("type").and_then(Value::as_str) == Some("compaction_state") {
+            if let Some(summary) = ["summary", "text", "message"]
+                .into_iter()
+                .find_map(|key| value.get(key).and_then(Value::as_str))
+                .filter(|text| !text.is_empty())
+            {
+                compaction_summary = Some(summary.to_owned());
+            }
+            continue;
+        }
         match classify(value) {
             FlexibleRecord::Known(DroidRecord::SessionStart(start)) => {
                 if session_start.is_none() {
@@ -116,6 +131,26 @@ pub fn parse(path: &Path) -> Result<Session> {
         .and_then(|message| message.timestamp.clone());
 
     let summary = summary_for(session_start.as_ref(), &messages);
+    if let Some(note) = compaction_note(compaction_summary.as_deref()) {
+        messages.insert(0, note);
+    }
+    let hints = SessionHints {
+        model: session_start.as_ref().and_then(|start| {
+            ["model", "modelId"]
+                .into_iter()
+                .find_map(|key| start.extra.get(key).and_then(Value::as_str))
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        }),
+        thinking_level: session_start.as_ref().and_then(|start| {
+            ["thinkingLevel", "reasoning_effort", "effort"]
+                .into_iter()
+                .find_map(|key| start.extra.get(key).and_then(Value::as_str))
+                .and_then(|value| value.parse().ok())
+        }),
+        compaction_summary,
+        ..SessionHints::default()
+    };
 
     Ok(Session {
         tool: SourceTool::Droid,
@@ -126,6 +161,7 @@ pub fn parse(path: &Path) -> Result<Session> {
         messages,
         path: path.to_path_buf(),
         modified_epoch,
+        hints,
     })
 }
 
@@ -140,11 +176,20 @@ fn classify(record: Value) -> FlexibleRecord<DroidRecord> {
     match type_tag.as_deref() {
         Some("session_start") => serde_json::from_value::<DroidSessionStart>(record.clone())
             .map(|parsed| FlexibleRecord::Known(DroidRecord::SessionStart(parsed)))
-            .unwrap_or(FlexibleRecord::Unknown { type_tag, raw: record }),
+            .unwrap_or(FlexibleRecord::Unknown {
+                type_tag,
+                raw: record,
+            }),
         Some("message") => serde_json::from_value::<DroidMessage>(record.clone())
             .map(|parsed| FlexibleRecord::Known(DroidRecord::Message(parsed)))
-            .unwrap_or(FlexibleRecord::Unknown { type_tag, raw: record }),
-        _ => FlexibleRecord::Unknown { type_tag, raw: record },
+            .unwrap_or(FlexibleRecord::Unknown {
+                type_tag,
+                raw: record,
+            }),
+        _ => FlexibleRecord::Unknown {
+            type_tag,
+            raw: record,
+        },
     }
 }
 
@@ -218,8 +263,7 @@ mod tests {
         file
     }
 
-    const SESSION_START: &str =
-        r#"{"type":"session_start","id":"abc-123","title":"hello world","owner":"test-user","version":2,"cwd":"/tmp"}"#;
+    const SESSION_START: &str = r#"{"type":"session_start","id":"abc-123","title":"hello world","owner":"test-user","version":2,"cwd":"/tmp"}"#;
     const USER_MSG: &str = r#"{"type":"message","id":"m1","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello world"}]}}"#;
     const ASSISTANT_MSG: &str = r#"{"type":"message","id":"m2","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi there!"}]}}"#;
 
@@ -231,14 +275,20 @@ mod tests {
         assert_eq!(session.tool, SourceTool::Droid);
         assert_eq!(session.session_id, "abc-123");
         assert_eq!(session.cwd, PathBuf::from("/tmp"));
-        assert_eq!(session.start_timestamp.as_deref(), Some("2026-01-01T00:00:00.000Z"));
+        assert_eq!(
+            session.start_timestamp.as_deref(),
+            Some("2026-01-01T00:00:00.000Z")
+        );
         assert_eq!(session.summary, "hello world");
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].role, Role::User);
         assert_eq!(session.messages[0].text, "hello world");
         assert_eq!(session.messages[1].role, Role::Assistant);
         assert_eq!(session.messages[1].text, "Hi there!");
-        assert_eq!(session.messages[1].timestamp.as_deref(), Some("2026-01-01T00:00:01.000Z"));
+        assert_eq!(
+            session.messages[1].timestamp.as_deref(),
+            Some("2026-01-01T00:00:01.000Z")
+        );
         assert_eq!(session.path, file.path());
         assert!(session.modified_epoch.is_some());
     }
@@ -251,7 +301,10 @@ mod tests {
         let session = parse(file.path()).expect("parse");
 
         assert_eq!(session.session_id, "ns-1");
-        assert_eq!(session.summary, "Please fix the off-by-one bug in the parser");
+        assert_eq!(
+            session.summary,
+            "Please fix the off-by-one bug in the parser"
+        );
         assert_eq!(session.messages.len(), 1);
     }
 
@@ -268,7 +321,8 @@ mod tests {
 
     #[test]
     fn title_used_when_session_title_absent() {
-        let start = r#"{"type":"session_start","id":"t-1","title":"Real Title","cwd":"/tmp","version":2}"#;
+        let start =
+            r#"{"type":"session_start","id":"t-1","title":"Real Title","cwd":"/tmp","version":2}"#;
         let file = session_file(&[start]);
         let session = parse(file.path()).expect("parse");
         assert_eq!(session.summary, "Real Title");
@@ -321,6 +375,26 @@ mod tests {
     }
 
     #[test]
+    fn compaction_state_summary_becomes_a_note() {
+        let compaction = r#"{"type":"compaction_state","id":"c1","summary":"prior context"}"#;
+        let file = session_file(&[SESSION_START, compaction, USER_MSG]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(
+            session.hints.compaction_summary.as_deref(),
+            Some("prior context")
+        );
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    crate::domain::ContentPart::Note { kind, text }
+                        if kind == "compaction" && text == "prior context"
+                )
+            })
+        }));
+    }
+
+    #[test]
     fn unknown_records_are_preserved_internally_and_skipped() {
         let compaction = r#"{"type":"compaction_state","id":"c1","tokens":4096}"#;
         let todo = r#"{"type":"todo_state","items":[{"text":"do thing","done":false}]}"#;
@@ -340,7 +414,8 @@ mod tests {
         // session-start fails, so the record is preserved as raw unknown and
         // contributes neither a session id nor a title. The file stem backs the
         // id and the summary upgrades to the user-message summary.
-        let bad_start = r#"{"type":"session_start","id":12345,"title":"x","cwd":"/tmp","version":2}"#;
+        let bad_start =
+            r#"{"type":"session_start","id":12345,"title":"x","cwd":"/tmp","version":2}"#;
         let file = session_file(&[bad_start, USER_MSG]);
         let session = parse(file.path()).expect("parse");
 
@@ -380,7 +455,10 @@ mod tests {
             .to_owned();
         assert_eq!(session.session_id, stem);
         assert_eq!(session.cwd, file.path().parent().unwrap().to_path_buf());
-        assert_eq!(session.start_timestamp.as_deref(), Some("2026-01-01T00:00:00.000Z"));
+        assert_eq!(
+            session.start_timestamp.as_deref(),
+            Some("2026-01-01T00:00:00.000Z")
+        );
     }
 
     #[test]
@@ -389,7 +467,7 @@ mod tests {
         let file = session_file(&[SESSION_START, msg]);
         let session = parse(file.path()).expect("parse");
         assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].text, "first answer");
+        assert_eq!(session.messages[0].text, "first answer\nsecond answer");
     }
 
     #[test]

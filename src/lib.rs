@@ -14,6 +14,7 @@ pub mod sessions;
 
 pub(crate) mod cli;
 pub(crate) mod launcher;
+pub(crate) mod new;
 pub(crate) mod picker;
 pub(crate) mod sync;
 pub(crate) mod tmux;

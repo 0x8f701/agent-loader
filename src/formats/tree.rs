@@ -71,12 +71,8 @@ pub fn active_path<'a>(nodes: &'a [TreeNode<'a>]) -> Vec<&'a TreeNode<'a>> {
     path
 }
 
-/// Project an ordered (root → leaf) path of nodes into first-text `Message`s,
-/// keeping only recognized `user`/`assistant` roles.
-///
-/// Projection is lossy: unrecognized roles, empty content, and non-message
-/// entries are dropped. The shared `parsed_message` helper performs the role
-/// parse and first-text extraction, so this stays a thin, ordered filter.
+/// Project an ordered (root → leaf) path of nodes into portable `Message`s,
+/// keeping recognized `user`/`assistant`/`tool` roles and every content part.
 pub fn project_messages<'a>(path: &[&'a TreeNode<'a>]) -> Vec<Message> {
     path.iter()
         .filter_map(|node| parsed_message(node.role, node.content, node.timestamp))
@@ -270,9 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn project_messages_drops_unrecognized_roles_and_non_message_entries() {
-        // toolResult / developer roles and a non-message entry (no role) sit
-        // on the path but must not survive projection.
+    fn project_messages_keeps_tool_results_and_drops_unknown_roles() {
         let u = json!([{"type": "text", "text": "q"}]);
         let a = json!([{"type": "text", "text": "ans"}]);
         let tr = json!([{"type": "text", "text": "tool out"}]);
@@ -286,9 +280,11 @@ mod tests {
         ];
         let path = active_path(&nodes);
         let messages = project_messages(&path);
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].text, "q");
         assert_eq!(messages[1].text, "ans");
+        assert_eq!(messages[2].role, crate::domain::Role::Tool);
+        assert_eq!(messages[2].text, "tool out");
     }
 
     #[test]

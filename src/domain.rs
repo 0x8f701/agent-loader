@@ -172,6 +172,7 @@ pub struct ToolParseError(String);
 pub enum Role {
     User,
     Assistant,
+    Tool,
 }
 
 impl Role {
@@ -179,7 +180,12 @@ impl Role {
         match self {
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::Tool => "tool",
         }
+    }
+
+    pub const fn is_conversation(self) -> bool {
+        matches!(self, Self::User | Self::Assistant)
     }
 }
 
@@ -196,6 +202,7 @@ impl FromStr for Role {
         match value {
             "user" => Ok(Self::User),
             "assistant" => Ok(Self::Assistant),
+            "tool" | "toolResult" | "tool_result" => Ok(Self::Tool),
             _ => Err(RoleParseError(value.to_owned())),
         }
     }
@@ -209,11 +216,106 @@ pub struct RoleParseError(String);
 #[error("unsupported thinking level: {0}")]
 pub struct ThinkingLevelParseError(String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One portable content block shared across source and target formats.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContentPart {
+    Text(String),
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
+    Image {
+        mime_type: Option<String>,
+        data: String,
+    },
+    Note {
+        kind: String,
+        text: String,
+    },
+}
+
+impl ContentPart {
+    pub fn searchable_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text)
+            | Self::Thinking { text, .. }
+            | Self::ToolResult { content: text, .. }
+            | Self::Note { text, .. } => (!text.is_empty()).then_some(text.as_str()),
+            Self::ToolUse { name, .. } => (!name.is_empty()).then_some(name.as_str()),
+            Self::Image { .. } => Some("[Image]"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Message {
     pub role: Role,
     pub text: String,
     pub timestamp: Option<String>,
+    pub parts: Vec<ContentPart>,
+}
+
+impl Message {
+    pub fn plain(role: Role, text: impl Into<String>, timestamp: Option<String>) -> Self {
+        let text = text.into();
+        let parts = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentPart::Text(text.clone())]
+        };
+        Self {
+            role,
+            text,
+            timestamp,
+            parts,
+        }
+    }
+
+    pub fn from_parts(role: Role, parts: Vec<ContentPart>, timestamp: Option<String>) -> Self {
+        let text = joined_text(&parts);
+        Self {
+            role,
+            text,
+            timestamp,
+            parts,
+        }
+    }
+
+    pub fn effective_parts(&self) -> Vec<ContentPart> {
+        if self.parts.is_empty() && !self.text.is_empty() {
+            vec![ContentPart::Text(self.text.clone())]
+        } else {
+            self.parts.clone()
+        }
+    }
+}
+
+pub fn joined_text(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(ContentPart::searchable_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionHints {
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub thinking_level: Option<ThinkingLevel>,
+    pub compaction_summary: Option<String>,
+    pub session_kind: Option<String>,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +328,25 @@ pub struct Session {
     pub messages: Vec<Message>,
     pub path: PathBuf,
     pub modified_epoch: Option<f64>,
+    pub hints: SessionHints,
+}
+
+impl Session {
+    /// Workflow/subagent children that should stay out of the default catalog.
+    ///
+    /// Absent `sessionKind` is a user session. `parentSession` alone is a user
+    /// fork or rotation and stays visible. Grok `hidden: true` is also hidden.
+    pub fn is_catalog_child(&self) -> bool {
+        self.hints.hidden || is_internal_session_kind(self.hints.session_kind.as_deref())
+    }
+}
+
+/// Native workflow/subagent kinds. Missing or `user` is a first-class session.
+pub fn is_internal_session_kind(kind: Option<&str>) -> bool {
+    let Some(kind) = kind.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    !kind.eq_ignore_ascii_case("user")
 }
 
 #[derive(Debug, Clone)]
@@ -243,7 +364,10 @@ pub struct SessionRow {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlexibleRecord<T> {
     Known(T),
-    Unknown { type_tag: Option<String>, raw: Value },
+    Unknown {
+        type_tag: Option<String>,
+        raw: Value,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -289,20 +413,23 @@ impl FromStr for ThinkingLevel {
     type Err = ThinkingLevelParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
+        let normalized = value
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_', ' '], "");
+        match normalized.as_str() {
             "off" => Ok(Self::Off),
-            "minimal" => Ok(Self::Minimal),
+            "minimal" | "min" => Ok(Self::Minimal),
             "low" => Ok(Self::Low),
-            "medium" => Ok(Self::Medium),
+            "medium" | "med" => Ok(Self::Medium),
             "high" => Ok(Self::High),
-            "xhigh" => Ok(Self::XHigh),
-            "max" => Ok(Self::Max),
+            "xhigh" | "extrahigh" => Ok(Self::XHigh),
+            "max" | "maximum" => Ok(Self::Max),
             "auto" => Ok(Self::Auto),
             _ => Err(ThinkingLevelParseError(value.to_owned())),
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -330,11 +457,36 @@ mod tests {
     }
 
     #[test]
-    fn role_from_str_accepts_user_and_assistant_only() {
+    fn role_from_str_accepts_user_assistant_and_tool() {
         assert_eq!("user".parse::<Role>().unwrap(), Role::User);
         assert_eq!("assistant".parse::<Role>().unwrap(), Role::Assistant);
+        assert_eq!("tool".parse::<Role>().unwrap(), Role::Tool);
+        assert_eq!("toolResult".parse::<Role>().unwrap(), Role::Tool);
+        assert_eq!("tool_result".parse::<Role>().unwrap(), Role::Tool);
         let error = "system".parse::<Role>().expect_err("invalid role");
         assert_eq!(error.to_string(), "unsupported message role: system");
+    }
+
+    #[test]
+    fn message_from_parts_joins_searchable_text() {
+        let message = Message::from_parts(
+            Role::Assistant,
+            vec![
+                ContentPart::Thinking {
+                    text: "plan".to_owned(),
+                    signature: None,
+                },
+                ContentPart::Text("answer".to_owned()),
+                ContentPart::ToolUse {
+                    id: "c1".to_owned(),
+                    name: "read".to_owned(),
+                    input: json!({"path": "a.rs"}),
+                },
+            ],
+            None,
+        );
+        assert_eq!(message.text, "plan\nanswer\nread");
+        assert_eq!(message.effective_parts().len(), 3);
     }
 
     #[test]
@@ -352,6 +504,18 @@ mod tests {
         for (spelling, expected) in levels {
             assert_eq!(spelling.parse::<ThinkingLevel>().unwrap(), expected);
         }
+        assert_eq!(
+            "High".parse::<ThinkingLevel>().unwrap(),
+            ThinkingLevel::High
+        );
+        assert_eq!(
+            "x-high".parse::<ThinkingLevel>().unwrap(),
+            ThinkingLevel::XHigh
+        );
+        assert_eq!(
+            "extra_high".parse::<ThinkingLevel>().unwrap(),
+            ThinkingLevel::XHigh
+        );
         let error = "turbo".parse::<ThinkingLevel>().expect_err("invalid level");
         assert_eq!(error.to_string(), "unsupported thinking level: turbo");
     }
@@ -400,7 +564,11 @@ mod tests {
             type_tag: Some("mystery".to_owned()),
             raw: raw.clone(),
         };
-        let FlexibleRecord::Unknown { type_tag, raw: record_raw } = &record else {
+        let FlexibleRecord::Unknown {
+            type_tag,
+            raw: record_raw,
+        } = &record
+        else {
             panic!("expected Unknown");
         };
         assert_eq!(type_tag.as_deref(), Some("mystery"));
@@ -414,6 +582,37 @@ mod tests {
             raw: round_tripped,
         };
         assert_eq!(record, rebuilt);
+    }
+
+    #[test]
+    fn catalog_child_hides_internal_kinds_but_not_user_forks() {
+        let mut session = Session {
+            tool: SourceTool::Pi,
+            session_id: "s".to_owned(),
+            cwd: PathBuf::from("/workspace/project"),
+            start_timestamp: None,
+            summary: String::new(),
+            messages: Vec::new(),
+            path: PathBuf::from("/tmp/s.jsonl"),
+            modified_epoch: None,
+            hints: SessionHints::default(),
+        };
+        assert!(!session.is_catalog_child());
+        session.hints.session_kind = Some("user".to_owned());
+        assert!(!session.is_catalog_child());
+        session.hints.session_kind = Some("workflowWorker".to_owned());
+        assert!(session.is_catalog_child());
+        session.hints.session_kind = Some("subagent_resume".to_owned());
+        assert!(session.is_catalog_child());
+        session.hints.session_kind = Some(String::new());
+        assert!(!session.is_catalog_child());
+        session.hints.session_kind = Some("  ".to_owned());
+        assert!(!session.is_catalog_child());
+        session.hints.session_kind = Some("disposable".to_owned());
+        assert!(session.is_catalog_child());
+        session.hints.session_kind = None;
+        session.hints.hidden = true;
+        assert!(session.is_catalog_child());
     }
 
     #[test]

@@ -12,11 +12,11 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::domain::{Role, Session, TargetTool, ThinkingLevel};
+use crate::domain::{ContentPart, Message, Role, Session, TargetTool, ThinkingLevel};
 use crate::fs::atomic_write_jsonl;
 
 const MAX_FILESYSTEM_COMPONENT_BYTES: usize = 255;
-const CLAUDE_VERSION: &str = "2.1.220";
+const CLAUDE_VERSION: &str = "2.1.226";
 const DEFAULT_GROK_MODEL: &str = "grok-4.5";
 
 const URL_PATH_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -425,9 +425,11 @@ pub fn emit_with_defaults<D: EmitDefaults>(
             write_jsonl(&output, &records)?;
         }
         TargetTool::Grok | TargetTool::Hyper => {
-            let model = context
-                .grok_model
+            let model = session
+                .hints
+                .model
                 .clone()
+                .or_else(|| context.grok_model.clone())
                 .unwrap_or_else(|| defaults.grok_model());
             let bundle = emit_grok(session, cwd, &session_id, start, &model);
             write_grok_bundle(&output, cwd, &bundle, defaults)?;
@@ -448,66 +450,84 @@ fn emit_pi<D: EmitDefaults>(
     start: DateTime<Utc>,
     defaults: &mut D,
 ) -> Vec<Value> {
+    let provider = session
+        .hints
+        .provider
+        .clone()
+        .unwrap_or_else(|| "sessions-convert".to_owned());
+    let model = session
+        .hints
+        .model
+        .clone()
+        .unwrap_or_else(|| format!("converted-from-{}", session.tool));
+    let thinking_level = session.hints.thinking_level.unwrap_or(ThinkingLevel::Off);
     let model_id = short_id(defaults.next_uuid());
     let thinking_id = short_id(defaults.next_uuid());
+    let mut header = json!({
+        "type": "session",
+        "version": 3,
+        "id": session_id,
+        "timestamp": fmt_iso(start),
+        "cwd": cwd,
+    });
+    if let Some(kind) = session
+        .hints
+        .session_kind
+        .as_deref()
+        .filter(|kind| !kind.is_empty())
+    {
+        header
+            .as_object_mut()
+            .expect("JSON object")
+            .insert("sessionKind".to_owned(), json!(kind));
+    }
     let mut records = vec![
-        json!({
-            "type": "session",
-            "version": 3,
-            "id": session_id,
-            "timestamp": fmt_iso(start),
-            "cwd": cwd,
-        }),
+        header,
         json!({
             "type": "model_change",
             "id": model_id,
             "parentId": null,
             "timestamp": fmt_iso(start + TimeDelta::milliseconds(100)),
-            "provider": "sessions-convert",
-            "modelId": format!("converted-from-{}", session.tool),
+            "provider": provider,
+            "modelId": model,
         }),
         json!({
             "type": "thinking_level_change",
             "id": thinking_id,
             "parentId": model_id,
             "timestamp": fmt_iso(start + TimeDelta::milliseconds(200)),
-            "thinkingLevel": "off",
+            "thinkingLevel": thinking_level.as_str(),
         }),
     ];
     let mut parent_id = thinking_id;
+    push_tree_compaction_hint(
+        session,
+        &mut records,
+        &mut parent_id,
+        start + TimeDelta::milliseconds(300),
+        defaults,
+    );
     for (index, message) in session.messages.iter().enumerate() {
-        let message_id = short_id(defaults.next_uuid());
         let timestamp = message_time(session, message.timestamp.as_deref(), index, start);
-        let mut payload = serde_json::Map::new();
-        payload.insert("role".to_owned(), json!(message.role.as_str()));
-        payload.insert(
-            "content".to_owned(),
-            json!([{ "type": "text", "text": message.text }]),
-        );
-        payload.insert("timestamp".to_owned(), json!(timestamp.timestamp_millis()));
-        payload.insert("usage".to_owned(), zero_usage());
-        if message.role == Role::Assistant {
-            payload.insert("api".to_owned(), json!("openai-completions"));
-            payload.insert("provider".to_owned(), json!("sessions-convert"));
-            payload.insert(
-                "model".to_owned(),
-                json!(format!("converted-from-{}", session.tool)),
-            );
-            payload.insert("stopReason".to_owned(), json!("stop"));
-            payload.insert(
-                "responseId".to_owned(),
-                json!(format!(
-                    "converted-{}",
-                    compact_id(defaults.next_uuid(), 12)
-                )),
-            );
+        let (notes, rest) = split_notes(message);
+        push_tree_notes(&mut records, &mut parent_id, notes, timestamp, defaults);
+        if rest.is_empty() {
+            continue;
         }
+        let rest_message = Message::from_parts(message.role, rest, message.timestamp.clone());
+        let message_id = short_id(defaults.next_uuid());
         records.push(json!({
             "type": "message",
             "id": message_id,
             "parentId": parent_id,
             "timestamp": fmt_iso(timestamp),
-            "message": payload,
+            "message": pi_message_payload(
+                &rest_message,
+                timestamp,
+                defaults,
+                &provider,
+                &model,
+            ),
         }));
         parent_id = message_id;
     }
@@ -522,7 +542,23 @@ fn emit_omp<D: EmitDefaults>(
     runtime: &OmpRuntime,
     defaults: &mut D,
 ) -> Result<Vec<Value>> {
-    let (provider, model) = runtime.provider_and_model()?;
+    let (runtime_provider, runtime_model) = runtime.provider_and_model()?;
+    let provider = session
+        .hints
+        .provider
+        .as_deref()
+        .unwrap_or(runtime_provider);
+    let model = session.hints.model.as_deref().unwrap_or(runtime_model);
+    let model_selector = match (&session.hints.provider, &session.hints.model) {
+        (Some(hint_provider), Some(hint_model)) => format!("{hint_provider}/{hint_model}"),
+        (None, Some(hint_model)) if hint_model.contains('/') => hint_model.clone(),
+        (None, Some(hint_model)) => format!("{provider}/{hint_model}"),
+        _ => runtime.model.clone(),
+    };
+    let thinking_level = session
+        .hints
+        .thinking_level
+        .unwrap_or(runtime.thinking_level);
     let model_id = short_id(defaults.next_uuid());
     let thinking_id = short_id(defaults.next_uuid());
     // Native OMP files begin with a fixed-width title-slot record. The native
@@ -530,62 +566,72 @@ fn emit_omp<D: EmitDefaults>(
     // plain JSONL record with an empty `pad` is native-readable; the slot's
     // non-empty title overrides the `session` header title on load.
     let title_slot = omp_title_slot(session.summary.as_str(), fmt_iso(start));
+    let mut header = json!({
+        "type": "session",
+        "version": 3,
+        "id": session_id,
+        "timestamp": fmt_iso(start),
+        "cwd": cwd,
+        "title": session.summary,
+    });
+    if let Some(kind) = session
+        .hints
+        .session_kind
+        .as_deref()
+        .filter(|kind| !kind.is_empty())
+    {
+        header
+            .as_object_mut()
+            .expect("JSON object")
+            .insert("sessionKind".to_owned(), json!(kind));
+    }
     let mut records = vec![
         title_slot,
-        json!({
-            "type": "session",
-            "version": 3,
-            "id": session_id,
-            "timestamp": fmt_iso(start),
-            "cwd": cwd,
-            "title": session.summary,
-        }),
+        header,
         json!({
             "type": "model_change",
             "id": model_id,
             "parentId": null,
             "timestamp": fmt_iso(start + TimeDelta::milliseconds(100)),
-            "model": runtime.model,
+            "model": model_selector,
         }),
         json!({
             "type": "thinking_level_change",
             "id": thinking_id,
             "parentId": model_id,
             "timestamp": fmt_iso(start + TimeDelta::milliseconds(200)),
-            "thinkingLevel": runtime.thinking_level.as_str(),
+            "thinkingLevel": thinking_level.as_str(),
         }),
     ];
     let mut parent_id = thinking_id;
+    push_tree_compaction_hint(
+        session,
+        &mut records,
+        &mut parent_id,
+        start + TimeDelta::milliseconds(300),
+        defaults,
+    );
     for (index, message) in session.messages.iter().enumerate() {
-        let message_id = short_id(defaults.next_uuid());
         let timestamp = message_time(session, message.timestamp.as_deref(), index, start);
-        let mut payload = serde_json::Map::new();
-        payload.insert("role".to_owned(), json!(message.role.as_str()));
-        payload.insert(
-            "content".to_owned(),
-            json!([{ "type": "text", "text": message.text }]),
-        );
-        payload.insert("timestamp".to_owned(), json!(timestamp.timestamp_millis()));
-        payload.insert("usage".to_owned(), zero_usage());
-        if message.role == Role::Assistant {
-            payload.insert("api".to_owned(), json!("openai-completions"));
-            payload.insert("provider".to_owned(), json!(provider));
-            payload.insert("model".to_owned(), json!(model));
-            payload.insert("stopReason".to_owned(), json!("stop"));
-            payload.insert(
-                "responseId".to_owned(),
-                json!(format!(
-                    "converted-{}",
-                    compact_id(defaults.next_uuid(), 12)
-                )),
-            );
+        let (notes, rest) = split_notes(message);
+        push_tree_notes(&mut records, &mut parent_id, notes, timestamp, defaults);
+        if rest.is_empty() {
+            continue;
         }
+        let rest_message = Message::from_parts(message.role, rest, message.timestamp.clone());
+        let message_id = short_id(defaults.next_uuid());
         records.push(json!({
             "type": "message",
             "id": message_id,
             "parentId": parent_id,
             "timestamp": fmt_iso(timestamp),
-            "message": payload,
+            "message": pi_message_payload(
+                &rest_message,
+                timestamp,
+                defaults,
+                provider,
+                model,
+            ),
         }));
         parent_id = message_id;
     }
@@ -617,7 +663,7 @@ fn emit_droid<D: EmitDefaults>(
     owner: &str,
     defaults: &mut D,
 ) -> Vec<Value> {
-    let mut records = vec![json!({
+    let mut start_record = json!({
         "type": "session_start",
         "id": session_id,
         "title": session.summary,
@@ -627,18 +673,78 @@ fn emit_droid<D: EmitDefaults>(
         "cwd": cwd,
         "isSessionTitleManuallySet": false,
         "sessionTitleAutoStage": "first_message",
-    })];
+    });
+    if let Some(model) = &session.hints.model {
+        start_record
+            .as_object_mut()
+            .expect("JSON object")
+            .insert("model".to_owned(), json!(model));
+    }
+    if let Some(level) = session.hints.thinking_level {
+        start_record
+            .as_object_mut()
+            .expect("JSON object")
+            .insert("thinkingLevel".to_owned(), json!(level.as_str()));
+    }
+    let mut records = vec![start_record];
+    if !has_compaction_note(session) {
+        if let Some(text) = session
+            .hints
+            .compaction_summary
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
+            records.push(json!({
+                "type": "compaction_state",
+                "id": defaults.next_uuid().to_string(),
+                "summary": text,
+            }));
+        }
+    }
     let mut parent_id: Option<String> = None;
     for (index, message) in session.messages.iter().enumerate() {
-        let message_id = defaults.next_uuid().to_string();
         let timestamp = message_time(session, message.timestamp.as_deref(), index, start);
+        let (notes, rest) = split_notes(message);
+        for (kind, text) in notes {
+            let note_id = defaults.next_uuid().to_string();
+            if kind == "compaction" {
+                records.push(json!({
+                    "type": "compaction_state",
+                    "id": note_id,
+                    "summary": text,
+                }));
+            } else {
+                let mut record = json!({
+                    "type": "message",
+                    "id": note_id,
+                    "timestamp": fmt_iso(timestamp),
+                    "message": {
+                        "role": "user",
+                        "content": [{ "type": "text", "text": text }],
+                    },
+                });
+                if let Some(parent_id) = &parent_id {
+                    record
+                        .as_object_mut()
+                        .expect("JSON object")
+                        .insert("parentId".to_owned(), json!(parent_id));
+                }
+                records.push(record);
+                parent_id = Some(note_id);
+            }
+        }
+        if rest.is_empty() {
+            continue;
+        }
+        let rest_message = Message::from_parts(message.role, rest, message.timestamp.clone());
+        let message_id = defaults.next_uuid().to_string();
         let mut record = json!({
             "type": "message",
             "id": message_id,
             "timestamp": fmt_iso(timestamp),
             "message": {
-                "role": message.role.as_str(),
-                "content": [{ "type": "text", "text": message.text }],
+                "role": droid_role(&rest_message),
+                "content": claude_content_blocks(&rest_message),
             },
         });
         if let Some(parent_id) = &parent_id {
@@ -672,7 +778,11 @@ fn emit_codex(
                 "originator": "codex",
                 "source": "cli",
                 "cli_version": env!("CARGO_PKG_VERSION"),
-                "model_provider": runtime.provider,
+                "model_provider": session
+                    .hints
+                    .provider
+                    .as_deref()
+                    .unwrap_or(&runtime.provider),
             },
         }),
         json!({
@@ -682,59 +792,55 @@ fn emit_codex(
                 "cwd": cwd,
                 "approval_policy": "never",
                 "sandbox_policy": { "type": "read-only" },
-                "model": runtime.model,
+                "model": session.hints.model.as_deref().unwrap_or(&runtime.model),
                 "summary": "auto",
+                "reasoning_effort": session
+                    .hints
+                    .thinking_level
+                    .map(|level| level.as_str())
+                    .unwrap_or("auto"),
             },
         }),
     ];
+    if !has_compaction_note(session) {
+        if let Some(text) = session
+            .hints
+            .compaction_summary
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
+            records.push(json!({
+                "timestamp": timestamp,
+                "type": "compacted",
+                "payload": { "message": text },
+            }));
+        }
+    }
     for (index, message) in session.messages.iter().enumerate() {
         let timestamp = message_time(session, message.timestamp.as_deref(), index, start);
         let timestamp_text = fmt_iso(timestamp);
-        let content_type = if message.role == Role::User {
-            "input_text"
-        } else {
-            "output_text"
-        };
-        let response_item = json!({
-            "timestamp": timestamp_text,
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": message.role.as_str(),
-                "content": [{ "type": content_type, "text": message.text }],
-            },
-        });
-        let event = if message.role == Role::User {
-            json!({
-                "timestamp": timestamp_text,
-                "type": "event_msg",
-                "payload": {
-                    "type": "user_message",
-                    "message": message.text,
-                    "images": [],
-                    "local_images": [],
-                    "text_elements": [],
-                },
-            })
-        } else {
-            json!({
-                "timestamp": timestamp_text,
-                "type": "event_msg",
-                "payload": {
-                    "type": "agent_message",
-                    "message": message.text,
-                    "phase": null,
-                    "memory_citation": null,
-                },
-            })
-        };
-        if message.role == Role::User {
-            records.push(response_item);
-            records.push(event);
-        } else {
-            records.push(event);
-            records.push(response_item);
+        let (notes, rest) = split_notes(message);
+        for (kind, text) in notes {
+            if kind == "compaction" {
+                records.push(json!({
+                    "timestamp": timestamp_text,
+                    "type": "compacted",
+                    "payload": { "message": text },
+                }));
+            } else {
+                let note = Message::from_parts(
+                    message.role,
+                    vec![ContentPart::Text(text)],
+                    message.timestamp.clone(),
+                );
+                records.extend(codex_records(&note, &timestamp_text));
+            }
         }
+        if rest.is_empty() {
+            continue;
+        }
+        let rest_message = Message::from_parts(message.role, rest, message.timestamp.clone());
+        records.extend(codex_records(&rest_message, &timestamp_text));
     }
     records
 }
@@ -749,10 +855,85 @@ fn emit_claude<D: EmitDefaults>(
     let mut records =
         Vec::with_capacity(session.messages.len() + usize::from(!session.messages.is_empty()));
     let mut parent_uuid: Option<String> = None;
-    let mut last_user_text = "";
+    let mut last_user_text = String::new();
+    let model = session
+        .hints
+        .model
+        .clone()
+        .unwrap_or_else(|| format!("converted-from-{}", session.tool));
+    if !has_compaction_note(session) {
+        if let Some(text) = session
+            .hints
+            .compaction_summary
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
+            let message_uuid = defaults.next_uuid().to_string();
+            records.push(json!({
+                "parentUuid": parent_uuid,
+                "isSidechain": false,
+                "userType": "external",
+                "cwd": cwd,
+                "sessionId": session_id,
+                "version": CLAUDE_VERSION,
+                "gitBranch": "",
+                "type": "user",
+                "isCompactSummary": true,
+                "uuid": message_uuid,
+                "timestamp": fmt_iso(start),
+                "message": { "role": "user", "content": text },
+                "permissionMode": "default",
+            }));
+            parent_uuid = Some(message_uuid);
+        }
+    }
     for (index, message) in session.messages.iter().enumerate() {
-        let message_uuid = defaults.next_uuid().to_string();
         let timestamp = message_time(session, message.timestamp.as_deref(), index, start);
+        let (notes, rest) = split_notes(message);
+        for (kind, text) in notes {
+            let message_uuid = defaults.next_uuid().to_string();
+            if kind == "compaction" {
+                records.push(json!({
+                    "parentUuid": parent_uuid,
+                    "isSidechain": false,
+                    "userType": "external",
+                    "cwd": cwd,
+                    "sessionId": session_id,
+                    "version": CLAUDE_VERSION,
+                    "gitBranch": "",
+                    "type": "user",
+                    "isCompactSummary": true,
+                    "uuid": message_uuid,
+                    "timestamp": fmt_iso(timestamp),
+                    "message": { "role": "user", "content": text },
+                    "permissionMode": "default",
+                }));
+            } else {
+                records.push(json!({
+                    "parentUuid": parent_uuid,
+                    "isSidechain": false,
+                    "userType": "external",
+                    "cwd": cwd,
+                    "sessionId": session_id,
+                    "version": CLAUDE_VERSION,
+                    "gitBranch": "",
+                    "type": "attachment",
+                    "uuid": message_uuid,
+                    "timestamp": fmt_iso(timestamp),
+                    "attachment": {
+                        "type": kind,
+                        "content": text,
+                    },
+                }));
+            }
+            parent_uuid = Some(message_uuid);
+        }
+        if rest.is_empty() {
+            continue;
+        }
+        let rest_message = Message::from_parts(message.role, rest, message.timestamp.clone());
+        let message_uuid = defaults.next_uuid().to_string();
+        let record_type = claude_record_type(&rest_message);
         let mut record = json!({
             "parentUuid": parent_uuid,
             "isSidechain": false,
@@ -761,32 +942,39 @@ fn emit_claude<D: EmitDefaults>(
             "sessionId": session_id,
             "version": CLAUDE_VERSION,
             "gitBranch": "",
-            "type": message.role.as_str(),
+            "type": record_type,
             "uuid": message_uuid,
             "timestamp": fmt_iso(timestamp),
         });
         let object = record.as_object_mut().expect("JSON object");
-        if message.role == Role::User {
-            last_user_text = &message.text;
+        if record_type == "user" {
+            if rest_message.role == Role::User {
+                last_user_text = rest_message.text.clone();
+            }
             object.insert(
                 "message".to_owned(),
-                json!({ "role": "user", "content": message.text }),
+                json!({ "role": "user", "content": claude_user_content(&rest_message) }),
             );
             object.insert("permissionMode".to_owned(), json!("default"));
         } else {
-            object.insert(
-                "message".to_owned(),
-                json!({
-                    "model": format!("converted-from-{}", session.tool),
-                    "id": format!("msg_converted_{}", defaults.next_uuid().simple()),
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{ "type": "text", "text": message.text }],
-                    "stop_reason": "end_turn",
-                    "stop_sequence": null,
-                    "usage": { "input_tokens": 0, "output_tokens": 0 },
-                }),
-            );
+            let mut assistant = json!({
+                "model": model,
+                "id": format!("msg_converted_{}", defaults.next_uuid().simple()),
+                "type": "message",
+                "role": "assistant",
+                "content": claude_content_blocks(&rest_message),
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": { "input_tokens": 0, "output_tokens": 0 },
+            });
+            if let Some(level) = session.hints.thinking_level {
+                object.insert("effort".to_owned(), json!(level.as_str()));
+                assistant
+                    .as_object_mut()
+                    .expect("JSON object")
+                    .insert("effort".to_owned(), json!(level.as_str()));
+            }
+            object.insert("message".to_owned(), assistant);
         }
         records.push(record);
         parent_uuid = Some(message_uuid);
@@ -822,61 +1010,29 @@ fn emit_grok(
     for (index, message) in session.messages.iter().enumerate() {
         let timestamp = message_time(session, message.timestamp.as_deref(), index, start);
         end = timestamp;
-        let provenance = format!("converted-from-{}", session.tool);
-        let (chat_record, update_type, chunk_meta) = if message.role == Role::User {
-            let current_prompt = prompt_index;
-            prompt_index += 1;
-            (
-                json!({
-                    "type": "user",
-                    "content": [{ "type": "text", "text": message.text }],
-                    "prompt_index": current_prompt,
-                }),
-                "user_message_chunk",
-                json!({ "modelId": provenance, "promptIndex": current_prompt }),
-            )
-        } else {
-            (
-                json!({
-                    "type": "assistant",
-                    "content": message.text,
-                    "model_id": provenance,
-                }),
-                "agent_message_chunk",
-                json!({ "modelId": provenance }),
-            )
-        };
-        chat.push(chat_record);
-        updates.push(json!({
-            "timestamp": timestamp.timestamp(),
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": update_type,
-                    "content": { "type": "text", "text": message.text },
-                    "_meta": chunk_meta,
-                },
-                "_meta": {
-                    "eventId": format!("{session_id}-{}", index + 1),
-                    "agentTimestampMs": timestamp.timestamp_millis(),
-                },
-            },
-        }));
+        let provenance = model.to_owned();
+        let (chat_records, update_records) = grok_records(
+            message,
+            session_id,
+            timestamp,
+            &provenance,
+            &mut prompt_index,
+            index,
+        );
+        chat.extend(chat_records);
+        updates.extend(update_records);
     }
     GrokBundle {
-        summary: json!({
-            "info": { "id": session_id, "cwd": cwd },
-            "session_summary": session.summary,
-            "generated_title": session.summary,
-            "created_at": fmt_iso(start),
-            "updated_at": fmt_iso(end),
-            "last_active_at": fmt_iso(end),
-            "num_messages": updates.len(),
-            "num_chat_messages": chat.len(),
-            "current_model_id": model,
-            "chat_format_version": 1,
-        }),
+        summary: grok_summary(
+            session,
+            cwd,
+            session_id,
+            model,
+            start,
+            end,
+            chat.len(),
+            updates.len(),
+        ),
         chat,
         updates,
     }
@@ -962,6 +1118,868 @@ fn target_path(
         TargetTool::Agent => unreachable!("Agent emission rejected before path selection"),
     };
     Ok(path)
+}
+
+fn split_notes(message: &Message) -> (Vec<(String, String)>, Vec<ContentPart>) {
+    let mut notes = Vec::new();
+    let mut rest = Vec::new();
+    for part in message.effective_parts() {
+        match part {
+            ContentPart::Note { kind, text } => notes.push((kind, text)),
+            other => rest.push(other),
+        }
+    }
+    (notes, rest)
+}
+
+fn has_compaction_note(session: &Session) -> bool {
+    session.messages.iter().any(|message| {
+        message
+            .effective_parts()
+            .iter()
+            .any(|part| matches!(part, ContentPart::Note { kind, .. } if kind == "compaction"))
+    })
+}
+
+fn push_tree_compaction_hint<D: EmitDefaults>(
+    session: &Session,
+    records: &mut Vec<Value>,
+    parent_id: &mut String,
+    timestamp: DateTime<Utc>,
+    defaults: &mut D,
+) {
+    if has_compaction_note(session) {
+        return;
+    }
+    let Some(text) = session
+        .hints
+        .compaction_summary
+        .as_deref()
+        .filter(|text| !text.is_empty())
+    else {
+        return;
+    };
+    push_tree_notes(
+        records,
+        parent_id,
+        vec![("compaction".to_owned(), text.to_owned())],
+        timestamp,
+        defaults,
+    );
+}
+
+fn push_tree_notes<D: EmitDefaults>(
+    records: &mut Vec<Value>,
+    parent_id: &mut String,
+    notes: Vec<(String, String)>,
+    timestamp: DateTime<Utc>,
+    defaults: &mut D,
+) {
+    for (kind, text) in notes {
+        let message_id = short_id(defaults.next_uuid());
+        if kind == "compaction" {
+            records.push(json!({
+                "type": "compaction",
+                "id": message_id,
+                "parentId": parent_id,
+                "timestamp": fmt_iso(timestamp),
+                "summary": text,
+            }));
+        } else if kind == "branch_summary" {
+            records.push(json!({
+                "type": "branch_summary",
+                "id": message_id,
+                "parentId": parent_id,
+                "timestamp": fmt_iso(timestamp),
+                "fromId": parent_id,
+                "summary": text,
+            }));
+        } else {
+            records.push(json!({
+                "type": "custom_message",
+                "id": message_id,
+                "parentId": parent_id,
+                "timestamp": fmt_iso(timestamp),
+                "customType": kind,
+                "content": text,
+                "display": true,
+            }));
+        }
+        *parent_id = message_id;
+    }
+}
+
+fn tool_arguments(input: &Value) -> Value {
+    match input {
+        Value::String(text) => json!(text),
+        other => json!(other.to_string()),
+    }
+}
+
+fn image_ref(mime_type: Option<&str>, data: impl AsRef<str>) -> String {
+    let data = data.as_ref();
+    if data.starts_with("data:") || data.contains("://") || data.starts_with('/') {
+        data.to_owned()
+    } else {
+        format!("data:{};base64,{data}", mime_type.unwrap_or("image/png"))
+    }
+}
+
+fn pi_message_payload<D: EmitDefaults>(
+    message: &Message,
+    timestamp: DateTime<Utc>,
+    defaults: &mut D,
+    provider: &str,
+    model: &str,
+) -> Value {
+    let parts = message.effective_parts();
+    let mut payload = serde_json::Map::new();
+    payload.insert("timestamp".to_owned(), json!(timestamp.timestamp_millis()));
+    payload.insert("usage".to_owned(), zero_usage());
+    if message.role == Role::Tool {
+        let result = parts.iter().find_map(|part| match part {
+            ContentPart::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => Some((tool_use_id.as_str(), content.as_str(), *is_error)),
+            _ => None,
+        });
+        payload.insert("role".to_owned(), json!("toolResult"));
+        if let Some((tool_use_id, content, is_error)) = result {
+            payload.insert("toolCallId".to_owned(), json!(tool_use_id));
+            payload.insert("toolName".to_owned(), json!(""));
+            payload.insert(
+                "content".to_owned(),
+                tool_result_content(content, &parts, false),
+            );
+            payload.insert("isError".to_owned(), json!(is_error));
+        } else {
+            payload.insert("content".to_owned(), json!(pi_content_blocks(&parts)));
+        }
+        return Value::Object(payload);
+    }
+    payload.insert("role".to_owned(), json!(message.role.as_str()));
+    payload.insert("content".to_owned(), json!(pi_content_blocks(&parts)));
+    if message.role == Role::Assistant {
+        payload.insert("api".to_owned(), json!("openai-completions"));
+        payload.insert("provider".to_owned(), json!(provider));
+        payload.insert("model".to_owned(), json!(model));
+        payload.insert("stopReason".to_owned(), json!("stop"));
+        payload.insert(
+            "responseId".to_owned(),
+            json!(format!(
+                "converted-{}",
+                compact_id(defaults.next_uuid(), 12)
+            )),
+        );
+    }
+    Value::Object(payload)
+}
+
+fn pi_content_blocks(parts: &[ContentPart]) -> Vec<Value> {
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    parts
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text(text) => json!({ "type": "text", "text": text }),
+            ContentPart::Thinking { text, signature } => {
+                let mut block = json!({ "type": "thinking", "thinking": text });
+                if let Some(signature) = signature {
+                    block
+                        .as_object_mut()
+                        .expect("object")
+                        .insert("thinkingSignature".to_owned(), json!(signature));
+                }
+                block
+            }
+            ContentPart::ToolUse { id, name, input } => json!({
+                "type": "toolCall",
+                "id": id,
+                "name": name,
+                "arguments": input,
+            }),
+            ContentPart::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => json!({
+                "type": "tool_result",
+                "toolCallId": tool_use_id,
+                "content": content,
+                "isError": is_error,
+            }),
+            ContentPart::Image { mime_type, data } => json!({
+                "type": "image",
+                "data": data,
+                "mimeType": mime_type.clone().unwrap_or_else(|| "image/png".to_owned()),
+            }),
+            ContentPart::Note { text, .. } => json!({ "type": "text", "text": text }),
+        })
+        .collect()
+}
+
+fn droid_role(message: &Message) -> &'static str {
+    match message.role {
+        Role::Tool => "user",
+        other => other.as_str(),
+    }
+}
+
+fn claude_record_type(message: &Message) -> &'static str {
+    match message.role {
+        Role::Assistant => "assistant",
+        Role::User | Role::Tool => "user",
+    }
+}
+
+fn claude_user_content(message: &Message) -> Value {
+    let parts = message.effective_parts();
+    if parts.len() == 1 {
+        if let ContentPart::Text(text) = &parts[0] {
+            return json!(text);
+        }
+    }
+    Value::Array(claude_content_blocks(message))
+}
+
+fn claude_content_blocks(message: &Message) -> Vec<Value> {
+    let parts = message.effective_parts();
+    if parts.is_empty() {
+        return vec![json!({ "type": "text", "text": message.text })];
+    }
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text(text) => Some(json!({ "type": "text", "text": text })),
+            ContentPart::Thinking { text, signature } => Some(json!({
+                "type": "thinking",
+                "thinking": text,
+                "signature": signature.clone().unwrap_or_default(),
+            })),
+            ContentPart::ToolUse { id, name, input } => Some(json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            })),
+            ContentPart::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => Some(json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": tool_result_content(content, &parts, true),
+                "is_error": is_error,
+            })),
+            ContentPart::Image { mime_type, data } if message.role != Role::Tool => Some(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type.clone().unwrap_or_else(|| "image/png".to_owned()),
+                    "data": data,
+                }
+            })),
+            ContentPart::Image { .. } => None,
+            ContentPart::Note { text, .. } => Some(json!({ "type": "text", "text": text })),
+        })
+        .collect()
+}
+
+fn tool_result_content(content: &str, parts: &[ContentPart], claude_style: bool) -> Value {
+    let images: Vec<&ContentPart> = parts
+        .iter()
+        .filter(|part| matches!(part, ContentPart::Image { .. }))
+        .collect();
+    if images.is_empty() {
+        return json!(content);
+    }
+    let mut blocks = vec![json!({ "type": "text", "text": content })];
+    for part in images {
+        let ContentPart::Image { mime_type, data } = part else {
+            continue;
+        };
+        if claude_style {
+            blocks.push(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type.clone().unwrap_or_else(|| "image/png".to_owned()),
+                    "data": data,
+                }
+            }));
+        } else {
+            blocks.push(json!({
+                "type": "image",
+                "data": data,
+                "mimeType": mime_type.clone().unwrap_or_else(|| "image/png".to_owned()),
+            }));
+        }
+    }
+    json!(blocks)
+}
+
+fn codex_records(message: &Message, timestamp_text: &str) -> Vec<Value> {
+    let mut records = Vec::new();
+    let mut grouped = Vec::new();
+    for part in message.effective_parts() {
+        if matches!(message.role, Role::User | Role::Assistant)
+            && matches!(
+                part,
+                ContentPart::Text(_) | ContentPart::Image { .. } | ContentPart::Note { .. }
+            )
+        {
+            grouped.push(part);
+            continue;
+        }
+        records.extend(codex_grouped_message(
+            message.role,
+            &grouped,
+            timestamp_text,
+        ));
+        grouped.clear();
+        records.extend(codex_special_part(&part, timestamp_text));
+    }
+    records.extend(codex_grouped_message(
+        message.role,
+        &grouped,
+        timestamp_text,
+    ));
+    records
+}
+
+fn codex_grouped_message(role: Role, parts: &[ContentPart], timestamp_text: &str) -> Vec<Value> {
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    let mut content = Vec::new();
+    let mut texts = Vec::new();
+    let mut images = Vec::new();
+    for part in parts {
+        match part {
+            ContentPart::Text(text) | ContentPart::Note { text, .. } => {
+                let content_type = if role == Role::User {
+                    "input_text"
+                } else {
+                    "output_text"
+                };
+                content.push(json!({ "type": content_type, "text": text }));
+                if !text.is_empty() {
+                    texts.push(text.as_str());
+                }
+            }
+            ContentPart::Image { mime_type, data } => {
+                let url = image_ref(mime_type.as_deref(), data);
+                let content_type = if role == Role::User {
+                    "input_image"
+                } else {
+                    "output_image"
+                };
+                content.push(json!({ "type": content_type, "image_url": url }));
+                images.push(url);
+            }
+            _ => {}
+        }
+    }
+    let record_role = if role == Role::Tool {
+        "user"
+    } else {
+        role.as_str()
+    };
+    let response_item = json!({
+        "timestamp": timestamp_text,
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": record_role,
+            "content": content,
+        },
+    });
+    let text = texts.join("\n");
+    match role {
+        Role::User => vec![
+            response_item,
+            json!({
+                "timestamp": timestamp_text,
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": text,
+                    "images": images,
+                    "local_images": [],
+                    "text_elements": [],
+                },
+            }),
+        ],
+        Role::Assistant if !text.is_empty() => vec![
+            json!({
+                "timestamp": timestamp_text,
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": text,
+                    "phase": null,
+                    "memory_citation": null,
+                },
+            }),
+            response_item,
+        ],
+        _ => vec![response_item],
+    }
+}
+
+fn codex_special_part(part: &ContentPart, timestamp_text: &str) -> Vec<Value> {
+    match part {
+        ContentPart::Thinking { text, .. } => vec![json!({
+            "timestamp": timestamp_text,
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "content": [{ "type": "output_text", "text": text }],
+            },
+        })],
+        ContentPart::ToolUse { id, name, input } => vec![json!({
+            "timestamp": timestamp_text,
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": id,
+                "name": name,
+                "arguments": tool_arguments(input),
+            },
+        })],
+        ContentPart::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } => vec![json!({
+            "timestamp": timestamp_text,
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": tool_use_id,
+                "output": content,
+            },
+        })],
+        ContentPart::Image { mime_type, data } => {
+            let url = image_ref(mime_type.as_deref(), data);
+            vec![json!({
+                "timestamp": timestamp_text,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_image", "image_url": url }],
+                },
+            })]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn grok_summary(
+    session: &Session,
+    cwd: &str,
+    session_id: &str,
+    model: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    chat_len: usize,
+    updates_len: usize,
+) -> Value {
+    let mut summary = json!({
+        "info": { "id": session_id, "cwd": cwd },
+        "session_summary": session.summary,
+        "generated_title": session.summary,
+        "created_at": fmt_iso(start),
+        "updated_at": fmt_iso(end),
+        "last_active_at": fmt_iso(end),
+        "num_messages": updates_len,
+        "num_chat_messages": chat_len,
+        "current_model_id": model,
+        "chat_format_version": 1,
+    });
+    let object = summary.as_object_mut().expect("JSON object");
+    if let Some(level) = session.hints.thinking_level {
+        object.insert("reasoning_effort".to_owned(), json!(level.as_str()));
+    }
+    if let Some(kind) = session
+        .hints
+        .session_kind
+        .as_deref()
+        .filter(|kind| !kind.is_empty())
+    {
+        object.insert("session_kind".to_owned(), json!(kind));
+    }
+    if session.hints.hidden {
+        object.insert("hidden".to_owned(), json!(true));
+    }
+    summary
+}
+
+fn grok_records(
+    message: &Message,
+    session_id: &str,
+    timestamp: DateTime<Utc>,
+    provenance: &str,
+    prompt_index: &mut u64,
+    index: usize,
+) -> (Vec<Value>, Vec<Value>) {
+    let mut chat = Vec::new();
+    let mut updates = Vec::new();
+    let mut parts = message.effective_parts();
+    if message.role == Role::User {
+        let visible: Vec<ContentPart> = parts
+            .iter()
+            .filter(|part| {
+                matches!(
+                    part,
+                    ContentPart::Text(_) | ContentPart::Image { .. } | ContentPart::Note { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        if !visible.is_empty() {
+            let current_prompt = *prompt_index;
+            *prompt_index += 1;
+            let content: Vec<Value> = visible
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Image { mime_type, data } => {
+                        json!({ "type": "image", "url": image_ref(mime_type.as_deref(), data) })
+                    }
+                    ContentPart::Text(text) | ContentPart::Note { text, .. } => {
+                        json!({ "type": "text", "text": text })
+                    }
+                    _ => json!({ "type": "text", "text": "" }),
+                })
+                .collect();
+            let text = visible
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text(text) | ContentPart::Note { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            chat.push(json!({
+                "type": "user",
+                "content": content,
+                "prompt_index": current_prompt,
+            }));
+            push_grok_update(
+                &mut updates,
+                session_id,
+                timestamp,
+                index,
+                "user_message_chunk",
+                json!({ "type": "text", "text": text }),
+                json!({ "modelId": provenance, "promptIndex": current_prompt }),
+            );
+        }
+        parts.retain(|part| {
+            !matches!(
+                part,
+                ContentPart::Text(_) | ContentPart::Image { .. } | ContentPart::Note { .. }
+            )
+        });
+    }
+    if message.role == Role::Assistant {
+        let thinking: Vec<ContentPart> = parts
+            .iter()
+            .filter(|part| matches!(part, ContentPart::Thinking { .. }))
+            .cloned()
+            .collect();
+        let grouped: Vec<ContentPart> = parts
+            .iter()
+            .filter(|part| {
+                matches!(
+                    part,
+                    ContentPart::Text(_)
+                        | ContentPart::Image { .. }
+                        | ContentPart::Note { .. }
+                        | ContentPart::ToolUse { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        for part in thinking {
+            let ContentPart::Thinking { text, .. } = part else {
+                continue;
+            };
+            chat.push(json!({
+                "type": "reasoning",
+                "content": text,
+                "model_id": provenance,
+            }));
+            push_grok_update(
+                &mut updates,
+                session_id,
+                timestamp,
+                index,
+                "agent_thought_chunk",
+                json!({ "type": "text", "text": text }),
+                json!({ "modelId": provenance }),
+            );
+        }
+        if !grouped.is_empty() {
+            let content: Vec<Value> = grouped
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text(text) | ContentPart::Note { text, .. } => {
+                        Some(json!({ "type": "text", "text": text }))
+                    }
+                    ContentPart::Image { mime_type, data } => Some(
+                        json!({ "type": "image", "url": image_ref(mime_type.as_deref(), data) }),
+                    ),
+                    _ => None,
+                })
+                .collect();
+            let tool_calls: Vec<Value> = grouped
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::ToolUse { id, name, input } => Some(json!({
+                        "id": id,
+                        "name": name,
+                        "arguments": input,
+                    })),
+                    _ => None,
+                })
+                .collect();
+            let text = grouped
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text(text) | ContentPart::Note { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let content_value = if content.len() == 1
+                && content[0].get("type").and_then(Value::as_str) == Some("text")
+            {
+                json!(text)
+            } else if content.is_empty() {
+                json!(text)
+            } else {
+                json!(content)
+            };
+            let mut record = json!({
+                "type": "assistant",
+                "content": content_value,
+                "model_id": provenance,
+            });
+            if !tool_calls.is_empty() {
+                record
+                    .as_object_mut()
+                    .expect("JSON object")
+                    .insert("tool_calls".to_owned(), json!(tool_calls));
+            }
+            chat.push(record);
+            push_grok_update(
+                &mut updates,
+                session_id,
+                timestamp,
+                index,
+                "agent_message_chunk",
+                json!({ "type": "text", "text": text }),
+                json!({ "modelId": provenance }),
+            );
+        }
+        parts.retain(|part| matches!(part, ContentPart::ToolResult { .. }));
+    }
+    if message.role == Role::Tool {
+        let images: Vec<Value> = parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Image { mime_type, data } => {
+                    Some(json!({ "type": "image", "url": image_ref(mime_type.as_deref(), data) }))
+                }
+                _ => None,
+            })
+            .collect();
+        parts.retain(|part| !matches!(part, ContentPart::Image { .. }));
+        if let Some((tool_use_id, content, is_error)) = parts.iter().find_map(|part| match part {
+            ContentPart::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => Some((tool_use_id.clone(), content.clone(), *is_error)),
+            _ => None,
+        }) {
+            let mut record = json!({
+                "type": "tool_result",
+                "id": tool_use_id,
+                "tool_call_id": tool_use_id,
+                "content": content,
+                "is_error": is_error,
+            });
+            if !images.is_empty() {
+                record
+                    .as_object_mut()
+                    .expect("JSON object")
+                    .insert("images".to_owned(), json!(images));
+            }
+            chat.push(record);
+            push_grok_update(
+                &mut updates,
+                session_id,
+                timestamp,
+                index,
+                "tool_call",
+                json!({ "type": "text", "text": content }),
+                json!({
+                    "toolCallId": tool_use_id,
+                    "status": if is_error { "failed" } else { "completed" }
+                }),
+            );
+            parts.retain(|part| !matches!(part, ContentPart::ToolResult { .. }));
+        }
+    }
+    for part in parts {
+        let (chat_record, update_type, content, extra_update) = match &part {
+            ContentPart::Text(text) if message.role == Role::User => {
+                let current_prompt = *prompt_index;
+                *prompt_index += 1;
+                (
+                    json!({
+                        "type": "user",
+                        "content": [{ "type": "text", "text": text }],
+                        "prompt_index": current_prompt,
+                    }),
+                    "user_message_chunk",
+                    json!({ "type": "text", "text": text }),
+                    json!({ "modelId": provenance, "promptIndex": current_prompt }),
+                )
+            }
+            ContentPart::Text(text) => (
+                json!({
+                    "type": "assistant",
+                    "content": text,
+                    "model_id": provenance,
+                }),
+                "agent_message_chunk",
+                json!({ "type": "text", "text": text }),
+                json!({ "modelId": provenance }),
+            ),
+            ContentPart::Thinking { text, .. } => (
+                json!({
+                    "type": "reasoning",
+                    "content": text,
+                    "model_id": provenance,
+                }),
+                "agent_thought_chunk",
+                json!({ "type": "text", "text": text }),
+                json!({ "modelId": provenance }),
+            ),
+            ContentPart::ToolUse { id, name, input } => (
+                json!({
+                    "type": "tool_call",
+                    "id": id,
+                    "name": name,
+                    "arguments": input,
+                }),
+                "tool_call",
+                json!({ "type": "text", "text": name }),
+                json!({ "toolCallId": id, "title": name, "kind": "other", "status": "pending", "rawInput": input }),
+            ),
+            ContentPart::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => (
+                json!({
+                    "type": "tool_result",
+                    "id": tool_use_id,
+                    "content": content,
+                    "is_error": is_error,
+                }),
+                "tool_call",
+                json!({ "type": "text", "text": content }),
+                json!({ "toolCallId": tool_use_id, "status": if *is_error { "failed" } else { "completed" } }),
+            ),
+            ContentPart::Note { text, .. } => (
+                json!({
+                    "type": if message.role == Role::User { "user" } else { "assistant" },
+                    "content": [{ "type": "text", "text": text }],
+                    "model_id": provenance,
+                }),
+                if message.role == Role::User {
+                    "user_message_chunk"
+                } else {
+                    "agent_message_chunk"
+                },
+                json!({ "type": "text", "text": text }),
+                json!({ "modelId": provenance }),
+            ),
+            ContentPart::Image { mime_type, data } => {
+                let url = image_ref(mime_type.as_deref(), data);
+                (
+                    json!({
+                        "type": if message.role == Role::User { "user" } else { "assistant" },
+                        "content": [{ "type": "image", "url": url }],
+                    }),
+                    if message.role == Role::User {
+                        "user_message_chunk"
+                    } else {
+                        "agent_message_chunk"
+                    },
+                    json!({ "type": "image", "url": url }),
+                    json!({ "modelId": provenance }),
+                )
+            }
+        };
+        chat.push(chat_record);
+        push_grok_update(
+            &mut updates,
+            session_id,
+            timestamp,
+            index,
+            update_type,
+            content,
+            extra_update,
+        );
+    }
+    (chat, updates)
+}
+
+fn push_grok_update(
+    updates: &mut Vec<Value>,
+    session_id: &str,
+    timestamp: DateTime<Utc>,
+    index: usize,
+    update_type: &str,
+    content: Value,
+    extra_update: Value,
+) {
+    let mut update = json!({
+        "sessionUpdate": update_type,
+        "content": content,
+        "_meta": extra_update,
+    });
+    if let Some(object) = extra_update.as_object() {
+        if let Some(update_object) = update.as_object_mut() {
+            for (key, value) in object {
+                if key != "modelId" && key != "promptIndex" {
+                    update_object.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    updates.push(json!({
+        "timestamp": timestamp.timestamp(),
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": update,
+            "_meta": {
+                "eventId": format!("{session_id}-{}", index + 1),
+                "agentTimestampMs": timestamp.timestamp_millis(),
+            },
+        },
+    }));
 }
 
 fn write_jsonl(path: &Path, records: &[Value]) -> Result<()> {
@@ -1262,7 +2280,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::domain::{Message, SourceTool};
+    use crate::domain::{ContentPart, Message, Role, SourceTool};
 
     struct FixedDefaults {
         uuids: VecDeque<Uuid>,
@@ -1316,19 +2334,20 @@ mod tests {
             start_timestamp: Some("2026-07-30T10:11:12.123Z".to_owned()),
             summary: "Converted session".to_owned(),
             messages: vec![
-                Message {
-                    role: Role::User,
-                    text: "hello".to_owned(),
-                    timestamp: Some("2026-07-30T10:11:13.000Z".to_owned()),
-                },
-                Message {
-                    role: Role::Assistant,
-                    text: "world".to_owned(),
-                    timestamp: Some("2026-07-30T10:11:14.000Z".to_owned()),
-                },
+                Message::plain(
+                    Role::User,
+                    "hello",
+                    Some("2026-07-30T10:11:13.000Z".to_owned()),
+                ),
+                Message::plain(
+                    Role::Assistant,
+                    "world",
+                    Some("2026-07-30T10:11:14.000Z".to_owned()),
+                ),
             ],
             path: home.join("source.jsonl"),
             modified_epoch: None,
+            hints: crate::domain::SessionHints::default(),
         }
     }
 
@@ -1345,7 +2364,10 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let home = temporary.path();
         let session = fixture(home);
-        for target in TargetTool::ALL.into_iter().filter(|target| *target != TargetTool::Agent) {
+        for target in TargetTool::ALL
+            .into_iter()
+            .filter(|target| *target != TargetTool::Agent)
+        {
             let context = EmitContext::new(home).with_session_id(format!(
                 "00000000-0000-4000-8000-0000000000{}",
                 target as u8
@@ -1512,6 +2534,67 @@ mod tests {
     }
 
     #[test]
+    fn pi_emits_native_compaction_for_compaction_notes() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let mut session = fixture(home);
+        session.messages.insert(
+            0,
+            Message::from_parts(
+                Role::Assistant,
+                vec![ContentPart::Note {
+                    kind: "compaction".to_owned(),
+                    text: "prior context".to_owned(),
+                }],
+                None,
+            ),
+        );
+        let emitted = emit_with_defaults(
+            &session,
+            TargetTool::Pi,
+            &EmitContext::new(home).with_session_id("pi-compact"),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        let records = read_jsonl(&emitted.path);
+        assert!(records.iter().any(|record| {
+            record.get("type").and_then(Value::as_str) == Some("compaction")
+                && record.get("summary").and_then(Value::as_str) == Some("prior context")
+        }));
+        assert!(!records.iter().any(|record| {
+            record.get("type").and_then(Value::as_str) == Some("custom_message")
+                && record.get("customType").and_then(Value::as_str) == Some("compaction")
+        }));
+    }
+
+    #[test]
+    fn pi_emits_native_branch_summary_for_branch_notes() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let mut session = fixture(home);
+        session.messages.push(Message::from_parts(
+            Role::Assistant,
+            vec![ContentPart::Note {
+                kind: "branch_summary".to_owned(),
+                text: "other branch work".to_owned(),
+            }],
+            None,
+        ));
+        let emitted = emit_with_defaults(
+            &session,
+            TargetTool::Pi,
+            &EmitContext::new(home).with_session_id("pi-branch"),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        let records = read_jsonl(&emitted.path);
+        assert!(records.iter().any(|record| {
+            record.get("type").and_then(Value::as_str) == Some("branch_summary")
+                && record.get("summary").and_then(Value::as_str) == Some("other branch work")
+        }));
+    }
+
+    #[test]
     fn codex_rollout_has_native_context_and_event_order() {
         let temporary = TempDir::new().unwrap();
         let home = temporary.path();
@@ -1559,6 +2642,80 @@ mod tests {
         assert_eq!(records[2]["type"], "last-prompt");
         assert_eq!(records[2]["lastPrompt"], "hello");
         assert_eq!(records[2]["leafUuid"], records[1]["uuid"]);
+    }
+
+    #[test]
+    fn codex_and_grok_group_user_text_with_images() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let mut session = fixture(home);
+        session.messages[0] = Message::from_parts(
+            Role::User,
+            vec![
+                ContentPart::Text("hello".to_owned()),
+                ContentPart::Image {
+                    mime_type: Some("image/png".to_owned()),
+                    data: "iVBORw0KGgo=".to_owned(),
+                },
+            ],
+            Some("2026-07-30T10:11:13.000Z".to_owned()),
+        );
+
+        let codex = emit_with_defaults(
+            &session,
+            TargetTool::Codex,
+            &EmitContext::new(home)
+                .with_session_id("codex-image")
+                .with_codex_runtime(CodexRuntime {
+                    provider: "provider".to_owned(),
+                    model: "model".to_owned(),
+                }),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        let records = read_jsonl(&codex.path);
+        let user = records
+            .iter()
+            .find(|record| {
+                record.get("type").and_then(Value::as_str) == Some("response_item")
+                    && record["payload"].get("role").and_then(Value::as_str) == Some("user")
+            })
+            .expect("user response");
+        let content = user["payload"]["content"].as_array().expect("content");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(
+            records
+                .iter()
+                .filter(
+                    |record| record["payload"].get("type").and_then(Value::as_str)
+                        == Some("user_message")
+                )
+                .count(),
+            1
+        );
+
+        let grok = emit_with_defaults(
+            &session,
+            TargetTool::Grok,
+            &EmitContext::new(home).with_session_id("grok-image"),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        let chat: Vec<Value> = fs::read_to_string(grok.path.with_file_name("chat_history.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let users: Vec<&Value> = chat
+            .iter()
+            .filter(|record| record.get("type").and_then(Value::as_str) == Some("user"))
+            .collect();
+        assert_eq!(users.len(), 1);
+        let content = users[0]["content"].as_array().expect("content");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
     }
 
     #[test]

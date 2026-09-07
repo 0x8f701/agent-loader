@@ -4,17 +4,20 @@
 //! `session` header; subsequent entries form branches through `id`/`parentId`.
 //! Native v1 records are migrated to a linear tree before the active branch is
 //! resolved. The latest compaction replaces older context, while recognized
-//! message, custom-message, and branch-summary entries feed the intentionally
-//! lossy user/assistant projection.
+//! message, custom-message, and branch-summary entries feed the portable
+//! user/assistant/tool projection, including thinking and tool-call blocks.
 
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::domain::{Message, Session, SourceTool};
 use crate::formats::tree::TreeNode;
-use crate::formats::{read_jsonl_values, summarize_messages, tree};
+use crate::formats::{
+    compaction_note, content_parts, hints_from_tree_records, read_jsonl_values, summarize_messages,
+    tree,
+};
 
 /// Parse a Pi/OMP session export into a lossy `Session`.
 ///
@@ -42,7 +45,7 @@ pub fn parse(path: &Path) -> Result<Session> {
     // no valid JSON object exists — is unloadable and rejected so the catalog
     // skips it. `values.first()` is used (not indexing) so an all-malformed
     // file yields `None` here rather than panicking.
-    let (session_id, raw_cwd, raw_timestamp) = values
+    let (session_id, raw_cwd, raw_timestamp, session_kind) = values
         .first()
         .and_then(Value::as_object)
         .filter(|object| object.get("type").and_then(Value::as_str) == Some("session"))
@@ -64,6 +67,11 @@ pub fn parse(path: &Path) -> Result<Session> {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_owned(),
+                        object
+                            .get("sessionKind")
+                            .and_then(Value::as_str)
+                            .filter(|kind| !kind.is_empty())
+                            .map(str::to_owned),
                     )
                 })
         })
@@ -76,8 +84,10 @@ pub fn parse(path: &Path) -> Result<Session> {
 
     migrate_legacy_entries(&mut values);
 
+    let synthesized: Vec<Option<Value>> =
+        values[1..].iter().map(synthesized_tree_content).collect();
     let mut nodes: Vec<TreeNode<'_>> = Vec::with_capacity(values.len().saturating_sub(1));
-    for record in &values[1..] {
+    for (record, extra) in values[1..].iter().zip(synthesized.iter()) {
         let Some(object) = record.as_object() else {
             continue;
         };
@@ -90,8 +100,8 @@ pub fn parse(path: &Path) -> Result<Session> {
             id,
             parent_id: parent_id.filter(|value| !value.is_empty()),
             entry_type,
-            role,
-            content: content.or_else(|| object.get("content")),
+            role: tree_role(object, role),
+            content: extra.as_ref().or(content).or_else(|| object.get("content")),
             timestamp: entry_timestamp,
             summary: object.get("summary").and_then(Value::as_str),
             short_summary: None,
@@ -99,7 +109,14 @@ pub fn parse(path: &Path) -> Result<Session> {
         });
     }
 
-    let messages: Vec<Message> = tree::project_native_messages(&tree::active_path(&nodes));
+    let active = tree::active_path(&nodes);
+    let path_ids: Vec<&str> = active.iter().map(|node| node.id).collect();
+    let mut hints = hints_from_tree_records(&values, &path_ids);
+    hints.session_kind = session_kind;
+    let mut messages: Vec<Message> = tree::project_native_messages(&active);
+    if let Some(note) = compaction_note(hints.compaction_summary.as_deref()) {
+        messages.insert(0, note);
+    }
     let summary = summarize_messages(&messages);
 
     // The header's cwd is used verbatim — even when empty (ancient v1 files) —
@@ -118,6 +135,7 @@ pub fn parse(path: &Path) -> Result<Session> {
         messages,
         path: path.to_path_buf(),
         modified_epoch,
+        hints,
     })
 }
 
@@ -274,6 +292,121 @@ fn message_payload(object: &Map<String, Value>) -> (Option<&str>, Option<&Value>
     (role, content)
 }
 
+pub(crate) fn tree_role<'a>(
+    object: &'a Map<String, Value>,
+    role: Option<&'a str>,
+) -> Option<&'a str> {
+    match role {
+        Some("user" | "assistant" | "tool" | "toolResult" | "tool_result") => role,
+        Some("bashExecution" | "branchSummary" | "compactionSummary" | "custom") => {
+            Some("assistant")
+        }
+        Some(_) => None,
+        None => matches!(
+            object.get("type").and_then(Value::as_str),
+            Some("custom_message" | "branch_summary")
+        )
+        .then_some("assistant"),
+    }
+}
+
+pub(crate) fn synthesized_tree_content(record: &Value) -> Option<Value> {
+    let object = record.as_object()?;
+    match object.get("type").and_then(Value::as_str) {
+        Some("custom_message") => {
+            return Some(visible_custom_note(object).unwrap_or(json!([])));
+        }
+        Some("branch_summary") => {
+            return note_blocks(
+                "branch_summary",
+                object.get("summary").and_then(Value::as_str)?,
+            );
+        }
+        _ => {}
+    }
+    let (role, content) = message_payload(object);
+    let message = object.get("message")?.as_object()?;
+    match role {
+        Some("toolResult") => Some(pi_tool_result_content(message, content)),
+        Some("bashExecution") => bash_execution_note(message),
+        Some("branchSummary") => note_blocks(
+            "branch_summary",
+            message.get("summary").and_then(Value::as_str)?,
+        ),
+        Some("compactionSummary") => note_blocks(
+            "compaction",
+            message.get("summary").and_then(Value::as_str)?,
+        ),
+        Some("custom") => Some(visible_custom_note(message).unwrap_or(json!([]))),
+        _ => None,
+    }
+}
+
+fn visible_custom_note(object: &Map<String, Value>) -> Option<Value> {
+    if object.get("display").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let kind = object
+        .get("customType")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("custom");
+    let text = match object.get("content") {
+        Some(Value::String(text)) if !text.is_empty() => text.clone(),
+        Some(value) => {
+            let joined = crate::domain::joined_text(&content_parts(value));
+            if joined.is_empty() {
+                return None;
+            }
+            joined
+        }
+        None => return None,
+    };
+    note_blocks(kind, &text)
+}
+
+fn bash_execution_note(message: &Map<String, Value>) -> Option<Value> {
+    let command = message
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let output = message
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let text = [command, output]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        return None;
+    }
+    note_blocks("bashExecution", &text)
+}
+
+fn note_blocks(kind: &str, text: &str) -> Option<Value> {
+    if text.is_empty() {
+        return None;
+    }
+    Some(json!([{
+        "type": "note",
+        "kind": kind,
+        "text": text,
+    }]))
+}
+
+fn pi_tool_result_content(message: &Map<String, Value>, content: Option<&Value>) -> Value {
+    json!([{
+        "type": "tool_result",
+        "toolCallId": message.get("toolCallId").and_then(Value::as_str).unwrap_or(""),
+        "content": content.cloned().unwrap_or(Value::Null),
+        "isError": message.get("isError").and_then(Value::as_bool).unwrap_or(false),
+    }])
+}
+
 /// Build a fallback `Session` for an empty (not-yet-flushed) file: id from the
 /// file name, cwd from the parent directory, no messages.
 fn empty_session(path: &Path, modified_epoch: Option<f64>) -> Session {
@@ -286,6 +419,7 @@ fn empty_session(path: &Path, modified_epoch: Option<f64>) -> Session {
         messages: Vec::new(),
         path: path.to_path_buf(),
         modified_epoch,
+        hints: crate::domain::SessionHints::default(),
     }
 }
 
@@ -413,6 +547,21 @@ mod tests {
         assert_eq!(session.summary, "hi");
         assert_eq!(session.path, file.path());
         assert!(session.modified_epoch.is_some());
+        assert_eq!(session.hints.session_kind, None);
+    }
+
+    #[test]
+    fn session_header_kind_lands_on_hints() {
+        let file = write_session(&[
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp","sessionKind":"workflowWorker"}"#,
+            &msg("a", None, "user", r#""task""#),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(
+            session.hints.session_kind.as_deref(),
+            Some("workflowWorker")
+        );
+        assert!(session.is_catalog_child());
     }
 
     #[test]
@@ -557,8 +706,6 @@ mod tests {
 
     #[test]
     fn only_user_and_assistant_roles_are_projected() {
-        // toolResult / custom / developer roles sit on the active path but
-        // must not appear in the projected messages.
         let file = write_session(&[
             HEADER,
             &msg("m1", None, "user", r#""q""#),
@@ -578,11 +725,13 @@ mod tests {
             &msg("m5", Some("m4"), "developer", r#""dev""#),
         ]);
         let session = parse(file.path()).expect("parse");
-        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages.len(), 3);
         assert_eq!(session.messages[0].role, Role::User);
         assert_eq!(session.messages[0].text, "q");
         assert_eq!(session.messages[1].role, Role::Assistant);
         assert_eq!(session.messages[1].text, "ans");
+        assert_eq!(session.messages[2].role, Role::Tool);
+        assert_eq!(session.messages[2].text, "tool");
     }
 
     #[test]
@@ -628,8 +777,7 @@ mod tests {
         // migration must rewrite the role to `custom` so the entry no longer
         // resembles a user turn, and the rewrite must land in the shared entry
         // object. A later (v3) file must be left untouched.
-        let v2_header =
-            r#"{"type":"session","id":"s1","version":2,"timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#;
+        let v2_header = r#"{"type":"session","id":"s1","version":2,"timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#;
         let file = write_session(&[
             v2_header,
             &msg(
@@ -704,7 +852,7 @@ mod tests {
             .iter()
             .map(|message| message.text.as_str())
             .collect();
-        assert_eq!(texts, ["kept", "done"]);
+        assert_eq!(texts, ["prior context", "kept", "done"]);
 
         // The index field itself is consumed: the migrated compaction carries
         // `firstKeptEntryId` and no longer carries `firstKeptEntryIndex`.
@@ -714,10 +862,7 @@ mod tests {
             .iter()
             .find(|value| value.get("type").and_then(Value::as_str) == Some("compaction"))
             .expect("compaction record");
-        assert_eq!(
-            compaction.get("firstKeptEntryId"),
-            Some(&json!("legacy-2"))
-        );
+        assert_eq!(compaction.get("firstKeptEntryId"), Some(&json!("legacy-2")));
         assert_eq!(compaction.get("firstKeptEntryIndex"), None);
     }
 
@@ -746,11 +891,86 @@ mod tests {
             .iter()
             .map(|message| message.text.as_str())
             .collect();
-        assert_eq!(texts, ["kept", "done"]);
+        assert_eq!(texts, ["prior context", "kept", "done"]);
+        assert_eq!(
+            session.hints.compaction_summary.as_deref(),
+            Some("prior context")
+        );
     }
 
     #[test]
-    fn encode_cwd_matches_real_pi_directory_names() {
+    fn custom_message_projects_as_a_note() {
+        let file = write_session(&[
+            HEADER,
+            r#"{"type":"custom_message","id":"n1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","customType":"handoff","content":"handoff summary","display":true}"#,
+            &msg(
+                "a",
+                Some("n1"),
+                "assistant",
+                r#"[{"type":"text","text":"ready"}]"#,
+            ),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(session.messages.len(), 2);
+        assert!(matches!(
+            &session.messages[0].parts[0],
+            crate::domain::ContentPart::Note { kind, text }
+                if kind == "handoff" && text == "handoff summary"
+        ));
+        assert_eq!(session.messages[1].text, "ready");
+    }
+
+    #[test]
+    fn hidden_custom_message_is_not_projected() {
+        let file = write_session(&[
+            HEADER,
+            r#"{"type":"custom_message","id":"n1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","customType":"handoff","content":"hidden","display":false}"#,
+            &msg(
+                "a",
+                Some("n1"),
+                "assistant",
+                r#"[{"type":"text","text":"ready"}]"#,
+            ),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].text, "ready");
+    }
+
+    #[test]
+    fn branch_summary_and_bash_execution_project_as_notes() {
+        let file = write_session(&[
+            HEADER,
+            r#"{"type":"branch_summary","id":"b1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","fromId":"root","summary":"other branch work"}"#,
+            r#"{"type":"message","id":"x1","parentId":"b1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"bashExecution","command":"ls","output":"src","timestamp":2}}"#,
+            r#"{"type":"message","id":"c1","parentId":"x1","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"compactionSummary","summary":"prior context","tokensBefore":12,"timestamp":3}}"#,
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert!(
+            session.messages.iter().any(|message| message.parts.iter().any(
+                |part| matches!(part, crate::domain::ContentPart::Note { kind, text } if kind == "branch_summary" && text == "other branch work")
+            )),
+            "{:?}",
+            session.messages
+        );
+        assert!(
+            session.messages.iter().any(|message| message.parts.iter().any(
+                |part| matches!(part, crate::domain::ContentPart::Note { kind, text } if kind == "bashExecution" && text.contains("ls") && text.contains("src"))
+            )),
+            "{:?}",
+            session.messages
+        );
+        assert!(
+            session.messages.iter().any(|message| message.parts.iter().any(
+                |part| matches!(part, crate::domain::ContentPart::Note { kind, text } if kind == "compaction" && text == "prior context")
+            )),
+            "{:?}",
+            session.messages
+        );
+    }
+
+    #[test]
+    fn encode_cwd_encodes_nested_and_hyphenated_components() {
         assert_eq!(
             encode_cwd(Path::new("/workspace/user")).unwrap(),
             "--workspace-user--"
@@ -766,11 +986,8 @@ mod tests {
             "--workspace-user-Projects-llama.cpp--"
         );
         assert_eq!(
-            encode_cwd(Path::new(
-                "/workspace/user/Projects/parth-generic-v1/client_prover"
-            ))
-            .unwrap(),
-            "--workspace-user-Projects-parth-generic-v1-client_prover--"
+            encode_cwd(Path::new("/workspace/user/Projects/sample-app-v1/worker")).unwrap(),
+            "--workspace-user-Projects-sample-app-v1-worker--"
         );
         assert_eq!(encode_cwd(Path::new("/tmp")).unwrap(), "--tmp--");
     }

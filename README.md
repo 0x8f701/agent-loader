@@ -36,7 +36,7 @@ The installer verifies every download against the release's `SHA256SUMS` and ins
 Pin a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.5.1"
+curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.6.0
 ```
 
 If `al` is not on PATH after installation, open a new terminal or use the full path printed during install.
@@ -88,6 +88,13 @@ al sessions query "refactor auth"
 al sessions sync host-a --dry-run
 al sessions sync host-a host-b --tool omp --tool pi --dry-run
 
+# Create or update a project, optionally on a remote host / worktree / agent.
+al new sample-app "ship the parser"
+al new sample-app "ship the parser" --tmux
+al new x3 ~/Projects/pi-zig "完成zig版本的pi-coding-agent" --executor omp --worktree
+al new x3 ~/Projects/pi-zig "完成zig版本的pi-coding-agent" --orchestrator pilo --executor omp --reviewer grok --worktree
+al new ~/Projects/pi-zig "完成zig版本的pi-coding-agent" --executor omp --print-command
+
 # Run one shell-compatible command string in a tmux-managed pane (Unix only).
 al tmux-run -c /workspace/project --fresh -- 'make test'
 
@@ -105,11 +112,11 @@ al agentlo --host host-a --wt feature-name --tmux
 
 Run `al --help` and `al COMMAND --help` for the current argument surface.
 
-- `al sessions [COUNT]` — list recent local sessions (default 5; use `--all` to show everything, `--dedupe` to keep the newest row per tool/cwd/summary).
+- `al sessions [COUNT]` — list recent local sessions (default 5; use `--all` to show everything, `--dedupe` to keep the newest row per tool/cwd/summary). Workflow/subagent children are hidden unless `--children` is set. User forks that only carry `parentSession` stay visible.
   - `al sessions list [COUNT]` — explicit list with the same flags.
-  - Repeatable `--host HOST` adds a remote host to query. `local` is reserved for the current machine. With `--host`, `al` runs `al sessions list` on each host over SSH and prints read-only results grouped under `== <host> ==`. It is not a sync: no files are copied. Hosts are queried in the order given; `--all`/`--dedupe`/COUNT are forwarded to each remote. Per-host deduplication only; there is no cross-host deduplication. The command continues after a failed host and exits nonzero if any host failed. Empty, whitespace-containing, control-character, or option-like host values are rejected. `--host` cannot be combined with `--paths`, `--picker`, or `--fzf`.
+  - Repeatable `--host HOST` adds a remote host to query. `local` is reserved for the current machine. With `--host`, `al` runs `al sessions list` on each host over SSH and prints read-only results grouped under `== <host> ==`. It is not a sync: no files are copied. Hosts are queried in the order given; `--all`/`--dedupe`/`--children`/COUNT are forwarded to each remote. Per-host deduplication only; there is no cross-host deduplication. The command continues after a failed host and exits nonzero if any host failed. Empty, whitespace-containing, control-character, or option-like host values are rejected. `--host` cannot be combined with `--paths`, `--picker`, or `--fzf`.
   - `al sessions --fzf` / `al sessions list --fzf` — local interactive fuzzy filter over tool, time, session id, and summary, followed by a target picker that opens the session. Native Agent rows offer only `agent` and default to it. Requires `fzf` on PATH. Uses the full deduped catalog, not the default 5-row list.
-  - `al sessions search QUERY` — search the text of user/assistant messages in discovered sessions. Search is local-only. `--dedupe` and `--picker` change output style.
+  - `al sessions search QUERY` — search the text of user/assistant messages in discovered sessions. Search is local-only. `--dedupe` and `--picker` change output style. `--children` includes workflow/subagent sessions.
   - `al sessions query QUERY...` — the same picker-and-open flow as `--fzf`, after a local user/assistant message-body search, including parsed native Agent messages. Requires `fzf` on PATH.
   - `al sessions convert SOURCE TARGET INPUT [OUTPUT]` (visible alias `migrate`) — read `INPUT` in the native format of `SOURCE` and write a `TARGET`-compatible export. If `OUTPUT` is omitted, the export is written to the target tool's native session location and the path is printed. Cursor Agent is intentionally excluded because its store format is undocumented.
   - `al sessions move FROM TO [--tool TOOL]... [--dry-run]` — move native session files from one directory to another without converting them. `FROM` can be a catalog folder (match by file path) or a recorded workspace path (match by `cwd`, including after the project directory itself is gone). `TO` can be another catalog folder, a dump directory, or the new workspace: matching `cwd` values are rewritten and files are re-homed to that tool's native layout. Cursor Agent stores are excluded. The command refuses to overwrite an existing destination, to move an entire home/catalog root, or to delete a Grok directory that contains unexpected files.
@@ -127,6 +134,7 @@ Run `al --help` and `al COMMAND --help` for the current argument surface.
   On macOS, remote launchers map `/Users/<user>` to `/home/<user>`. Additional component-aware mappings can be supplied through `AL_REMOTE_PATH_MAPS` as an ordered JSON array of absolute source/destination pairs, for example `[["/Volumes/workspace","/srv/workspace"]]`. Every source and destination must be an absolute path; malformed configuration fails before SSH is invoked. The remote host must have `al` installed and on PATH.
 
   `al agentlo` launches Cursor's official `agent` CLI. With no tool args it first runs `agent --force --trust --approve-mcps --continue`; if that command exits nonzero, it retries as `agent --force --trust --approve-mcps` to create a new chat. The continue probe hides Cursor's "No previous chats found." status line, including inside `--tmux`. Cursor's native local worktree options (`-w`/`--worktree [NAME]` and `--worktree-base REF`) pass through normally. The launcher-level `--wt NAME` remains the remote-host worktree control and therefore requires `--host`; `--tmux` works for both local and remote launches. A `--session ID` selector (or a positional chat id) maps to `--resume ID`; any other arguments are forwarded verbatim after the base approval flags. Separately, `al sessions`, `al sessions search`, `al sessions --fzf`, and `al sessions query` discover native Cursor Agent sessions and can reopen them exactly; conversion and sync remain disabled because the native SQLite/blob format is undocumented and live stores may depend on WAL state.
+- `al new [HOST] NAME|PATH GOAL` — create the project if it is missing, otherwise update `GOAL.md`. A bare `NAME` goes under `$AL_PROJECTS_HOME` or `~/Projects` (remote: `$HOME/Projects`). A path must be absolute or start with `~/` on a remote host. Missing repos get `README.md`, `GOAL.md`, `git init`, and `Initial commit`; existing git checkouts commit `Set goal`. `--worktree [NAME]` (alias `--wt`) creates or reuses `~/Projects/<repo>-<NAME>` (`NAME` defaults to `wt`). `--executor|--orchestrator|--reviewer TOOL` start fresh agents (yolo/approval flags, no `--continue`) in **one tmux session** with one window per role. Window names are `<tool>-<project>` (for example `omlo-pi-zig-wt`); the session is the project/worktree name. Usual case is just `--executor omp`. Each role gets `.al/<role>.md` covering the coordinate envelope (`TASK`/`ACK`/`PROGRESS`/`DONE`/`BLOCKED`/`RELAY`/`AUDIT`/`INFO`, star topology, `modifying:`). After the TUI is up, grok/hyper/claude get `tmux send-keys` of `/goal <text>`; pi/omp get `/goal` then the text; codex/droid/agent have no `/goal` (files only). `--tmux` is implied by a role flag unless `--no-tmux` (multiple roles require tmux; `--no-tmux` cannot send `/goal`). Role launch and `--tmux` are Unix-only. Remote create/open uses SSH + `fish` + `git`. Opening copies this `al` to `/tmp/al-<version>` on the host instead of using the remote PATH binary. An existing exact tmux session name is refused, not replaced. `--print-command` prints the plan without writing files or running SSH.
 - `al tmux-run ...` — run a command inside the tmux integration wrapper (Unix only; Windows returns an explicit unsupported-platform error).
 
 ```sh
@@ -158,23 +166,29 @@ Cursor Agent discovery reads `.cursor/chats/<32-hex-workspace-hash>/<session-id>
 The managed `rpi` executable is resolved from `$PI_HOME/bin/rpi`, then
 `~/.rpi/bin/rpi`, then `PATH`. Rpi sessions are discovered under `~/.rpi/sessions`.
 
-Session conversion is intentionally lossy:
+Session conversion preserves the portable conversation:
 
-- Only user/assistant messages and the first recognized text block from each message are preserved. Images, attachments, tool calls, and other metadata are dropped.
+- User, assistant, and tool turns keep every recognized text, thinking, tool-use, and tool-result block, remapped into the target tool's native record shape.
+- Images are remapped to each target's native image block (Pi/OMP `image`, Claude/Droid `image`+`source`, Codex `input_image`/`images[]`, Grok `image`+`url`).
+- Compaction summaries become native Pi/OMP `compaction` records or Claude `isCompactSummary` user turns; other notes stay Pi/OMP `custom_message` records or Claude attachments. Other targets keep the note text.
+- Source model, provider, and thinking level are written back when the target format has a place for them (Pi/OMP `thinking_level_change`, Claude `effort`, Codex `reasoning_effort`, Grok `reasoning_effort`, Droid `thinkingLevel`).
+- Session metadata that has no target equivalent (Claude attachments, Codex world_state, Grok hooks, todos, labels) is still dropped.
 - Empty lines are skipped. After a successful native load, unparseable records and non-message entries may be skipped.
 - Generated summaries normalize whitespace and are truncated to 100 characters; projected message text is preserved.
 - `grok` and `hyper` targets reuse Grok's storage layout; `pi` writes `~/.pi/agent/sessions` and `rpi` writes `~/.rpi/sessions` using the same JSONL shape; other targets write their own native formats.
 
-This is by design: `al` is a loader that passes the useful context forward, not a bit-perfect archival mirror.
+Cursor Agent remains parse/search/open only: its SQLite blob store is not a conversion target.
 
 ## Source format note
 
 Format adapters read each tool's native export:
 
-- **Pi / OMP** — newline-delimited JSONL conversation trees.
-- **Droid** — `session_start` and `message` typed records.
-- **Codex / Claude / Grok** — tool-specific JSON/JSONL or directory layouts. Hyper targets reuse Grok's storage layout. Rpi uses Pi's JSONL shape under `~/.rpi/sessions`.
-- **Cursor Agent** — a read-only SQLite `store.db` adapter with sibling `meta.json`; only plaintext user/assistant text is projected, injected wrappers and tool output are excluded, and the native store remains canonical.
+- **Pi / OMP** — newline-delimited JSONL conversation trees, including thinking, `toolCall` / `toolResult`, visible `custom_message`, `branch_summary`, `bashExecution`, and compaction notes.
+- **Droid** — `session_start` and `message` typed records with `text` / `thinking` / `tool_use` / `tool_result` / `image` blocks.
+- **Codex** — rollout JSONL `response_item` messages plus `function_call`, `function_call_output`, `reasoning`, `compacted`, and user `images`.
+- **Claude** — UUID conversation graph; user/assistant content blocks including thinking, tools, images, and attachments.
+- **Grok / Hyper** — `summary.json` plus `chat_history.jsonl`, falling back to ACP `updates.jsonl`; tool, reasoning, `backend_tool_call`, and image records (including tool-result `images`) are kept.
+- **Cursor Agent** — a read-only SQLite `store.db` adapter with sibling `meta.json`; plaintext user/assistant/tool text is projected, injected wrappers are excluded, and the native store remains canonical.
 
 Pi/OMP nonempty files require a valid native `session` header or loading fails. After a successful load, later unparseable or non-message records may be skipped.
 
@@ -211,14 +225,14 @@ Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 ### Artifacts
 
 | Asset | Example |
-| macOS arm64 | `al-0.5.1-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `al-0.5.1-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc 2.31+) | `al-0.5.1-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc 2.31+) | `al-0.5.1-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `al-0.5.1-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `al-0.6.0-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `al-0.6.0-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 (glibc 2.31+) | `al-0.6.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc 2.31+) | `al-0.6.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `al-0.6.0-x86_64-pc-windows-msvc.zip` |
 | Checksums | `SHA256SUMS` |
 
-The tag must match `Cargo.toml` version exactly (`v0.5.1` ↔ `0.5.1`) or the build fails.
+The tag must match `Cargo.toml` version exactly (`v0.6.0` ↔ `0.6.0`) or the build fails.
 
 ## License
 

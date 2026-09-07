@@ -22,8 +22,11 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use crate::domain::{Message, Role, Session, SourceTool};
-use crate::formats::{first_text_from_content, normalize, read_jsonl_values, summarize_messages};
+use crate::domain::{ContentPart, Message, Role, Session, SourceTool};
+use crate::formats::{
+    compaction_note, content_parts, first_text_from_content, normalize, parsed_message,
+    read_jsonl_values, summarize_messages,
+};
 
 /// Sentinel Codex prepends to a synthesized user message body
 /// (`protocol/src/protocol.rs:108`). Stripped when deriving a lossy preview,
@@ -41,6 +44,21 @@ const IMAGE_ONLY_PLACEHOLDER: &str = "[Image]";
 pub enum CodexItem {
     SessionMeta(CodexSessionMeta),
     ResponseMessage(CodexResponseMessage),
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: Value,
+    },
+    FunctionCallOutput {
+        call_id: String,
+        output: Value,
+    },
+    Reasoning {
+        text: String,
+    },
+    Compacted {
+        text: String,
+    },
     UserMessage(CodexUserMessageEvent),
     ThreadNameUpdated(CodexThreadNameUpdatedEvent),
     TurnContext(CodexTurnContext),
@@ -157,6 +175,8 @@ pub fn parse(path: &Path) -> Result<Session> {
     let mut first_user_message: Option<String> = None;
     let mut thread_title: Option<String> = None;
     let mut first_line_timestamp: Option<String> = None;
+    let mut hints = crate::domain::SessionHints::default();
+    let mut compaction_summary = None;
 
     for value in values {
         let timestamp = value
@@ -172,6 +192,7 @@ pub fn parse(path: &Path) -> Result<Session> {
                 // forked-embedded metas with a different id are ignored
                 // (`state/src/extract.rs:62-66`).
                 if session_meta.is_none() {
+                    apply_codex_hints(&mut hints, &meta.extra);
                     session_meta = Some(meta);
                 }
             }
@@ -180,12 +201,42 @@ pub fn parse(path: &Path) -> Result<Session> {
                     messages.push(message);
                 }
             }
+            CodexItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => messages.push(Message::from_parts(
+                Role::Assistant,
+                vec![ContentPart::ToolUse {
+                    id: call_id,
+                    name,
+                    input: arguments,
+                }],
+                timestamp.clone(),
+            )),
+            CodexItem::FunctionCallOutput { call_id, output } => {
+                messages.push(project_function_output(call_id, output, timestamp.clone()));
+            }
+            CodexItem::Compacted { text } => {
+                if !text.is_empty() {
+                    compaction_summary = Some(text);
+                }
+            }
+            CodexItem::Reasoning { text } => messages.push(Message::from_parts(
+                Role::Assistant,
+                vec![ContentPart::Thinking {
+                    text,
+                    signature: None,
+                }],
+                timestamp.clone(),
+            )),
             CodexItem::UserMessage(user) => {
                 if first_user_message.is_none() {
                     if let Some(preview) = user_message_preview(&user) {
                         first_user_message = Some(preview);
                     }
                 }
+                attach_event_images(&mut messages, &user);
             }
             CodexItem::ThreadNameUpdated(updated) => {
                 if let Some(name) = updated.thread_name.as_deref() {
@@ -195,7 +246,7 @@ pub fn parse(path: &Path) -> Result<Session> {
                     }
                 }
             }
-            CodexItem::TurnContext(_) => {}
+            CodexItem::TurnContext(context) => apply_codex_hints(&mut hints, &context.extra),
             // Unknown item kinds and known kinds that failed strict
             // deserialization are preserved as raw values and intentionally
             // dropped from the lossy `Session` contract.
@@ -224,6 +275,13 @@ pub fn parse(path: &Path) -> Result<Session> {
         .filter(|timestamp| !timestamp.is_empty())
         .or(first_line_timestamp);
 
+    if let Some(summary) = compaction_summary.as_deref() {
+        hints.compaction_summary = Some(summary.to_owned());
+        if let Some(note) = compaction_note(Some(summary)) {
+            messages.insert(0, note);
+        }
+    }
+
     let summary = summary_for(
         thread_title.as_deref(),
         first_user_message.as_deref(),
@@ -240,6 +298,7 @@ pub fn parse(path: &Path) -> Result<Session> {
         messages,
         path: path.to_path_buf(),
         modified_epoch,
+        hints,
     })
 }
 
@@ -273,6 +332,14 @@ fn classify_line(record: Value) -> CodexItem {
             }),
         Some("response_item") => classify_response_item(payload, type_tag, record),
         Some("event_msg") => classify_event_msg(payload, type_tag, record),
+        Some("compacted") => CodexItem::Compacted {
+            text: ["message", "summary", "text"]
+                .into_iter()
+                .find_map(|key| payload.get(key).and_then(Value::as_str))
+                .filter(|text| !text.is_empty())
+                .unwrap_or("")
+                .to_owned(),
+        },
         _ => CodexItem::Unknown {
             type_tag,
             raw: record,
@@ -292,6 +359,37 @@ fn classify_response_item(payload: Value, type_tag: Option<String>, record: Valu
                 type_tag,
                 raw: record,
             }),
+        Some("function_call" | "custom_tool_call") => CodexItem::FunctionCall {
+            call_id: payload
+                .get("call_id")
+                .or_else(|| payload.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            name: payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            arguments: crate::formats::object_or_json(
+                payload.get("arguments").cloned().unwrap_or(Value::Null),
+            ),
+        },
+        Some("function_call_output" | "custom_tool_call_output") => CodexItem::FunctionCallOutput {
+            call_id: payload
+                .get("call_id")
+                .or_else(|| payload.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            output: payload.get("output").cloned().unwrap_or(Value::Null),
+        },
+        Some("reasoning") => CodexItem::Reasoning {
+            text: first_text_from_content(payload.get("content").unwrap_or(&payload))
+                .or_else(|| payload.get("summary").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_owned(),
+        },
         _ => CodexItem::Unknown {
             type_tag,
             raw: record,
@@ -330,13 +428,103 @@ fn classify_event_msg(payload: Value, type_tag: Option<String>, record: Value) -
 /// the shared first-text helper. Non-user/assistant roles and content without a
 /// text block yield `None`.
 fn project_message(record: &CodexResponseMessage, timestamp: Option<&str>) -> Option<Message> {
-    let role = record.role.parse::<Role>().ok()?;
-    let text = first_text_from_content(&record.content)?.to_owned();
-    Some(Message {
-        role,
-        text,
-        timestamp: timestamp.map(str::to_owned),
-    })
+    parsed_message(Some(&record.role), Some(&record.content), timestamp)
+}
+
+fn apply_codex_hints(hints: &mut crate::domain::SessionHints, extra: &Map<String, Value>) {
+    if let Some(model) = extra
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        hints.model = Some(model.to_owned());
+    }
+    if let Some(provider) = extra
+        .get("model_provider")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        hints.provider = Some(provider.to_owned());
+    }
+    if hints.thinking_level.is_none() {
+        hints.thinking_level = ["reasoning_effort", "effort", "reasoningEffort"]
+            .into_iter()
+            .find_map(|key| extra.get(key).and_then(Value::as_str))
+            .and_then(|value| value.parse().ok());
+    }
+}
+
+fn project_function_output(call_id: String, output: Value, timestamp: Option<String>) -> Message {
+    let parsed = match &output {
+        Value::String(text) => serde_json::from_str(text).unwrap_or(output.clone()),
+        _ => output.clone(),
+    };
+    let content = crate::formats::first_text_from_content(&parsed)
+        .map(str::to_owned)
+        .or_else(|| match &output {
+            Value::String(text) => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut parts = vec![ContentPart::ToolResult {
+        tool_use_id: call_id,
+        content,
+        is_error: false,
+    }];
+    parts.extend(
+        content_parts(&parsed)
+            .into_iter()
+            .filter(|part| matches!(part, ContentPart::Image { .. })),
+    );
+    Message::from_parts(Role::Tool, parts, timestamp)
+}
+
+fn attach_event_images(messages: &mut [Message], user: &CodexUserMessageEvent) {
+    let images = user
+        .images
+        .iter()
+        .chain(user.local_images.iter())
+        .filter_map(image_from_codex_value)
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return;
+    }
+    let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == Role::User)
+    else {
+        return;
+    };
+    for part in images {
+        let ContentPart::Image { data, .. } = &part else {
+            continue;
+        };
+        let already = message.parts.iter().any(|existing| {
+            matches!(
+                existing,
+                ContentPart::Image {
+                    data: existing_data,
+                    ..
+                } if existing_data == data
+            )
+        });
+        if !already {
+            message.parts.push(part);
+        }
+    }
+    message.text = crate::domain::joined_text(&message.parts);
+}
+
+fn image_from_codex_value(value: &Value) -> Option<ContentPart> {
+    match value {
+        Value::String(data) if !data.is_empty() => Some(ContentPart::Image {
+            mime_type: None,
+            data: data.clone(),
+        }),
+        Value::Object(object) => crate::formats::image_from_object(object),
+        _ => None,
+    }
 }
 
 /// Native lossy preview for an `EventMsg::UserMessage`
@@ -421,7 +609,7 @@ fn metadata_epoch(metadata: &fs::Metadata) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Role;
+    use crate::domain::{ContentPart, Role};
     use std::fs as stdfs;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -547,7 +735,7 @@ mod tests {
         let file = session_file(&[META, msg]);
         let session = parse(file.path()).expect("parse");
         assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].text, "first answer");
+        assert_eq!(session.messages[0].text, "first answer\nsecond answer");
     }
 
     #[test]
@@ -556,6 +744,22 @@ mod tests {
         let file = session_file(&[META, turn, USER_RESPONSE]);
         let session = parse(file.path()).expect("parse");
         assert_eq!(session.cwd, PathBuf::from("/workspace/project"));
+        assert_eq!(session.hints.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn user_event_images_attach_to_the_last_user_message() {
+        let user_event = r#"{"timestamp":"2026-07-29T06:04:38.000Z","type":"event_msg","payload":{"type":"user_message","message":"hi","images":["iVBORw0KGgo="],"local_images":[],"text_elements":[]}}"#;
+        let file = session_file(&[META, USER_RESPONSE, user_event]);
+        let session = parse(file.path()).expect("parse");
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::Image { data, .. } if data == "iVBORw0KGgo="
+                )
+            })
+        }));
     }
 
     #[test]
@@ -652,5 +856,21 @@ mod tests {
             top,
             CodexItem::Unknown { type_tag, .. } if type_tag.as_deref() == Some("brand_new")
         ));
+    }
+
+    #[test]
+    fn compacted_item_becomes_a_compaction_note() {
+        let compacted = r#"{"timestamp":"2026-07-29T06:04:37.500Z","type":"compacted","payload":{"message":"prior context"}}"#;
+        let file = session_file(&[META, compacted, USER_RESPONSE]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(
+            session.hints.compaction_summary.as_deref(),
+            Some("prior context")
+        );
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, ContentPart::Note { kind, text } if kind == "compaction" && text == "prior context")
+            })
+        }));
     }
 }

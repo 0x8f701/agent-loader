@@ -62,14 +62,12 @@ fn write_jsonl_session(
     lines: &[String],
 ) -> PathBuf {
     let session_dir = home.join(root).join(dir);
-    fs::create_dir_all(&session_dir)
-        .unwrap_or_else(|e| panic!("creating session dir: {e}"));
+    fs::create_dir_all(&session_dir).unwrap_or_else(|e| panic!("creating session dir: {e}"));
     let path = session_dir.join(file);
-    let mut file_handle = fs::File::create(&path)
-        .unwrap_or_else(|e| panic!("creating session file: {e}"));
+    let mut file_handle =
+        fs::File::create(&path).unwrap_or_else(|e| panic!("creating session file: {e}"));
     for line in lines {
-        writeln!(file_handle, "{line}")
-            .unwrap_or_else(|e| panic!("writing session line: {e}"));
+        writeln!(file_handle, "{line}").unwrap_or_else(|e| panic!("writing session line: {e}"));
     }
     file_handle
         .flush()
@@ -90,7 +88,8 @@ fn run_with_env(home: &Path, args: &[&str], variables: &[(&str, &OsStr)]) -> Out
         .env("HOME", home)
         .env_remove("SESSIONS_HOME")
         .env_remove("GROK_HOME")
-        .env_remove("NO_COLOR");
+        .env_remove("NO_COLOR")
+        .env_remove("AL_PROJECTS_HOME");
     for (name, value) in variables {
         command.env(name, value);
     }
@@ -118,7 +117,10 @@ fn write_fake_tool(bin: &Path, name: &str, script: &str) {
 
 #[cfg(unix)]
 fn write_ssh_stub(bin: &Path) -> PathBuf {
-    let invocations = bin.parent().expect("stub bin parent").join("ssh-invocations");
+    let invocations = bin
+        .parent()
+        .expect("stub bin parent")
+        .join("ssh-invocations");
     write_fake_tool(
         bin,
         "ssh",
@@ -176,9 +178,15 @@ fn write_omp_fixture(home: &Path, id: &str, legacy: bool) -> PathBuf {
         .join(".omp/agent/sessions/--workspace-project--")
         .join(format!("2026-07-30T12-00-00_{id}.jsonl"));
     let header = if legacy {
-        format!(r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-07-30T12:00:00.000Z","cwd":"{}","titleSource":"converted","convertedFrom":"pi"}}"#, home.display())
+        format!(
+            r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-07-30T12:00:00.000Z","cwd":"{}","titleSource":"converted","convertedFrom":"pi"}}"#,
+            home.display()
+        )
     } else {
-        format!(r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-07-30T12:00:00.000Z","cwd":"{}","title":"native"}}"#, home.display())
+        format!(
+            r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-07-30T12:00:00.000Z","cwd":"{}","title":"native"}}"#,
+            home.display()
+        )
     };
     let model = if legacy {
         r#"{"type":"model_change","id":"model","parentId":null,"provider":"sessions-convert","modelId":"converted-from-pi"}"#.to_owned()
@@ -227,9 +235,9 @@ fn write_codex_fixture(home: &Path, id: &str, legacy: bool) -> PathBuf {
 /// shape of `format_epoch`, independent of timezone. Defends the field is a
 /// real numeric timestamp, not garbage.
 fn assert_local_timestamp(field: &str) {
-    let (date, time) = field.split_once(' ').unwrap_or_else(|| {
-        panic!("timestamp field is not 'date time': {field:?}")
-    });
+    let (date, time) = field
+        .split_once(' ')
+        .unwrap_or_else(|| panic!("timestamp field is not 'date time': {field:?}"));
     let date_parts: Vec<&str> = date.split('-').collect();
     assert_eq!(
         date_parts.len(),
@@ -270,10 +278,7 @@ fn list_paths_all_emits_five_field_ansi_free_tsv_with_exact_tool_id_path() {
     ];
     let path = write_pi_session(home.path(), dir, file, &lines);
 
-    let output = run(
-        home.path(),
-        &["sessions", "list", "--paths", "--all"],
-    );
+    let output = run(home.path(), &["sessions", "list", "--paths", "--all"]);
     assert!(
         output.status.success(),
         "list --paths --all failed: {}",
@@ -287,10 +292,7 @@ fn list_paths_all_emits_five_field_ansi_free_tsv_with_exact_tool_id_path() {
     );
 
     // Exactly one session row (one fixture) -> exactly one non-empty line.
-    let nonempty: Vec<&str> = stdout
-        .split('\n')
-        .filter(|line| !line.is_empty())
-        .collect();
+    let nonempty: Vec<&str> = stdout.split('\n').filter(|line| !line.is_empty()).collect();
     assert_eq!(
         nonempty.len(),
         1,
@@ -322,6 +324,126 @@ fn list_paths_all_emits_five_field_ansi_free_tsv_with_exact_tool_id_path() {
 }
 
 #[test]
+fn list_paths_all_hides_workflow_children_until_requested() {
+    let home = TempDir::new().unwrap();
+    let dir = "--workspace-project--";
+    let cwd = "/workspace/project";
+    let parent_id = "aaaaaaaa-0000-4000-8000-00000000000a";
+    let child_id = "aaaaaaaa-0000-4000-8000-00000000000b";
+    write_pi_session(
+        home.path(),
+        dir,
+        "2026-07-30T12-00-00-aaaaaaaa-0000-4000-8000-00000000000a.jsonl",
+        &[
+            header(parent_id, cwd),
+            message("m1", None, "user", "parent prompt"),
+        ],
+    );
+    write_pi_session(
+        home.path(),
+        dir,
+        "2026-07-30T12-00-01-aaaaaaaa-0000-4000-8000-00000000000b.jsonl",
+        &[
+            format!(
+                r#"{{"type":"session","version":3,"id":"{child_id}","timestamp":"2026-07-30T12:00:01.000Z","cwd":"{cwd}","sessionKind":"workflowWorker"}}"#
+            ),
+            message("m1", None, "user", "child worker prompt"),
+        ],
+    );
+
+    let hidden = run(home.path(), &["sessions", "list", "--paths", "--all"]);
+    assert!(
+        hidden.status.success(),
+        "list --paths --all failed: {}",
+        String::from_utf8_lossy(&hidden.stderr),
+    );
+    let hidden_stdout = String::from_utf8(hidden.stdout).unwrap();
+    assert!(
+        hidden_stdout.contains(parent_id),
+        "parent must stay listed: {hidden_stdout}"
+    );
+    assert!(
+        !hidden_stdout.contains(child_id),
+        "--all must not reveal children: {hidden_stdout}"
+    );
+
+    let shown = run(
+        home.path(),
+        &["sessions", "list", "--paths", "--all", "--children"],
+    );
+    assert!(
+        shown.status.success(),
+        "list --children failed: {}",
+        String::from_utf8_lossy(&shown.stderr),
+    );
+    let shown_stdout = String::from_utf8(shown.stdout).unwrap();
+    assert!(
+        shown_stdout.contains(parent_id) && shown_stdout.contains(child_id),
+        "--children must list parent and worker: {shown_stdout}"
+    );
+}
+
+#[test]
+fn search_hides_workflow_children_until_requested() {
+    let home = TempDir::new().unwrap();
+    let dir = "--workspace-project--";
+    let cwd = "/workspace/project";
+    let parent_id = "aaaaaaaa-0000-4000-8000-00000000000c";
+    let child_id = "aaaaaaaa-0000-4000-8000-00000000000d";
+    write_pi_session(
+        home.path(),
+        dir,
+        "2026-07-30T12-00-00-aaaaaaaa-0000-4000-8000-00000000000c.jsonl",
+        &[
+            header(parent_id, cwd),
+            message("m1", None, "user", "shared unique token in parent"),
+        ],
+    );
+    write_pi_session(
+        home.path(),
+        dir,
+        "2026-07-30T12-00-01-aaaaaaaa-0000-4000-8000-00000000000d.jsonl",
+        &[
+            format!(
+                r#"{{"type":"session","version":3,"id":"{child_id}","timestamp":"2026-07-30T12:00:01.000Z","cwd":"{cwd}","sessionKind":"workflowPlanner"}}"#
+            ),
+            message("m1", None, "user", "shared unique token in child"),
+        ],
+    );
+
+    let hidden = run(home.path(), &["sessions", "search", "unique token"]);
+    assert!(
+        hidden.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&hidden.stderr),
+    );
+    let hidden_stdout = String::from_utf8(hidden.stdout).unwrap();
+    assert!(
+        hidden_stdout.contains(parent_id),
+        "parent must match search: {hidden_stdout}"
+    );
+    assert!(
+        !hidden_stdout.contains(child_id),
+        "default search must hide children: {hidden_stdout}"
+    );
+
+    let shown = run(
+        home.path(),
+        &["sessions", "search", "--children", "unique token"],
+    );
+    assert!(
+        shown.status.success(),
+        "search --children failed: {}",
+        String::from_utf8_lossy(&shown.stderr),
+    );
+    let shown_stdout = String::from_utf8(shown.stdout).unwrap();
+    assert!(
+        shown_stdout.contains(parent_id) && shown_stdout.contains(child_id),
+        "--children search must include the worker: {shown_stdout}"
+    );
+}
+
+#[test]
 fn list_paths_zero_emits_nothing_and_exits_zero() {
     let home = TempDir::new().unwrap();
     // A real fixture is present so the empty output is attributable to the
@@ -336,11 +458,7 @@ fn list_paths_zero_emits_nothing_and_exits_zero() {
     write_pi_session(home.path(), dir, file, &lines);
 
     let output = run(home.path(), &["sessions", "list", "--paths", "0"]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "list --paths 0 must exit 0",
-    );
+    assert_eq!(output.status.code(), Some(0), "list --paths 0 must exit 0",);
     assert!(
         output.stdout.is_empty(),
         "list --paths 0 must emit no stdout, got: {:?}",
@@ -354,22 +472,13 @@ fn explicit_session_hosts_preserve_order_local_and_forward_only_list_flags() {
     let home = TempDir::new().unwrap();
     let bin = home.path().join("bin");
     let invocations = write_ssh_stub(&bin);
-    let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-        .unwrap();
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     let output = run_with_env(
         home.path(),
         &[
-            "sessions",
-            "list",
-            "4",
-            "--all",
-            "--dedupe",
-            "--host",
-            "host-a",
-            "--host",
-            "local",
-            "--host",
-            "host-b",
+            "sessions", "list", "4", "--all", "--dedupe", "--host", "host-a", "--host", "local",
+            "--host", "host-b",
         ],
         &[
             ("PATH", path.as_os_str()),
@@ -397,8 +506,8 @@ fn session_host_metacharacters_are_one_literal_ssh_argument() {
     let home = TempDir::new().unwrap();
     let bin = home.path().join("bin");
     let invocations = write_ssh_stub(&bin);
-    let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-        .unwrap();
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     let host = "host-a;printf-injected";
     let output = run_with_env(
         home.path(),
@@ -425,18 +534,11 @@ fn session_hosts_continue_after_failure_return_one_and_hide_remote_stderr() {
     let home = TempDir::new().unwrap();
     let bin = home.path().join("bin");
     let invocations = write_ssh_stub(&bin);
-    let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-        .unwrap();
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     let output = run_with_env(
         home.path(),
-        &[
-            "sessions",
-            "list",
-            "--host",
-            "host-c",
-            "--host",
-            "host-b",
-        ],
+        &["sessions", "list", "--host", "host-c", "--host", "host-b"],
         &[
             ("PATH", path.as_os_str()),
             ("SSH_INVOCATIONS", invocations.as_os_str()),
@@ -451,7 +553,11 @@ fn session_hosts_continue_after_failure_return_one_and_hide_remote_stderr() {
     assert!(stderr.contains("host-c"));
     assert!(stderr.contains("ssh exited with exit status: 23"));
     assert!(!stderr.contains("private session body"));
-    assert!(fs::read_to_string(invocations).unwrap().contains("<host-b>"));
+    assert!(
+        fs::read_to_string(invocations)
+            .unwrap()
+            .contains("<host-b>")
+    );
 }
 
 #[cfg(unix)]
@@ -460,8 +566,8 @@ fn session_host_forbidden_combinations_fail_before_ssh() {
     let home = TempDir::new().unwrap();
     let bin = home.path().join("bin");
     let invocations = write_ssh_stub(&bin);
-    let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-        .unwrap();
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     for prefix in [&["sessions"][..], &["sessions", "list"][..]] {
         for mode in ["--paths", "--picker", "--fzf"] {
             let mut args = prefix.to_vec();
@@ -506,8 +612,18 @@ fn search_uppercase_query_finds_lowercase_message_body_and_summary() {
     let match_id = "cccccccc-0000-4000-8000-000000000003";
     let match_lines = vec![
         header(match_id, "/tmp/match"),
-        message("u1", None, "user", "reproduce the off by one bug in the parser"),
-        message("a1", Some("u1"), "assistant", "the off by one error is in tokenize"),
+        message(
+            "u1",
+            None,
+            "user",
+            "reproduce the off by one bug in the parser",
+        ),
+        message(
+            "a1",
+            Some("u1"),
+            "assistant",
+            "the off by one error is in tokenize",
+        ),
     ];
     write_pi_session(
         home.path(),
@@ -621,13 +737,21 @@ fn legacy_omp_open_and_fork_launch_new_native_copies_without_touching_source() {
         );
 
         let invocation = fs::read_to_string(&invocations).unwrap();
-        let prefix = if command == "open" { "--resume " } else { "--fork " };
+        let prefix = if command == "open" {
+            "--resume "
+        } else {
+            "--fork "
+        };
         let launched_path = PathBuf::from(invocation.trim().strip_prefix(prefix).unwrap());
         assert_ne!(launched_path, source);
         assert!(launched_path.is_file());
         assert_ne!(first_json_id(&launched_path, "/id"), original_id);
         assert_eq!(fs::read(&source).unwrap(), before);
-        assert!(String::from_utf8(before).unwrap().contains("keep-on-original"));
+        assert!(
+            String::from_utf8(before)
+                .unwrap()
+                .contains("keep-on-original")
+        );
     }
 }
 
@@ -675,7 +799,11 @@ esac
     assert_ne!(outputs[0], source);
     assert_eq!(first_json_id(&outputs[0], "/payload/id"), launched_id);
     assert_eq!(fs::read(&source).unwrap(), before);
-    assert!(String::from_utf8(before).unwrap().contains("keep-on-original"));
+    assert!(
+        String::from_utf8(before)
+            .unwrap()
+            .contains("keep-on-original")
+    );
 }
 
 #[cfg(unix)]
@@ -744,11 +872,7 @@ fn native_same_format_sessions_launch_original_without_materializing() {
 fn print_command_never_materializes_or_mutates_legacy_same_format_sessions() {
     let home = TempDir::new().unwrap();
     let omp = write_omp_fixture(home.path(), "legacy-print-omp", true);
-    let codex = write_codex_fixture(
-        home.path(),
-        "33333333-3333-4333-8333-333333333333",
-        true,
-    );
+    let codex = write_codex_fixture(home.path(), "33333333-3333-4333-8333-333333333333", true);
     let omp_before = fs::read(&omp).unwrap();
     let codex_before = fs::read(&codex).unwrap();
 
@@ -792,10 +916,25 @@ fn agentlo_default_continues_existing_chat_without_fallback() {
         "agent",
         "#!/bin/sh\nfor a in \"$@\"; do printf '<%s>\\n' \"$a\" >> \"$AL_AGENT_INVOCATIONS\"; done\n",
     );
-    let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
-    let output = run_with_env(home.path(), &["agentlo"], &[("PATH", path.as_os_str()), ("AL_AGENT_INVOCATIONS", invocations.as_os_str())]);
-    assert!(output.status.success(), "agentlo failed: {}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(fs::read_to_string(&invocations).unwrap(), "<--force>\n<--trust>\n<--approve-mcps>\n<--continue>\n");
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["agentlo"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("AL_AGENT_INVOCATIONS", invocations.as_os_str()),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "agentlo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&invocations).unwrap(),
+        "<--force>\n<--trust>\n<--approve-mcps>\n<--continue>\n"
+    );
 }
 
 #[cfg(unix)]
@@ -809,10 +948,25 @@ fn agentlo_default_starts_new_chat_when_continue_fails() {
         "agent",
         "#!/bin/sh\nfor a in \"$@\"; do printf '<%s>\\n' \"$a\" >> \"$AL_AGENT_INVOCATIONS\"; done\ncase \" $* \" in *' --continue '*) exit 1;; esac\n",
     );
-    let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
-    let output = run_with_env(home.path(), &["agentlo"], &[("PATH", path.as_os_str()), ("AL_AGENT_INVOCATIONS", invocations.as_os_str())]);
-    assert!(output.status.success(), "agentlo fallback failed: {}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(fs::read_to_string(&invocations).unwrap(), "<--force>\n<--trust>\n<--approve-mcps>\n<--continue>\n<--force>\n<--trust>\n<--approve-mcps>\n");
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["agentlo"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("AL_AGENT_INVOCATIONS", invocations.as_os_str()),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "agentlo fallback failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&invocations).unwrap(),
+        "<--force>\n<--trust>\n<--approve-mcps>\n<--continue>\n<--force>\n<--trust>\n<--approve-mcps>\n"
+    );
 }
 
 #[cfg(unix)]
@@ -826,8 +980,8 @@ fn agentlo_protected_tail_survives_without_shell_reparsing() {
         "agent",
         "#!/bin/sh\nfor a in \"$@\"; do printf '<%s>\\n' \"$a\" >> \"$AL_AGENT_INVOCATIONS\"; done\n",
     );
-    let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-        .unwrap();
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     // A literal `--` protects the tail from launcher flag parsing; the
     // positional tail becomes the resume id. Shell metacharacters must
     // survive byte-for-byte because `al` execs structured argv, never a
@@ -912,8 +1066,8 @@ fn sessions_fzf_picks_session_and_opens_native_pi() {
         ],
     );
     let (bin, fzf_state, pi_invocations) = write_picker_stubs(home.path());
-    let path_var = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-        .unwrap();
+    let path_var =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     let output = run_with_env(
         home.path(),
         &["sessions", "--fzf"],
@@ -950,8 +1104,8 @@ fn sessions_list_fzf_matches_bare_fzf() {
         ],
     );
     let (bin, fzf_state, pi_invocations) = write_picker_stubs(home.path());
-    let path_var = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-        .unwrap();
+    let path_var =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     let output = run_with_env(
         home.path(),
         &["sessions", "list", "--fzf"],
@@ -997,8 +1151,8 @@ fn sessions_query_searches_then_opens_only_the_match() {
         ],
     );
     let (bin, fzf_state, pi_invocations) = write_picker_stubs(home.path());
-    let path_var = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-        .unwrap();
+    let path_var =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     let output = run_with_env(
         home.path(),
         &["sessions", "query", "UNIQUE", "needle"],
@@ -1034,8 +1188,8 @@ fn sessions_query_without_match_cancels_without_launching() {
         ],
     );
     let (bin, fzf_state, pi_invocations) = write_picker_stubs(home.path());
-    let path_var = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-        .unwrap();
+    let path_var =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     let output = run_with_env(
         home.path(),
         &["sessions", "query", "missing-term-xyz"],
@@ -1046,8 +1200,14 @@ fn sessions_query_without_match_cancels_without_launching() {
         ],
     );
     assert_eq!(output.status.code(), Some(1));
-    assert!(!fzf_state.exists(), "empty query results must not spawn fzf");
-    assert!(!pi_invocations.exists(), "empty query results must not launch");
+    assert!(
+        !fzf_state.exists(),
+        "empty query results must not spawn fzf"
+    );
+    assert!(
+        !pi_invocations.exists(),
+        "empty query results must not launch"
+    );
 }
 
 #[test]
@@ -1060,9 +1220,14 @@ fn sessions_fzf_on_empty_catalog_cancels() {
 #[test]
 fn sessions_query_requires_a_nonempty_query() {
     let home = TempDir::new().unwrap();
-    assert_eq!(run(home.path(), &["sessions", "query"]).status.code(), Some(2));
     assert_eq!(
-        run(home.path(), &["sessions", "query", "   "]).status.code(),
+        run(home.path(), &["sessions", "query"]).status.code(),
+        Some(2)
+    );
+    assert_eq!(
+        run(home.path(), &["sessions", "query", "   "])
+            .status
+            .code(),
         Some(2)
     );
 }
@@ -1115,12 +1280,7 @@ fn sessions_move_rehomes_pi_workspace_directory() {
 
     let output = run(
         home.path(),
-        &[
-            "sessions",
-            "move",
-            "/workspace/project",
-            "/workspace/moved",
-        ],
+        &["sessions", "move", "/workspace/project", "/workspace/moved"],
     );
     assert!(
         output.status.success(),
@@ -1133,7 +1293,10 @@ fn sessions_move_rehomes_pi_workspace_directory() {
         dest.contains("/.pi/agent/sessions/--workspace-moved--/"),
         "expected re-homed Pi path, got {dest:?}"
     );
-    assert!(Path::new(dest).is_file(), "moved destination is missing: {dest}");
+    assert!(
+        Path::new(dest).is_file(),
+        "moved destination is missing: {dest}"
+    );
     assert!(
         !source.exists(),
         "source session should be deleted after move: {}",
@@ -1176,7 +1339,11 @@ fn sessions_move_copies_catalog_folder_without_rewriting_cwd() {
         String::from_utf8_lossy(&output.stderr),
     );
     let dest = to.join(file);
-    assert!(!source.exists(), "source should be gone: {}", source.display());
+    assert!(
+        !source.exists(),
+        "source should be gone: {}",
+        source.display()
+    );
     assert!(dest.is_file(), "destination missing: {}", dest.display());
     let text = fs::read_to_string(&dest).unwrap();
     assert!(
@@ -1309,9 +1476,7 @@ fn sessions_move_rpi_workspace() {
     let dest = String::from_utf8(output.stdout).unwrap();
     let dest = dest.trim();
     assert!(
-        dest.ends_with(&format!(
-            "/.rpi/sessions/--workspace-new-project--/{file}"
-        )),
+        dest.ends_with(&format!("/.rpi/sessions/--workspace-new-project--/{file}")),
         "unexpected dest {dest:?}"
     );
     assert!(Path::new(dest).is_file());
@@ -1320,4 +1485,330 @@ fn sessions_move_rpi_workspace() {
     let text = fs::read_to_string(dest).unwrap();
     assert!(text.contains(to), "{text}");
     assert!(!text.contains(from), "{text}");
+}
+
+#[test]
+fn new_project_creates_updates_and_worktree() {
+    let home = TempDir::new().unwrap();
+    let destination = home.path().join("Projects").join("sample-app");
+    let created = run(home.path(), &["new", "sample-app", "ship the parser"]);
+    assert!(
+        created.status.success(),
+        "al new create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&created.stdout).trim(),
+        destination.to_str().expect("utf-8 dest")
+    );
+    let goal = fs::read_to_string(destination.join("GOAL.md")).expect("GOAL.md");
+    assert!(goal.contains("ship the parser"), "{goal}");
+    let log = Command::new("git")
+        .args(["log", "-1", "--pretty=%s"])
+        .current_dir(&destination)
+        .output()
+        .expect("git log");
+    assert_eq!(
+        String::from_utf8_lossy(&log.stdout).trim(),
+        "Initial commit"
+    );
+
+    let updated = run(home.path(), &["new", "sample-app", "next goal"]);
+    assert!(
+        updated.status.success(),
+        "al new update failed: {}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+    let goal = fs::read_to_string(destination.join("GOAL.md")).expect("GOAL.md");
+    assert!(goal.contains("next goal"), "{goal}");
+
+    let planned = run(
+        home.path(),
+        &[
+            "new",
+            "x3",
+            "~/Projects/pi-zig",
+            "完成zig版本的pi-coding-agent",
+            "--executor",
+            "omp",
+            "--worktree",
+            "--print-command",
+        ],
+    );
+    assert!(
+        planned.status.success(),
+        "al new --print-command failed: {}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    assert!(!home.path().join("Projects").join("pi-zig").exists());
+    let stdout = String::from_utf8_lossy(&planned.stdout);
+    assert!(stdout.contains("x3"), "{stdout}");
+    assert!(stdout.contains("$HOME/Projects/pi-zig-wt"), "{stdout}");
+    assert!(stdout.contains("omlo-pi-zig-wt"), "{stdout}");
+    assert!(stdout.contains("omp --auto-approve"), "{stdout}");
+    assert!(
+        stdout.contains("goal\tomlo-pi-zig-wt\t/goal then 完成zig版本的pi-coding-agent"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("You are the executor"),
+        "startup argv prompt should be gone: {stdout}"
+    );
+
+    let grok_plan = run(
+        home.path(),
+        &[
+            "new",
+            "~/Projects/sample-app",
+            "ship the parser",
+            "--executor",
+            "grok",
+            "--print-command",
+        ],
+    );
+    assert!(
+        grok_plan.status.success(),
+        "al new grok --print-command failed: {}",
+        String::from_utf8_lossy(&grok_plan.stderr)
+    );
+    let grok_out = String::from_utf8_lossy(&grok_plan.stdout);
+    assert!(
+        grok_out.contains("goal\tgrolo-sample-app\t/goal ship the parser"),
+        "{grok_out}"
+    );
+
+    let agent_plan = run(
+        home.path(),
+        &[
+            "new",
+            "~/Projects/sample-app",
+            "ship the parser",
+            "--executor",
+            "agent",
+            "--print-command",
+        ],
+    );
+    assert!(agent_plan.status.success());
+    let agent_out = String::from_utf8_lossy(&agent_plan.stdout);
+    assert!(
+        agent_out.contains("goal\tagentlo-sample-app\tGOAL.md only (agentlo has no /goal)"),
+        "{agent_out}"
+    );
+
+    let no_tmux_fleet = run(
+        home.path(),
+        &[
+            "new",
+            "sample-app",
+            "ship the parser",
+            "--orchestrator",
+            "pi",
+            "--executor",
+            "omp",
+            "--no-tmux",
+        ],
+    );
+    assert!(
+        !no_tmux_fleet.status.success(),
+        "multiple roles + --no-tmux should fail"
+    );
+    let no_tmux_err = String::from_utf8_lossy(&no_tmux_fleet.stderr);
+    assert!(
+        no_tmux_err.contains("multiple roles require tmux"),
+        "{no_tmux_err}"
+    );
+
+    let worktree = run(
+        home.path(),
+        &[
+            "new",
+            destination.to_str().expect("utf-8 repo"),
+            "use a worktree",
+            "--worktree",
+            "feat",
+        ],
+    );
+    assert!(
+        worktree.status.success(),
+        "al new --worktree failed: {}",
+        String::from_utf8_lossy(&worktree.stderr)
+    );
+    let dest = home.path().join("Projects").join("sample-app-feat");
+    assert_eq!(
+        String::from_utf8_lossy(&worktree.stdout).trim(),
+        dest.to_str().expect("utf-8 dest")
+    );
+    let goal = fs::read_to_string(dest.join("GOAL.md")).expect("worktree GOAL.md");
+    assert!(goal.contains("use a worktree"), "{goal}");
+    assert!(dest.join(".git").exists());
+}
+
+#[cfg(unix)]
+fn path_with(bin: &Path) -> std::ffi::OsString {
+    let mut path = bin.as_os_str().to_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path
+}
+
+#[cfg(unix)]
+fn tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn kill_tmux_session(session: &str) {
+    let _ = Command::new("tmux")
+        .args(["kill-session", "-t", session])
+        .status();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_project_no_tmux_warns_that_goal_cannot_be_sent() {
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    write_fake_tool(&bin, "grok", "#!/bin/sh\nexit 0\n");
+    let path = path_with(&bin);
+    let output = run_with_env(
+        home.path(),
+        &[
+            "new",
+            "sample-app",
+            "ship the parser",
+            "--executor",
+            "grok",
+            "--no-tmux",
+        ],
+        &[("PATH", path.as_os_str())],
+    );
+    assert!(
+        output.status.success(),
+        "al new --no-tmux failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot send /goal"),
+        "expected /goal warning, got {stderr}"
+    );
+    let dest = home.path().join("Projects").join("sample-app");
+    let goal = fs::read_to_string(dest.join("GOAL.md")).expect("GOAL.md");
+    assert!(goal.contains("ship the parser"), "{goal}");
+    assert!(dest.join(".al").join("executor.md").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn new_project_sends_native_goal_via_tmux() {
+    if !tmux_available() {
+        eprintln!("skipping new_project_sends_native_goal_via_tmux: tmux not on PATH");
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let grok_name = format!("altest-grok-{}-{stamp}", std::process::id());
+    let omp_name = format!("altest-omp-{}-{stamp}", std::process::id());
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    write_fake_tool(
+        &bin,
+        "grok",
+        "#!/bin/sh\nprintf 'ready\\nNo goal\\n>\\n'\nexec cat\n",
+    );
+    write_fake_tool(
+        &bin,
+        "omp",
+        "#!/bin/sh\nprintf 'ready\\nNo goal\\n>\\n'\nexec cat\n",
+    );
+    let path = path_with(&bin);
+    let wait = std::ffi::OsString::from("2000");
+    let _grok_guard = scopeguard_kill(&grok_name);
+    let grok = run_with_env(
+        home.path(),
+        &["new", &grok_name, "ship the parser", "--executor", "grok"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("AL_GOAL_WAIT_MS", wait.as_os_str()),
+        ],
+    );
+    assert!(
+        grok.status.success(),
+        "al new --executor grok failed: {}",
+        String::from_utf8_lossy(&grok.stderr)
+    );
+    let grok_pane = Command::new("tmux")
+        .args([
+            "capture-pane",
+            "-p",
+            "-t",
+            &format!("{grok_name}:grolo-{grok_name}"),
+        ])
+        .output()
+        .expect("tmux capture grok");
+    assert!(grok_pane.status.success(), "grok capture failed");
+    let grok_text = String::from_utf8_lossy(&grok_pane.stdout);
+    assert!(
+        grok_text.contains("/goal ship the parser"),
+        "grok pane missing /goal: {grok_text:?}"
+    );
+
+    let _omp_guard = scopeguard_kill(&omp_name);
+    let omp = run_with_env(
+        home.path(),
+        &["new", &omp_name, "ship the parser", "--executor", "omp"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("AL_GOAL_WAIT_MS", wait.as_os_str()),
+        ],
+    );
+    assert!(
+        omp.status.success(),
+        "al new --executor omp failed: {}",
+        String::from_utf8_lossy(&omp.stderr)
+    );
+    let omp_pane = Command::new("tmux")
+        .args([
+            "capture-pane",
+            "-p",
+            "-t",
+            &format!("{omp_name}:omlo-{omp_name}"),
+        ])
+        .output()
+        .expect("tmux capture omp");
+    assert!(omp_pane.status.success(), "omp capture failed");
+    let omp_text = String::from_utf8_lossy(&omp_pane.stdout);
+    assert!(
+        omp_text.contains("/goal"),
+        "omp pane missing /goal: {omp_text:?}"
+    );
+    assert!(
+        omp_text.contains("ship the parser"),
+        "omp pane missing goal text: {omp_text:?}"
+    );
+}
+
+#[cfg(unix)]
+fn scopeguard_kill(session: &str) -> TmuxKillOnDrop {
+    TmuxKillOnDrop {
+        session: session.to_owned(),
+    }
+}
+
+#[cfg(unix)]
+struct TmuxKillOnDrop {
+    session: String,
+}
+
+#[cfg(unix)]
+impl Drop for TmuxKillOnDrop {
+    fn drop(&mut self) {
+        kill_tmux_session(&self.session);
+    }
 }

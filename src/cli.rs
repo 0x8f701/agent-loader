@@ -13,7 +13,6 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-
 impl Cli {
     pub fn try_parse_from<I, T>(arguments: I) -> Result<Self, clap::Error>
     where
@@ -36,7 +35,15 @@ fn restore_raw_tail(cli: &mut Cli, arguments: &[OsString]) {
     };
     if !matches!(
         command_name,
-        "omlo" | "pilo" | "rpilo" | "grolo" | "hyperlo" | "dolo" | "colo" | "cclo" | "agentlo"
+        "omlo"
+            | "pilo"
+            | "rpilo"
+            | "grolo"
+            | "hyperlo"
+            | "dolo"
+            | "colo"
+            | "cclo"
+            | "agentlo"
             | "tmux-run"
     ) {
         return;
@@ -68,6 +75,8 @@ pub enum Command {
     Colo(RawTail),
     Cclo(RawTail),
     Agentlo(RawTail),
+    /// Create or update a git project, optionally make a worktree, then open it.
+    New(NewProjectArgs),
     #[command(name = "tmux-run")]
     TmuxRun(RawTail),
     #[command(name = "__tmux-child", hide = true)]
@@ -106,6 +115,9 @@ pub struct SessionListArgs {
     pub all: bool,
     #[arg(long)]
     pub dedupe: bool,
+    /// Include workflow/subagent child sessions in the listing.
+    #[arg(long)]
+    pub children: bool,
     #[arg(
         long = "host",
         value_name = "HOST",
@@ -126,6 +138,9 @@ pub struct SessionListArgs {
 pub struct SessionSearchArgs {
     #[arg(long)]
     pub dedupe: bool,
+    /// Include workflow/subagent child sessions in the search results.
+    #[arg(long)]
+    pub children: bool,
     #[arg(long)]
     pub picker: bool,
     #[arg(value_parser = nonempty_query)]
@@ -180,7 +195,6 @@ pub struct SessionSyncArgs {
     pub dry_run: bool,
 }
 
-
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct SessionQueryArgs {
     #[arg(required = true, num_args = 1.., value_parser = nonempty_query)]
@@ -195,6 +209,39 @@ pub struct RawTail {
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
+pub struct NewProjectArgs {
+    /// `HOST NAME|PATH GOAL` on a remote machine, or `NAME|PATH GOAL` on this machine.
+    /// A bare name goes under ~/Projects (or $AL_PROJECTS_HOME).
+    #[arg(
+        required = true,
+        num_args = 2..=3,
+        value_names = ["HOST|PATH", "PATH|GOAL", "GOAL"]
+    )]
+    pub args: Vec<String>,
+    /// Launch the executor agent (`pilo`, `omlo`, `omp`, …). Unix tmux only.
+    #[arg(long, value_parser = crate::new::parse_launcher_tool)]
+    pub executor: Option<crate::launcher::LauncherKind>,
+    /// Launch the orchestrator / supervisor agent in another tmux window (Unix only).
+    #[arg(long, value_parser = crate::new::parse_launcher_tool)]
+    pub orchestrator: Option<crate::launcher::LauncherKind>,
+    /// Launch the reviewer agent in another tmux window (Unix only).
+    #[arg(long, value_parser = crate::new::parse_launcher_tool)]
+    pub reviewer: Option<crate::launcher::LauncherKind>,
+    /// Create `~/Projects/<repo>-<NAME>` as a git worktree (NAME defaults to `wt`).
+    #[arg(long, visible_alias = "wt", num_args = 0..=1, default_missing_value = "wt", value_name = "NAME")]
+    pub worktree: Option<String>,
+    /// Open the project in tmux (Unix only; implied by a role flag unless --no-tmux).
+    #[arg(long, default_value_t = false, conflicts_with = "no_tmux")]
+    pub tmux: bool,
+    /// Write the goal (and optionally launch) without wrapping in tmux.
+    #[arg(long)]
+    pub no_tmux: bool,
+    /// Print the create/open plan without writing files or running ssh.
+    #[arg(long)]
+    pub print_command: bool,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
 pub struct TmuxChildArgs {
     #[arg(long)]
     pub payload: PathBuf,
@@ -203,11 +250,15 @@ pub struct TmuxChildArgs {
 }
 
 fn parse_target_tool(value: &str) -> Result<TargetTool, String> {
-    value.parse::<TargetTool>().map_err(|error| error.to_string())
+    value
+        .parse::<TargetTool>()
+        .map_err(|error| error.to_string())
 }
 
 fn non_agent_source(value: &str) -> Result<SourceTool, String> {
-    let tool = value.parse::<SourceTool>().map_err(|error| error.to_string())?;
+    let tool = value
+        .parse::<SourceTool>()
+        .map_err(|error| error.to_string())?;
     if tool == SourceTool::Agent {
         Err("Agent sessions do not support conversion, move, or sync".to_owned())
     } else {
@@ -223,7 +274,6 @@ fn non_agent_target(value: &str) -> Result<TargetTool, String> {
         Ok(tool)
     }
 }
-
 
 fn nonempty_query(value: &str) -> Result<String, String> {
     if value.trim().is_empty() {
@@ -271,11 +321,16 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Pilo(args) => dispatch_launcher(crate::launcher::LauncherKind::Pi, args.argv),
         Command::Rpilo(args) => dispatch_launcher(crate::launcher::LauncherKind::Rpi, args.argv),
         Command::Grolo(args) => dispatch_launcher(crate::launcher::LauncherKind::Grok, args.argv),
-        Command::Hyperlo(args) => dispatch_launcher(crate::launcher::LauncherKind::Hyper, args.argv),
+        Command::Hyperlo(args) => {
+            dispatch_launcher(crate::launcher::LauncherKind::Hyper, args.argv)
+        }
         Command::Dolo(args) => dispatch_launcher(crate::launcher::LauncherKind::Droid, args.argv),
         Command::Colo(args) => dispatch_launcher(crate::launcher::LauncherKind::Codex, args.argv),
         Command::Cclo(args) => dispatch_launcher(crate::launcher::LauncherKind::Claude, args.argv),
-        Command::Agentlo(args) => dispatch_launcher(crate::launcher::LauncherKind::Agent, args.argv),
+        Command::Agentlo(args) => {
+            dispatch_launcher(crate::launcher::LauncherKind::Agent, args.argv)
+        }
+        Command::New(args) => dispatch_new(args),
         Command::TmuxRun(args) => dispatch_tmux_run(args.argv),
         Command::TmuxChild(args) => dispatch_tmux_child(args),
     }
@@ -292,9 +347,12 @@ fn dispatch_sessions(sessions: SessionsCli) -> anyhow::Result<()> {
         Some(SessionsCommand::Fork(args)) => {
             dispatch_session_launch(args.session_ref, args.target_tool, args.print_command, true)
         }
-        Some(SessionsCommand::Open(args)) => {
-            dispatch_session_launch(args.session_ref, args.target_tool, args.print_command, false)
-        }
+        Some(SessionsCommand::Open(args)) => dispatch_session_launch(
+            args.session_ref,
+            args.target_tool,
+            args.print_command,
+            false,
+        ),
         Some(SessionsCommand::Sync(args)) => dispatch_sync(args),
     }
 }
@@ -329,6 +387,7 @@ fn dispatch_local_list(args: &SessionListArgs) -> anyhow::Result<()> {
         count: args.count,
         show_all: args.all,
         dedupe: args.dedupe,
+        include_children: args.children,
         tools: Vec::new(),
     })?;
     if args.paths {
@@ -351,16 +410,20 @@ fn dispatch_local_list(args: &SessionListArgs) -> anyhow::Result<()> {
 
 fn dispatch_remote_list(host: &str, remote_command: &str) -> anyhow::Result<bool> {
     let output = match std::process::Command::new("ssh")
-        .args(["-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1", "--"])
+        .args([
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ConnectionAttempts=1",
+            "--",
+        ])
         .arg(host)
         .arg(remote_command)
         .output()
     {
         Ok(output) => output,
         Err(error) => {
-            eprintln!(
-                "al: sessions list failed for host {host:?}: could not run ssh: {error}"
-            );
+            eprintln!("al: sessions list failed for host {host:?}: could not run ssh: {error}");
             return Ok(false);
         }
     };
@@ -389,6 +452,9 @@ fn remote_session_list_command(args: &SessionListArgs) -> String {
     if args.dedupe {
         command.push_str(" '--dedupe'");
     }
+    if args.children {
+        command.push_str(" '--children'");
+    }
     command
 }
 
@@ -411,6 +477,7 @@ fn dispatch_search(args: SessionSearchArgs) -> anyhow::Result<()> {
         &args.query,
         &crate::sessions::SearchOptions {
             dedupe: args.dedupe,
+            include_children: args.children,
             tools: Vec::new(),
         },
     )?;
@@ -457,7 +524,6 @@ fn dispatch_sync(args: SessionSyncArgs) -> anyhow::Result<()> {
     exit_with(report.exit_code())
 }
 
-
 fn dispatch_launcher(
     kind: crate::launcher::LauncherKind,
     argv: Vec<OsString>,
@@ -498,7 +564,6 @@ fn print_byte_lines(lines: &[u8]) -> anyhow::Result<()> {
         write_stdout_bytes(lines, true)
     }
 }
-
 
 fn write_stdout(value: &str) -> anyhow::Result<()> {
     write_stdout_bytes(value.as_bytes(), false)
@@ -575,7 +640,6 @@ fn sessions_home() -> anyhow::Result<PathBuf> {
         .unwrap_or(home_dir()?))
 }
 
-
 fn exit_with(code: i32) -> anyhow::Result<()> {
     if code == 0 {
         Ok(())
@@ -631,14 +695,8 @@ fn dispatch_session_launch(
         || (session.tool == SourceTool::Grok && target == TargetTool::Hyper)
         || (session.tool.uses_pi_jsonl() && target.uses_pi_storage());
 
-    let (path, session_id, created_output) = prepare_session_launch(
-        &session,
-        target,
-        same_format,
-        print_command,
-        fork,
-        &home,
-    )?;
+    let (path, session_id, created_output) =
+        prepare_session_launch(&session, target, same_format, print_command, fork, &home)?;
 
     let mut plan = if fork && !same_format {
         if target == TargetTool::Claude {
@@ -652,23 +710,16 @@ fn dispatch_session_launch(
             let kind = launcher_kind_for_target(target);
             let args = match target {
                 TargetTool::Droid => vec![OsString::from(&session_id)],
-                TargetTool::Pi | TargetTool::Rpi | TargetTool::Omp => vec![
-                    OsString::from("--session"),
-                    path.as_os_str().to_owned(),
-                ],
-                TargetTool::Codex | TargetTool::Grok | TargetTool::Hyper => vec![
-                    OsString::from("--session"),
-                    OsString::from(&session_id),
-                ],
+                TargetTool::Pi | TargetTool::Rpi | TargetTool::Omp => {
+                    vec![OsString::from("--session"), path.as_os_str().to_owned()]
+                }
+                TargetTool::Codex | TargetTool::Grok | TargetTool::Hyper => {
+                    vec![OsString::from("--session"), OsString::from(&session_id)]
+                }
                 TargetTool::Claude => unreachable!(),
                 TargetTool::Agent => unreachable!("Agent cross-format launch rejected"),
             };
-            crate::launcher::build_launcher(
-                kind,
-                &args,
-                &home,
-                &std::env::current_dir()?,
-            )?
+            crate::launcher::build_launcher(kind, &args, &home, &std::env::current_dir()?)?
         }
     } else {
         let command = if fork {
@@ -737,6 +788,7 @@ fn dispatch_picker(query: Option<String>) -> anyhow::Result<()> {
             &query,
             &crate::sessions::SearchOptions {
                 dedupe: true,
+                include_children: false,
                 tools: Vec::new(),
             },
         )?,
@@ -744,6 +796,7 @@ fn dispatch_picker(query: Option<String>) -> anyhow::Result<()> {
             count: None,
             show_all: true,
             dedupe: true,
+            include_children: false,
             tools: Vec::new(),
         })?,
     };
@@ -787,7 +840,9 @@ fn launch_cwd(recorded: &std::path::Path) -> Option<PathBuf> {
     cwd
 }
 
-fn plan_command(plan: &crate::launcher::LaunchPlan) -> anyhow::Result<&crate::launcher::CommandSpec> {
+fn plan_command(
+    plan: &crate::launcher::LaunchPlan,
+) -> anyhow::Result<&crate::launcher::CommandSpec> {
     match plan {
         crate::launcher::LaunchPlan::Command(command) => Ok(command),
         crate::launcher::LaunchPlan::Fallback { primary, .. } => Ok(primary),
@@ -796,6 +851,23 @@ fn plan_command(plan: &crate::launcher::LaunchPlan) -> anyhow::Result<&crate::la
             anyhow::bail!("cannot print a remote launcher command for a local session")
         }
     }
+}
+
+fn dispatch_new(args: NewProjectArgs) -> anyhow::Result<()> {
+    let (host, path, goal) = crate::new::parse_new_targets(&args.args)?;
+    let has_role =
+        args.executor.is_some() || args.orchestrator.is_some() || args.reviewer.is_some();
+    crate::new::run(crate::new::NewProject {
+        host,
+        path,
+        goal,
+        executor: args.executor,
+        orchestrator: args.orchestrator,
+        reviewer: args.reviewer,
+        worktree: args.worktree,
+        tmux: !args.no_tmux && (args.tmux || has_role),
+        print_command: args.print_command,
+    })
 }
 
 fn dispatch_tmux_run(argv: Vec<OsString>) -> anyhow::Result<()> {
@@ -826,8 +898,12 @@ mod tests {
 
     use clap::CommandFactory;
 
-    use super::{Cli, Command, SessionsCommand, home_dir_from};
+    use super::{
+        Cli, Command, NewProjectArgs, SessionListArgs, SessionsCommand, home_dir_from,
+        remote_session_list_command,
+    };
     use crate::domain::{SourceTool, TargetTool};
+    use crate::launcher::LauncherKind;
 
     #[test]
     fn home_selection_prefers_home_and_rejects_missing_values() {
@@ -862,18 +938,24 @@ mod tests {
 
     #[test]
     fn sessions_list_supports_default_and_explicit_spellings() {
-        let default = Cli::try_parse_from(["al", "sessions", "12", "--dedupe", "--paths"])
-            .unwrap();
+        let default = Cli::try_parse_from(["al", "sessions", "12", "--dedupe", "--paths"]).unwrap();
         let Some(Command::Sessions(default)) = default.command else {
             panic!("expected sessions command");
         };
         assert_eq!(default.default_list.count, Some(12));
         assert!(default.default_list.dedupe);
+        assert!(!default.default_list.children);
         assert!(default.default_list.paths);
         assert!(default.default_list.hosts.is_empty());
 
         let explicit = Cli::try_parse_from([
-            "al", "sessions", "list", "7", "--all", "--picker",
+            "al",
+            "sessions",
+            "list",
+            "7",
+            "--all",
+            "--children",
+            "--picker",
         ])
         .unwrap();
         let Some(Command::Sessions(explicit)) = explicit.command else {
@@ -884,6 +966,7 @@ mod tests {
         };
         assert_eq!(list.count, Some(7));
         assert!(list.all);
+        assert!(list.children);
         assert!(list.picker);
     }
 
@@ -906,15 +989,9 @@ mod tests {
         assert_eq!(default.default_list.count, Some(12));
         assert_eq!(default.default_list.hosts, ["host-a", "local"]);
 
-        let explicit = Cli::try_parse_from([
-            "al",
-            "sessions",
-            "list",
-            "7",
-            "--host",
-            "host-b;literal",
-        ])
-        .unwrap();
+        let explicit =
+            Cli::try_parse_from(["al", "sessions", "list", "7", "--host", "host-b;literal"])
+                .unwrap();
         let Some(Command::Sessions(explicit)) = explicit.command else {
             panic!("expected sessions command");
         };
@@ -954,18 +1031,16 @@ mod tests {
         for mode in ["--paths", "--picker", "--fzf"] {
             assert!(Cli::try_parse_from(["al", "sessions", "--host", "host-a", mode]).is_err());
             assert!(
-                Cli::try_parse_from(["al", "sessions", "list", "--host", "host-a", mode])
-                    .is_err()
+                Cli::try_parse_from(["al", "sessions", "list", "--host", "host-a", mode]).is_err()
             );
         }
     }
 
     #[test]
     fn search_is_local_and_requires_a_nonempty_query() {
-        let parsed = Cli::try_parse_from([
-            "al", "sessions", "search", "--dedupe", "--picker", "Needle",
-        ])
-        .unwrap();
+        let parsed =
+            Cli::try_parse_from(["al", "sessions", "search", "--dedupe", "--picker", "Needle"])
+                .unwrap();
         let Some(Command::Sessions(sessions)) = parsed.command else {
             panic!("expected sessions command");
         };
@@ -973,18 +1048,54 @@ mod tests {
             panic!("expected search command");
         };
         assert!(search.dedupe);
+        assert!(!search.children);
         assert!(search.picker);
         assert_eq!(search.query, "Needle");
-
+        let with_children =
+            Cli::try_parse_from(["al", "sessions", "search", "--children", "Needle"]).unwrap();
+        let Some(Command::Sessions(sessions)) = with_children.command else {
+            panic!("expected sessions command");
+        };
+        let Some(SessionsCommand::Search(search)) = sessions.command else {
+            panic!("expected search command");
+        };
+        assert!(search.children);
         assert!(Cli::try_parse_from(["al", "sessions", "search", "   "]).is_err());
-        assert!(Cli::try_parse_from(["al", "sessions", "search", "--host", "host-a", "q"]).is_err());
+        assert!(
+            Cli::try_parse_from(["al", "sessions", "search", "--host", "host-a", "q"]).is_err()
+        );
+    }
+
+    #[test]
+    fn remote_list_command_forwards_children_with_other_list_flags() {
+        let args = SessionListArgs {
+            count: Some(4),
+            all: true,
+            dedupe: true,
+            children: true,
+            ..SessionListArgs::default()
+        };
+        assert_eq!(
+            remote_session_list_command(&args),
+            "exec 'al' 'sessions' 'list' '4' '--all' '--dedupe' '--children'"
+        );
+        assert_eq!(
+            remote_session_list_command(&SessionListArgs::default()),
+            "exec 'al' 'sessions' 'list'"
+        );
     }
 
     #[test]
     fn convert_and_migrate_compatibility_spellings_match() {
         for spelling in ["convert", "migrate"] {
             let parsed = Cli::try_parse_from([
-                "al", "sessions", spelling, "omp", "hyper", "session.jsonl", "output.jsonl",
+                "al",
+                "sessions",
+                spelling,
+                "omp",
+                "hyper",
+                "session.jsonl",
+                "output.jsonl",
             ])
             .unwrap();
             let Some(Command::Sessions(sessions)) = parsed.command else {
@@ -996,7 +1107,10 @@ mod tests {
             assert_eq!(convert.source_tool, SourceTool::Omp);
             assert_eq!(convert.target_tool, TargetTool::Hyper);
             assert_eq!(convert.input, OsString::from("session.jsonl"));
-            assert_eq!(convert.output.unwrap(), std::path::PathBuf::from("output.jsonl"));
+            assert_eq!(
+                convert.output.unwrap(),
+                std::path::PathBuf::from("output.jsonl")
+            );
         }
     }
 
@@ -1024,16 +1138,8 @@ mod tests {
         assert_eq!(moved.tools, [SourceTool::Pi]);
         assert!(moved.dry_run);
         assert!(Cli::try_parse_from(["al", "sessions", "move", "/only-one"]).is_err());
-        let rpi = Cli::try_parse_from([
-            "al",
-            "sessions",
-            "move",
-            "/old",
-            "/new",
-            "--tool",
-            "rpi",
-        ])
-        .unwrap();
+        let rpi = Cli::try_parse_from(["al", "sessions", "move", "/old", "/new", "--tool", "rpi"])
+            .unwrap();
         let Some(Command::Sessions(sessions)) = rpi.command else {
             panic!("expected sessions command");
         };
@@ -1047,13 +1153,22 @@ mod tests {
     fn agent_is_open_only_on_the_cli_surface() {
         assert!(Cli::try_parse_from(["al", "sessions", "convert", "agent", "omp", "id"]).is_err());
         assert!(Cli::try_parse_from(["al", "sessions", "convert", "omp", "agent", "id"]).is_err());
-        assert!(Cli::try_parse_from(["al", "sessions", "move", "/old", "/new", "--tool", "agent"]).is_err());
+        assert!(
+            Cli::try_parse_from(["al", "sessions", "move", "/old", "/new", "--tool", "agent"])
+                .is_err()
+        );
         assert!(Cli::try_parse_from(["al", "sessions", "fork", "id", "agent"]).is_err());
-        assert!(Cli::try_parse_from(["al", "sessions", "sync", "host", "--tool", "agent"]).is_err());
+        assert!(
+            Cli::try_parse_from(["al", "sessions", "sync", "host", "--tool", "agent"]).is_err()
+        );
 
         let parsed = Cli::try_parse_from(["al", "sessions", "open", "id", "agent"]).unwrap();
-        let Some(Command::Sessions(sessions)) = parsed.command else { panic!("expected sessions") };
-        let Some(SessionsCommand::Open(open)) = sessions.command else { panic!("expected open") };
+        let Some(Command::Sessions(sessions)) = parsed.command else {
+            panic!("expected sessions")
+        };
+        let Some(SessionsCommand::Open(open)) = sessions.command else {
+            panic!("expected open")
+        };
         assert_eq!(open.target_tool, TargetTool::Agent);
     }
 
@@ -1061,7 +1176,12 @@ mod tests {
     fn open_and_fork_preserve_session_ref_as_os_string() {
         for command in ["open", "fork"] {
             let parsed = Cli::try_parse_from([
-                "al", "sessions", command, "--print-command", "session-ref", "claude",
+                "al",
+                "sessions",
+                command,
+                "--print-command",
+                "session-ref",
+                "claude",
             ])
             .unwrap();
             let Some(Command::Sessions(sessions)) = parsed.command else {
@@ -1102,7 +1222,9 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["al", "sessions", "sync"]).is_err());
-        assert!(Cli::try_parse_from(["al", "sessions", "sync", "host-a", "host-b", "host-c"]).is_err());
+        assert!(
+            Cli::try_parse_from(["al", "sessions", "sync", "host-a", "host-b", "host-c"]).is_err()
+        );
     }
 
     #[test]
@@ -1148,8 +1270,7 @@ mod tests {
 
     #[test]
     fn raw_tail_restoration_does_not_match_program_name() {
-        let parsed = Cli::try_parse_from(["/tmp/omlo", "sessions", "list", "--paths"])
-            .unwrap();
+        let parsed = Cli::try_parse_from(["/tmp/omlo", "sessions", "list", "--paths"]).unwrap();
         let Some(Command::Sessions(sessions)) = parsed.command else {
             panic!("expected sessions command");
         };
@@ -1158,8 +1279,7 @@ mod tests {
 
     #[test]
     fn launcher_tail_preserves_stop_parsing_delimiter() {
-        let parsed = Cli::try_parse_from(["al", "omlo", "--", "--host", "tool-host"])
-            .unwrap();
+        let parsed = Cli::try_parse_from(["al", "omlo", "--", "--host", "tool-host"]).unwrap();
         let Some(Command::Omlo(tail)) = parsed.command else {
             panic!("expected omlo command");
         };
@@ -1220,7 +1340,12 @@ mod tests {
     #[test]
     fn hidden_tmux_child_parses_but_is_absent_from_root_help() {
         let parsed = Cli::try_parse_from([
-            "al", "__tmux-child", "--payload", "/tmp/payload", "--ready", "/tmp/ready",
+            "al",
+            "__tmux-child",
+            "--payload",
+            "/tmp/payload",
+            "--ready",
+            "/tmp/ready",
         ])
         .unwrap();
         assert!(matches!(parsed.command, Some(Command::TmuxChild(_))));
@@ -1229,18 +1354,107 @@ mod tests {
         assert!(!help.contains("__tmux-child"));
     }
 
+    #[test]
+    fn new_project_parses_host_path_goal_and_worktree_flag() {
+        let parsed = Cli::try_parse_from([
+            "al",
+            "new",
+            "x3",
+            "~/Projects/pi-zig",
+            "完成zig版本的pi-coding-agent",
+            "--executor",
+            "omp",
+            "--worktree",
+        ])
+        .unwrap();
+        let Some(Command::New(args)) = parsed.command else {
+            panic!("expected new command");
+        };
+        assert_eq!(
+            args,
+            NewProjectArgs {
+                args: vec![
+                    "x3".to_owned(),
+                    "~/Projects/pi-zig".to_owned(),
+                    "完成zig版本的pi-coding-agent".to_owned(),
+                ],
+                executor: Some(LauncherKind::Omp),
+                orchestrator: None,
+                reviewer: None,
+                worktree: Some("wt".to_owned()),
+                tmux: false,
+                no_tmux: false,
+                print_command: false,
+            }
+        );
+
+        let named = Cli::try_parse_from([
+            "al",
+            "new",
+            "~/Projects/pi-zig",
+            "ship it",
+            "--wt",
+            "feat",
+            "--print-command",
+        ])
+        .unwrap();
+        let Some(Command::New(named)) = named.command else {
+            panic!("expected new command");
+        };
+        assert_eq!(named.args, ["~/Projects/pi-zig", "ship it"]);
+        assert_eq!(named.worktree.as_deref(), Some("feat"));
+        assert!(named.print_command);
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        assert!(help.contains("new"));
+        assert!(!help.contains("set-goal"));
+        let new_help = cmd
+            .find_subcommand_mut("new")
+            .expect("new command")
+            .render_long_help()
+            .to_string();
+        assert!(new_help.contains("Unix"));
+        assert!(Cli::try_parse_from(["al", "new", "sample-app"]).is_err());
+        assert!(
+            Cli::try_parse_from(["al", "set-goal", "x3", "~/Projects/pi-zig", "goal"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["al", "new", "sample-app", "x", "--tmux", "--no-tmux"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["al", "new", "sample-app", "x", "--executor", "sks"]).is_err()
+        );
+        let fleet = Cli::try_parse_from([
+            "al",
+            "new",
+            "x3",
+            "~/Projects/pi-zig",
+            "goal",
+            "--orchestrator",
+            "pilo",
+            "--executor",
+            "omp",
+            "--reviewer",
+            "grok",
+        ])
+        .unwrap();
+        let Some(Command::New(fleet)) = fleet.command else {
+            panic!("expected new command");
+        };
+        assert_eq!(fleet.orchestrator, Some(LauncherKind::Pi));
+        assert_eq!(fleet.executor, Some(LauncherKind::Omp));
+        assert_eq!(fleet.reviewer, Some(LauncherKind::Grok));
+    }
+
     #[cfg(unix)]
     #[test]
     fn raw_launcher_tail_preserves_non_utf8_argv() {
         use std::os::unix::ffi::OsStringExt;
 
         let raw = OsString::from_vec(vec![b'a', 0xff, b'z']);
-        let parsed = Cli::try_parse_from([
-            OsString::from("al"),
-            OsString::from("pilo"),
-            raw.clone(),
-        ])
-        .unwrap();
+        let parsed =
+            Cli::try_parse_from([OsString::from("al"), OsString::from("pilo"), raw.clone()])
+                .unwrap();
         let Some(Command::Pilo(tail)) = parsed.command else {
             panic!("expected pilo command");
         };
