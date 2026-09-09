@@ -1644,6 +1644,148 @@ fn new_project_creates_updates_and_worktree() {
     assert!(dest.join(".git").exists());
 }
 
+#[test]
+fn new_project_clones_git_urls() {
+    let home = TempDir::new().unwrap();
+    let alpha = seed_git_upstream(home.path().join("upstreams").join("alpha"));
+    let beta = seed_git_upstream(home.path().join("upstreams").join("beta"));
+
+    let missing_worktree = run(
+        home.path(),
+        &[
+            "new",
+            "bundle",
+            "ship both",
+            "--git",
+            alpha.to_str().expect("utf-8 alpha"),
+            "--git",
+            beta.to_str().expect("utf-8 beta"),
+        ],
+    );
+    assert!(
+        !missing_worktree.status.success(),
+        "multiple --git without --worktree should fail"
+    );
+    let err = String::from_utf8_lossy(&missing_worktree.stderr);
+    assert!(err.contains("multiple --git requires --worktree"), "{err}");
+
+    let cloned = run(
+        home.path(),
+        &[
+            "new",
+            "cloned-app",
+            "ship the parser",
+            "--git",
+            alpha.to_str().expect("utf-8 alpha"),
+        ],
+    );
+    assert!(
+        cloned.status.success(),
+        "al new --git failed: {}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+    let dest = home.path().join("Projects").join("cloned-app");
+    assert_eq!(
+        String::from_utf8_lossy(&cloned.stdout).trim(),
+        dest.to_str().expect("utf-8 dest")
+    );
+    assert!(dest.join(".git").exists());
+    assert!(dest.join("README.md").exists());
+    let goal = fs::read_to_string(dest.join("GOAL.md")).expect("GOAL.md");
+    assert!(goal.contains("ship the parser"), "{goal}");
+
+    let planned = run(
+        home.path(),
+        &[
+            "new",
+            "bundle",
+            "ship both",
+            "--git",
+            "https://example.test/org/alpha.git",
+            "--git",
+            "https://example.test/org/beta.git",
+            "--worktree",
+            "--print-command",
+        ],
+    );
+    assert!(
+        planned.status.success(),
+        "al new --git --print-command failed: {}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&planned.stdout);
+    assert!(
+        stdout.contains("clone\thttps://example.test/org/alpha.git"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("worktree/alpha"), "{stdout}");
+    assert!(stdout.contains("worktree/beta"), "{stdout}");
+    assert!(!stdout.contains("git worktree add"), "{stdout}");
+    assert!(!home.path().join("Projects").join("worktree").exists());
+
+    let multi = run(
+        home.path(),
+        &[
+            "new",
+            "bundle",
+            "ship both",
+            "--git",
+            alpha.to_str().expect("utf-8 alpha"),
+            "--git",
+            beta.to_str().expect("utf-8 beta"),
+            "--worktree",
+        ],
+    );
+    assert!(
+        multi.status.success(),
+        "al new --git --worktree failed: {}",
+        String::from_utf8_lossy(&multi.stderr)
+    );
+    let bundle = home.path().join("Projects").join("worktree");
+    assert_eq!(
+        String::from_utf8_lossy(&multi.stdout).trim(),
+        bundle.to_str().expect("utf-8 dest")
+    );
+    assert!(bundle.join("alpha").join(".git").exists());
+    assert!(bundle.join("beta").join(".git").exists());
+    assert!(bundle.join("GOAL.md").exists());
+    assert!(!bundle.join(".git").exists());
+}
+
+fn seed_git_upstream(dir: PathBuf) -> PathBuf {
+    fs::create_dir_all(&dir).unwrap();
+    let status = Command::new("git")
+        .args(["init"])
+        .current_dir(&dir)
+        .status()
+        .expect("git init");
+    assert!(status.success(), "git init failed");
+    fs::write(dir.join("README.md"), "# upstream\n").expect("README");
+    let status = Command::new("git")
+        .args(["add", "README.md"])
+        .current_dir(&dir)
+        .status()
+        .expect("git add");
+    assert!(status.success(), "git add failed");
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=al",
+            "-c",
+            "user.email=al@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "upstream",
+        ])
+        .current_dir(&dir)
+        .status()
+        .expect("git commit");
+    assert!(status.success(), "git commit failed");
+    dir
+}
+
 #[cfg(unix)]
 fn path_with(bin: &Path) -> std::ffi::OsString {
     let mut path = bin.as_os_str().to_os_string();
@@ -1812,4 +1954,81 @@ impl Drop for TmuxKillOnDrop {
     fn drop(&mut self) {
         kill_tmux_session(&self.session);
     }
+}
+
+#[test]
+fn live_list_is_not_the_session_catalog_and_emits_json_rows() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let help = run(home.path(), &["list", "--help"]);
+    assert!(
+        help.status.success(),
+        "list --help failed: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help_text.contains("not saved sessions"),
+        "list help should distinguish live panes from the catalog: {help_text}"
+    );
+    assert!(
+        help_text.contains("--fzf"),
+        "list help should mention fzf attach: {help_text}"
+    );
+
+    let sessions = run(home.path(), &["sessions", "list", "--help"]);
+    assert!(
+        sessions.status.success(),
+        "sessions list --help failed: {}",
+        String::from_utf8_lossy(&sessions.stderr)
+    );
+
+    let bad_host = run(home.path(), &["list", "--host", ""]);
+    assert!(!bad_host.status.success(), "empty --host must be rejected");
+
+    let list = run_with_env(
+        home.path(),
+        &["list", "--json"],
+        &[("AL_LIVE_STATE_DIR", state.path().as_os_str())],
+    );
+    assert!(
+        list.status.success(),
+        "al list --json failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    for line in String::from_utf8_lossy(&list.stdout).lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let row: Value =
+            serde_json::from_str(line).unwrap_or_else(|error| panic!("json row {line}: {error}"));
+        assert!(row.get("agent").and_then(Value::as_str).is_some());
+        assert!(row.get("cwd").and_then(Value::as_str).is_some());
+        assert!(row.get("diff_summary").and_then(Value::as_str).is_some());
+        assert!(row.get("state").and_then(Value::as_str).is_some());
+        assert!(row.get("pane").and_then(Value::as_str).is_some());
+    }
+
+    let watch_help = run(home.path(), &["supervise", "--help"]);
+    assert!(
+        watch_help.status.success(),
+        "supervise --help failed: {}",
+        String::from_utf8_lossy(&watch_help.stderr)
+    );
+    let watch_text = String::from_utf8_lossy(&watch_help.stdout);
+    assert!(
+        watch_text.contains("Seconds between table refreshes"),
+        "{watch_text}"
+    );
+    let send_help = run(home.path(), &["supervise", "send", "--help"]);
+    assert!(
+        send_help.status.success(),
+        "supervise send --help failed: {}",
+        String::from_utf8_lossy(&send_help.stderr)
+    );
+    let missing_message = run(home.path(), &["supervise", "send"]);
+    assert!(
+        !missing_message.status.success(),
+        "supervise send without --message must fail"
+    );
 }

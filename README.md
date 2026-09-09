@@ -36,7 +36,7 @@ The installer verifies every download against the release's `SHA256SUMS` and ins
 Pin a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.7.0
+curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.8.0
 ```
 
 If `al` is not on PATH after installation, open a new terminal or use the full path printed during install.
@@ -61,6 +61,17 @@ al sessions search --dedupe --picker "database migration"
 al sessions --host host-a --host host-b --host local
 al sessions list --all --dedupe --host host-a --host host-b
 
+# Live tmux agents (not the session catalog: use `al sessions list` for that).
+al list
+al list --diff
+al list --fzf
+al list --host host-a --host host-b
+al supervise
+al supervise --host host-a --interval 5
+al supervise diff --host host-a
+al supervise send --host host-a --message "continue from GOAL.md"
+al supervise send omp --message "continue from GOAL.md"
+
 # Convert a Pi export into a Claude-compatible export.
 al sessions convert pi claude /workspace/project/pi-session.jsonl /workspace/project/claude-session.jsonl
 
@@ -83,6 +94,11 @@ al sessions open agent-session-id agent --print-command
 al sessions --fzf
 al sessions query "refactor auth"
 
+# Pick a live tmux agent pane and attach (requires fzf on PATH).
+al list --fzf
+al list --fzf omp
+al list --host host-a --fzf
+
 # Point-to-point session catalog sync (dry-run first).
 # Cursor Agent native SQLite stores are intentionally not synchronized.
 al sessions sync host-a --dry-run
@@ -91,9 +107,11 @@ al sessions sync host-a host-b --tool omp --tool pi --dry-run
 # Create or update a project, optionally on a remote host / worktree / agent.
 al new sample-app "ship the parser"
 al new sample-app "ship the parser" --tmux
-al new x3 ~/Projects/pi-zig "完成zig版本的pi-coding-agent" --executor omp --worktree
-al new x3 ~/Projects/pi-zig "完成zig版本的pi-coding-agent" --orchestrator pilo --executor omp --reviewer grok --worktree
-al new ~/Projects/pi-zig "完成zig版本的pi-coding-agent" --executor omp --print-command
+al new host-a ~/Projects/sample-app "ship the parser" --executor omp --worktree
+al new host-a ~/Projects/sample-app "ship the parser" --orchestrator pilo --executor omp --reviewer grok --worktree
+al new ~/Projects/sample-app "ship the parser" --executor omp --print-command
+al new sample-app "ship the parser" --git https://example.test/org/sample-app.git
+al new workspace "ship both" --git https://example.test/org/alpha.git --git https://example.test/org/beta.git --worktree
 
 # Run one shell-compatible command string in a tmux-managed pane (Unix only).
 al tmux-run -c /workspace/project --fresh -- 'make test'
@@ -134,7 +152,9 @@ Run `al --help` and `al COMMAND --help` for the current argument surface.
   On macOS, remote launchers map `/Users/<user>` to `/home/<user>`. Additional component-aware mappings can be supplied through `AL_REMOTE_PATH_MAPS` as an ordered JSON array of absolute source/destination pairs, for example `[["/Volumes/workspace","/srv/workspace"]]`. Every source and destination must be an absolute path; malformed configuration fails before SSH is invoked. The remote host must have `al` installed and on PATH.
 
   `al agentlo` launches Cursor's official `agent` CLI. With no tool args it first runs `agent --force --trust --approve-mcps --continue`; if that command exits nonzero, it retries as `agent --force --trust --approve-mcps` to create a new chat. The continue probe hides Cursor's "No previous chats found." status line, including inside `--tmux`. Cursor's native local worktree options (`-w`/`--worktree [NAME]` and `--worktree-base REF`) pass through normally. The launcher-level `--wt NAME` remains the remote-host worktree control and therefore requires `--host`; `--tmux` works for both local and remote launches. A `--session ID` selector (or a positional chat id) maps to `--resume ID`; any other arguments are forwarded verbatim after the base approval flags. Separately, `al sessions`, `al sessions search`, `al sessions --fzf`, and `al sessions query` discover native Cursor Agent sessions and can reopen them exactly; conversion and sync remain disabled because the native SQLite/blob format is undocumented and live stores may depend on WAL state.
-- `al new [HOST] NAME|PATH GOAL` — create the project if it is missing, otherwise update `GOAL.md`. A bare `NAME` goes under `$AL_PROJECTS_HOME` or `~/Projects` (remote: `$HOME/Projects`). A path must be absolute or start with `~/` on a remote host. Missing repos get `README.md`, `GOAL.md`, `git init`, and `Initial commit`; existing git checkouts commit `Set goal`. `--worktree [NAME]` (alias `--wt`) creates or reuses `~/Projects/<repo>-<NAME>` (`NAME` defaults to `wt`). `--executor|--orchestrator|--reviewer TOOL` start fresh agents (yolo/approval flags, no `--continue`) in **one tmux session** with one window per role. Window names are `<tool>-<project>` (for example `omlo-pi-zig-wt`); the session is the project/worktree name. Usual case is just `--executor omp`. Each role gets `.al/<role>.md` covering the coordinate envelope (`TASK`/`ACK`/`PROGRESS`/`DONE`/`BLOCKED`/`RELAY`/`AUDIT`/`INFO`, star topology, `modifying:`). After the TUI is up, grok/hyper/claude get `tmux send-keys` of `/goal <text>`; pi/omp get `/goal` then the text; codex/droid/agent have no `/goal` (files only). `--tmux` is implied by a role flag unless `--no-tmux` (multiple roles require tmux; `--no-tmux` cannot send `/goal`). Role launch and `--tmux` are Unix-only. Remote create/open uses SSH + `fish` + `git`. Opening copies this `al` to `/tmp/al-<version>` on the host instead of using the remote PATH binary. An existing exact tmux session name is refused, not replaced. `--print-command` prints the plan without writing files or running SSH.
+- `al new [HOST] NAME|PATH GOAL` — create the project if it is missing, otherwise update `GOAL.md`. A bare `NAME` goes under `$AL_PROJECTS_HOME` or `~/Projects` (remote: `$HOME/Projects`). A path must be absolute or start with `~/` on a remote host. Missing repos get `README.md`, `GOAL.md`, `git init`, and `Initial commit`; existing git checkouts commit `Set goal`. `--worktree [NAME]` (alias `--wt`) creates or reuses `~/Projects/<repo>-<NAME>` (`NAME` defaults to `wt`). Repeatable `--git URL` clones instead of `git init`: one URL goes to `~/Projects/<NAME>` (or `~/Projects/<worktree>` when `--worktree` is set); multiple URLs require `--worktree` and land under `~/Projects/worktree` (or `~/Projects/<NAME>`), each in a child directory named from the URL. A missing `--worktree` value with `--git` is `worktree`, not `wt`. Existing checkouts skip clone and only update `GOAL.md`. The parent of multiple clones is not a git repo; `GOAL.md` and `.al` role files live there and that folder is the launch cwd. `--executor|--orchestrator|--reviewer TOOL` start fresh agents (yolo/approval flags, no `--continue`) in **one tmux session** with one window per role. Window names are `<tool>-<project>` (for example `omlo-pi-zig-wt`); the session is the project/worktree name. Usual case is just `--executor omp`. Each role gets `.al/<role>.md` covering the coordinate envelope (`TASK`/`ACK`/`PROGRESS`/`DONE`/`BLOCKED`/`RELAY`/`AUDIT`/`INFO`, star topology, `modifying:`). After the TUI is up, grok/hyper/claude get `tmux send-keys` of `/goal <text>`; pi/omp get `/goal` then the text; codex/droid/agent have no `/goal` (files only). `--tmux` is implied by a role flag unless `--no-tmux` (multiple roles require tmux; `--no-tmux` cannot send `/goal`). Role launch and `--tmux` are Unix-only. Remote create/open uses SSH + `fish` + `git`. Opening copies this `al` to `/tmp/al-<version>` on the host instead of using the remote PATH binary. An existing exact tmux session name is refused, not replaced. `--print-command` prints the plan without writing files or running SSH.
+- `al list [--host HOST]... [--json] [--diff]` — snapshot **live tmux coding-agent panes** (not `al sessions list`). Agents are identified from the pane process tree (including `node`/`bash` wrappers) and from `al` window names such as `omlo-sample-app`. Rows are grouped by worktree: a header with cwd, branch, and `DIFF` (`+12/-3`, `?2` untracked, `clean`, or `-`), then one line per pane (state, agent, pane, named session, idle if nonzero, snippet). TUI chrome, statuslines, and shell prompts are skipped. `--diff` also prints each unique worktree's `git diff HEAD` plus untracked files. `--fzf [QUERY]` opens the same rows in fzf (searchable state/agent/cwd/snippet); selecting a row attaches to that tmux pane (`switch-client` when already inside tmux, `attach-session` otherwise; remote `--host` uses `ssh -tt`). Requires `fzf` on PATH. State is `blocked`, `asking`, `working`, or `idle` from the current screen: structural signals (spinner, `❯ `, `esc to interrupt`) use the last 12 nonempty lines; word matches (`thinking`, `FAILED`) use the last 2. Repeatable `--host` SSHs a one-shot dump of tmux/ps/pane-tree cwds/captures/git; one failed host still prints the others, then exits nonzero. The remote host does not need a newer `al`. Unix tmux only.
+- `al supervise [--host HOST]... [--interval SECS]` — refresh the same live table in place. It does **not** auto-reply. `al supervise diff [TARGET]` prints one worktree's git diff (same target rules as send). `al supervise send [TARGET] --message TEXT` pastes into a pane. Omit `TARGET` (or use `attention`) to send to the first blocked pane, else the first asking pane. `TARGET` can be a pane id (`%12`), a unique agent name (`omp`), a session/window name, or a cwd. `--host` selects the machine. `--no-submit` pastes without Enter.
 - `al tmux-run ...` — run a command inside the tmux integration wrapper (Unix only; Windows returns an explicit unsupported-platform error).
 
 ```sh
@@ -227,14 +247,14 @@ Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 ### Artifacts
 
 | Asset | Example |
-| macOS arm64 | `al-0.7.0-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `al-0.7.0-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc 2.31+) | `al-0.7.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc 2.31+) | `al-0.7.0-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `al-0.7.0-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `al-0.8.0-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `al-0.8.0-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 (glibc 2.31+) | `al-0.8.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc 2.31+) | `al-0.8.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `al-0.8.0-x86_64-pc-windows-msvc.zip` |
 | Checksums | `SHA256SUMS` |
 
-The tag must match `Cargo.toml` version exactly (`v0.7.0` ↔ `0.7.0`) or the build fails.
+The tag must match `Cargo.toml` version exactly (`v0.8.0` ↔ `0.8.0`) or the build fails.
 
 ## License
 

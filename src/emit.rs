@@ -2599,7 +2599,10 @@ mod tests {
             .collect();
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0]["message"]["role"], "user");
-        assert_eq!(messages[0]["message"]["content"][0]["text"], "list the file");
+        assert_eq!(
+            messages[0]["message"]["content"][0]["text"],
+            "list the file"
+        );
         assert!(
             messages[0]["message"]["content"]
                 .as_array()
@@ -2652,8 +2655,10 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result")
-                    && block.get("toolCallId").and_then(Value::as_str) == Some("call-1"))
+                .any(
+                    |block| block.get("type").and_then(Value::as_str) == Some("tool_result")
+                        && block.get("toolCallId").and_then(Value::as_str) == Some("call-1")
+                )
         );
     }
 

@@ -77,6 +77,11 @@ pub enum Command {
     Agentlo(RawTail),
     /// Create or update a git project, optionally make a worktree, then open it.
     New(NewProjectArgs),
+    /// List live tmux coding-agent panes, not saved sessions.
+    #[command(about = "List live tmux coding-agent panes, not saved sessions")]
+    List(LiveListArgs),
+    /// Watch live tmux coding-agent panes, or send / diff one of them.
+    Supervise(SuperviseCli),
     #[command(name = "tmux-run")]
     TmuxRun(RawTail),
     #[command(name = "__tmux-child", hide = true)]
@@ -195,6 +200,82 @@ pub struct SessionSyncArgs {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Args, Default, PartialEq, Eq)]
+pub struct LiveListArgs {
+    #[arg(
+        long = "host",
+        value_name = "HOST",
+        value_parser = nonempty_host
+    )]
+    pub hosts: Vec<String>,
+    #[arg(long)]
+    pub json: bool,
+    /// Print each unique worktree's git diff after the table.
+    #[arg(long)]
+    pub diff: bool,
+    /// Pick a live pane with fzf and attach to it. Requires fzf on PATH.
+    #[arg(long, conflicts_with_all = ["json", "diff"])]
+    pub fzf: bool,
+    /// Initial fzf query. Requires `--fzf`.
+    #[arg(value_name = "QUERY", num_args = 0.., trailing_var_arg = true, requires = "fzf")]
+    pub query: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct SuperviseCli {
+    #[command(subcommand)]
+    pub command: Option<SuperviseCommand>,
+    #[command(flatten)]
+    pub watch: SuperviseWatchArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SuperviseCommand {
+    /// Paste a message into a live pane.
+    Send(SuperviseSendArgs),
+    /// Print the git diff for one live agent worktree.
+    Diff(SuperviseDiffArgs),
+}
+
+#[derive(Debug, Args, Default, PartialEq, Eq)]
+pub struct SuperviseWatchArgs {
+    /// Remote host to scan. Repeatable. Omit for this machine.
+    #[arg(
+        long = "host",
+        value_name = "HOST",
+        value_parser = nonempty_host
+    )]
+    pub hosts: Vec<String>,
+    /// Seconds between table refreshes.
+    #[arg(long, default_value_t = crate::live::default_interval())]
+    pub interval: u64,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub struct SuperviseSendArgs {
+    /// Pane (`%12`), unique agent name, session, or cwd. Omit for the first blocked/asking pane.
+    pub target: Option<String>,
+    /// Text to paste into the pane.
+    #[arg(long, required = true)]
+    pub message: String,
+    /// Machine to send on. Omit for this machine.
+    #[arg(long = "host", value_parser = nonempty_host)]
+    pub host: Option<String>,
+    /// Paste without pressing Enter.
+    #[arg(long)]
+    pub no_submit: bool,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub struct SuperviseDiffArgs {
+    /// Pane (`%12`), unique agent name, session, or cwd. Omit for the first blocked/asking pane.
+    pub target: Option<String>,
+    /// Machine to read. Omit for this machine.
+    #[arg(long = "host", value_parser = nonempty_host)]
+    pub host: Option<String>,
+}
+
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct SessionQueryArgs {
     #[arg(required = true, num_args = 1.., value_parser = nonempty_query)]
@@ -227,9 +308,13 @@ pub struct NewProjectArgs {
     /// Launch the reviewer agent in another tmux window (Unix only).
     #[arg(long, value_parser = crate::new::parse_launcher_tool)]
     pub reviewer: Option<crate::launcher::LauncherKind>,
-    /// Create `~/Projects/<repo>-<NAME>` as a git worktree (NAME defaults to `wt`).
+    /// Without `--git`: create `~/Projects/<repo>-<NAME>` as a git worktree (NAME defaults to `wt`).
+    /// With `--git`: clone into `~/Projects/<NAME>` (NAME defaults to `worktree`). Multiple `--git` require this flag.
     #[arg(long, visible_alias = "wt", num_args = 0..=1, default_missing_value = "wt", value_name = "NAME")]
     pub worktree: Option<String>,
+    /// Clone this git URL instead of `git init`. Repeatable; more than one URL requires `--worktree`.
+    #[arg(long = "git", value_name = "URL", value_parser = crate::new::parse_git_url)]
+    pub gits: Vec<String>,
     /// Open the project in tmux (Unix only; implied by a role flag unless --no-tmux).
     #[arg(long, default_value_t = false, conflicts_with = "no_tmux")]
     pub tmux: bool,
@@ -331,6 +416,8 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             dispatch_launcher(crate::launcher::LauncherKind::Agent, args.argv)
         }
         Command::New(args) => dispatch_new(args),
+        Command::List(args) => dispatch_live_list(args),
+        Command::Supervise(args) => dispatch_supervise(args),
         Command::TmuxRun(args) => dispatch_tmux_run(args.argv),
         Command::TmuxChild(args) => dispatch_tmux_child(args),
     }
@@ -865,9 +952,53 @@ fn dispatch_new(args: NewProjectArgs) -> anyhow::Result<()> {
         orchestrator: args.orchestrator,
         reviewer: args.reviewer,
         worktree: args.worktree,
+        gits: args.gits,
         tmux: !args.no_tmux && (args.tmux || has_role),
         print_command: args.print_command,
     })
+}
+
+fn dispatch_live_list(args: LiveListArgs) -> anyhow::Result<()> {
+    require_unix_live("list")?;
+    crate::live::run_list(&crate::live::ListOptions {
+        hosts: args.hosts,
+        json: args.json,
+        diff: args.diff,
+        fzf: args.fzf,
+        query: args.query.join(" "),
+    })
+}
+
+fn dispatch_supervise(args: SuperviseCli) -> anyhow::Result<()> {
+    require_unix_live("supervise")?;
+    match args.command {
+        None => crate::live::run_watch(&crate::live::WatchOptions {
+            hosts: args.watch.hosts,
+            interval: args.watch.interval,
+        }),
+        Some(SuperviseCommand::Send(send)) => crate::live::run_send(&crate::live::SendOptions {
+            host: send.host,
+            target: send.target,
+            message: send.message,
+            submit: !send.no_submit,
+        }),
+        Some(SuperviseCommand::Diff(diff)) => crate::live::run_diff(&crate::live::DiffOptions {
+            host: diff.host,
+            target: diff.target,
+        }),
+    }
+}
+
+fn require_unix_live(command: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = command;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!(
+        "al {command} is unsupported on this platform; live agent status requires Unix tmux"
+    )
 }
 
 fn dispatch_tmux_run(argv: Vec<OsString>) -> anyhow::Result<()> {
@@ -899,8 +1030,8 @@ mod tests {
     use clap::CommandFactory;
 
     use super::{
-        Cli, Command, NewProjectArgs, SessionListArgs, SessionsCommand, home_dir_from,
-        remote_session_list_command,
+        Cli, Command, NewProjectArgs, SessionListArgs, SessionsCommand, SuperviseCommand,
+        home_dir_from, remote_session_list_command,
     };
     use crate::domain::{SourceTool, TargetTool};
     use crate::launcher::LauncherKind;
@@ -921,6 +1052,88 @@ mod tests {
             home_dir_from(None, Some(OsString::from(r"<workspace>\user"))).unwrap(),
             std::path::PathBuf::from(r"<workspace>\user")
         );
+    }
+
+    #[test]
+    fn live_list_and_supervise_parse() {
+        let list =
+            Cli::try_parse_from(["al", "list", "--host", "host-a", "--json", "--diff"]).unwrap();
+        let Some(Command::List(list)) = list.command else {
+            panic!("expected list command");
+        };
+        assert_eq!(list.hosts, ["host-a"]);
+        assert!(list.json);
+        assert!(list.diff);
+        assert!(!list.fzf);
+        assert!(list.query.is_empty());
+
+        let picked = Cli::try_parse_from(["al", "list", "--fzf", "omp", "sample-app"]).unwrap();
+        let Some(Command::List(picked)) = picked.command else {
+            panic!("expected list command");
+        };
+        assert!(picked.fzf);
+        assert_eq!(picked.query, ["omp", "sample-app"]);
+        assert!(Cli::try_parse_from(["al", "list", "--fzf", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["al", "list", "omp"]).is_err());
+
+        let watch =
+            Cli::try_parse_from(["al", "supervise", "--interval", "4", "--host", "host-b"]).unwrap();
+        let Some(Command::Supervise(watch)) = watch.command else {
+            panic!("expected supervise command");
+        };
+        assert!(watch.command.is_none());
+        assert_eq!(watch.watch.interval, 4);
+        assert_eq!(watch.watch.hosts, ["host-b"]);
+
+        let send = Cli::try_parse_from([
+            "al",
+            "supervise",
+            "send",
+            "%12",
+            "--message",
+            "continue",
+            "--no-submit",
+        ])
+        .unwrap();
+        let Some(Command::Supervise(send)) = send.command else {
+            panic!("expected supervise command");
+        };
+        let Some(SuperviseCommand::Send(send)) = send.command else {
+            panic!("expected send subcommand");
+        };
+        assert_eq!(send.target.as_deref(), Some("%12"));
+        assert_eq!(send.message, "continue");
+        assert!(send.no_submit);
+
+        let attention = Cli::try_parse_from([
+            "al",
+            "supervise",
+            "send",
+            "--host",
+            "host-a",
+            "--message",
+            "continue",
+        ])
+        .unwrap();
+        let Some(Command::Supervise(attention)) = attention.command else {
+            panic!("expected supervise command");
+        };
+        let Some(SuperviseCommand::Send(attention)) = attention.command else {
+            panic!("expected send subcommand");
+        };
+        assert_eq!(attention.target, None);
+        assert_eq!(attention.host.as_deref(), Some("host-a"));
+        assert_eq!(attention.message, "continue");
+
+        let diff = Cli::try_parse_from(["al", "supervise", "diff", "--host", "host-a"]).unwrap();
+        let Some(Command::Supervise(diff)) = diff.command else {
+            panic!("expected supervise command");
+        };
+        let Some(SuperviseCommand::Diff(diff)) = diff.command else {
+            panic!("expected diff subcommand");
+        };
+        assert_eq!(diff.target, None);
+        assert_eq!(diff.host.as_deref(), Some("host-a"));
     }
 
     #[test]
@@ -1382,6 +1595,7 @@ mod tests {
                 orchestrator: None,
                 reviewer: None,
                 worktree: Some("wt".to_owned()),
+                gits: Vec::new(),
                 tmux: false,
                 no_tmux: false,
                 print_command: false,
@@ -1404,6 +1618,33 @@ mod tests {
         assert_eq!(named.args, ["~/Projects/pi-zig", "ship it"]);
         assert_eq!(named.worktree.as_deref(), Some("feat"));
         assert!(named.print_command);
+
+        let cloned = Cli::try_parse_from([
+            "al",
+            "new",
+            "bundle",
+            "ship both",
+            "--git",
+            "https://example.test/org/alpha.git",
+            "--git",
+            "https://example.test/org/beta.git",
+            "--worktree",
+        ])
+        .unwrap();
+        let Some(Command::New(cloned)) = cloned.command else {
+            panic!("expected new command");
+        };
+        assert_eq!(
+            cloned.gits,
+            [
+                "https://example.test/org/alpha.git",
+                "https://example.test/org/beta.git"
+            ]
+        );
+        assert_eq!(cloned.worktree.as_deref(), Some("wt"));
+        assert!(
+            Cli::try_parse_from(["al", "new", "bundle", "ship", "--git", "-evil.git"]).is_err()
+        );
         let mut cmd = Cli::command();
         let help = cmd.render_long_help().to_string();
         assert!(help.contains("new"));
@@ -1414,6 +1655,7 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(new_help.contains("Unix"));
+        assert!(new_help.contains("--git"));
         assert!(Cli::try_parse_from(["al", "new", "sample-app"]).is_err());
         assert!(
             Cli::try_parse_from(["al", "set-goal", "x3", "~/Projects/pi-zig", "goal"]).is_err()

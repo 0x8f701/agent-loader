@@ -4,9 +4,9 @@
 //! points, require a complete regular JSONL file, and only report whether
 //! native re-emission is needed. They never resolve runtime state or write.
 
-use std::fs::{File, OpenOptions};
 #[cfg(all(not(unix), not(windows)))]
 use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -105,9 +105,7 @@ fn open_readonly_nofollow(path: &Path) -> Result<Option<File>> {
         {
             Ok(None)
         }
-        Err(error) => {
-            Err(error).with_context(|| format!("opening session {}", path.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("opening session {}", path.display())),
     }
 }
 
@@ -151,9 +149,7 @@ fn open_readonly_nofollow(path: &Path) -> Result<Option<File>> {
     match OpenOptions::new().read(true).open(path) {
         Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(error).with_context(|| format!("opening session {}", path.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("opening session {}", path.display())),
     }
 }
 
@@ -292,7 +288,10 @@ mod tests {
 
         assert!(needs_legacy_omp_conversion(&path).unwrap());
         assert_eq!(fs::read(&path).unwrap(), before);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o440);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o440
+        );
     }
 
     #[test]

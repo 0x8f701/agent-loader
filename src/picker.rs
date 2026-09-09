@@ -8,12 +8,12 @@
 
 use std::env;
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::domain::{SessionRow, SourceTool, TargetTool};
 
@@ -112,11 +112,7 @@ pub fn unsafe_field_name(tool: &str, session_id: &str, path: &str) -> Option<&'s
     unsafe_field_name_bytes(tool, session_id, path.as_bytes())
 }
 
-fn unsafe_field_name_bytes(
-    tool: &str,
-    session_id: &str,
-    path: &[u8],
-) -> Option<&'static str> {
+fn unsafe_field_name_bytes(tool: &str, session_id: &str, path: &[u8]) -> Option<&'static str> {
     if has_unsafe_chars(tool) {
         Some("tool")
     } else if has_unsafe_chars(session_id) {
@@ -315,10 +311,7 @@ pub enum TargetOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionOutcome {
     /// fzf exited 0 and the six-field picker row was captured.
-    Selected {
-        source: SourceTool,
-        path: PathBuf,
-    },
+    Selected { source: SourceTool, path: PathBuf },
     /// fzf exited 1 (no match) or 130 (Ctrl-C) — user cancelled cleanly.
     Cancelled,
     /// fzf exited with an unexpected non-zero code.
@@ -367,10 +360,7 @@ pub fn run_fzf(lines: &[String]) -> Result<FzfOutcome> {
         .stderr(Stdio::inherit());
     let mut child = cmd.spawn().context("spawning fzf")?;
     {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("fzf stdin was not piped")?;
+        let stdin = child.stdin.as_mut().context("fzf stdin was not piped")?;
         for line in lines {
             stdin.write_all(line.as_bytes())?;
             stdin.write_all(b"\n")?;
@@ -406,10 +396,7 @@ fn pick_target_tool_with_fzf(tools: &[TargetTool], fzf: &Path) -> Result<TargetO
         .stderr(Stdio::inherit());
     let mut child = cmd.spawn().context("spawning fzf")?;
     {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("fzf stdin was not piped")?;
+        let stdin = child.stdin.as_mut().context("fzf stdin was not piped")?;
         for tool in tools {
             stdin.write_all(tool.as_str().as_bytes())?;
             stdin.write_all(b"\n")?;
@@ -423,9 +410,7 @@ fn pick_target_tool_with_fzf(tools: &[TargetTool], fzf: &Path) -> Result<TargetO
     if code != 0 {
         return Ok(TargetOutcome::Error(code));
     }
-    let selection = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_owned();
+    let selection = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if selection.is_empty() {
         return Ok(TargetOutcome::Cancelled);
     }
@@ -451,6 +436,69 @@ fn pick_target_tool_with_fzf(tools: &[TargetTool], fzf: &Path) -> Result<TargetO
 /// and `PathBuf` on success, [`SessionOutcome::Cancelled`] when fzf
 /// exits 1 or 130, or `Err` when fzf is missing, the selection is
 /// malformed, or fzf exits with an unexpected code.
+/// Outcome of a generic TSV fzf pick. The selected line is returned whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineOutcome {
+    Selected(String),
+    Cancelled,
+    Error(i32),
+}
+
+/// Pipe display-first TSV lines to fzf (`--with-nth=1`) and return the
+/// selected line. `query` becomes fzf `--query` when it is nonempty.
+pub fn pick_tsv_line(lines: &[String], prompt: &str, query: Option<&str>) -> Result<LineOutcome> {
+    if lines.is_empty() {
+        return Ok(LineOutcome::Cancelled);
+    }
+    let fzf = which_fzf()?;
+    pick_tsv_line_with_fzf(lines, prompt, query, &fzf)
+}
+
+fn pick_tsv_line_with_fzf(
+    lines: &[String],
+    prompt: &str,
+    query: Option<&str>,
+    fzf: &Path,
+) -> Result<LineOutcome> {
+    let mut cmd = Command::new(fzf);
+    cmd.args([
+        "--ansi",
+        "--delimiter=\\t",
+        "--with-nth=1",
+        "--layout=reverse",
+        "--height=80%",
+        "--no-multi",
+    ]);
+    cmd.arg(format!("--prompt={prompt}"));
+    if let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) {
+        cmd.arg(format!("--query={query}"));
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = cmd.spawn().context("spawning fzf")?;
+    {
+        let stdin = child.stdin.as_mut().context("fzf stdin was not piped")?;
+        for line in lines {
+            stdin.write_all(line.as_bytes())?;
+            stdin.write_all(b"\n")?;
+        }
+    }
+    let output = child.wait_with_output().context("waiting for fzf")?;
+    match classify_fzf_status(output.status.code().unwrap_or(1)) {
+        FzfOutcome::Cancelled => Ok(LineOutcome::Cancelled),
+        FzfOutcome::Error(code) => Ok(LineOutcome::Error(code)),
+        FzfOutcome::Selected => {
+            let selection = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if selection.is_empty() {
+                Ok(LineOutcome::Cancelled)
+            } else {
+                Ok(LineOutcome::Selected(selection))
+            }
+        }
+    }
+}
+
 pub fn pick_session(lines: &[Vec<u8>], prompt: &str) -> Result<SessionOutcome> {
     if lines.is_empty() {
         return Ok(SessionOutcome::Cancelled);
@@ -459,11 +507,7 @@ pub fn pick_session(lines: &[Vec<u8>], prompt: &str) -> Result<SessionOutcome> {
     pick_session_with_fzf(lines, prompt, &fzf)
 }
 
-fn pick_session_with_fzf(
-    lines: &[Vec<u8>],
-    prompt: &str,
-    fzf: &Path,
-) -> Result<SessionOutcome> {
+fn pick_session_with_fzf(lines: &[Vec<u8>], prompt: &str, fzf: &Path) -> Result<SessionOutcome> {
     let mut cmd = Command::new(fzf);
     cmd.args([
         "--ansi",
@@ -479,10 +523,7 @@ fn pick_session_with_fzf(
         .stderr(Stdio::inherit());
     let mut child = cmd.spawn().context("spawning fzf")?;
     {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("fzf stdin was not piped")?;
+        let stdin = child.stdin.as_mut().context("fzf stdin was not piped")?;
         for line in lines {
             stdin.write_all(line)?;
             stdin.write_all(b"\n")?;
@@ -581,13 +622,13 @@ fn which_fzf() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::path::PathBuf;
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     fn row(id: &str, tool: SourceTool, summary: &str, cwd: &str, epoch: f64) -> SessionRow {
         SessionRow {
@@ -762,10 +803,7 @@ mod tests {
 
     #[test]
     fn unsafe_field_name_detects_tab() {
-        assert_eq!(
-            unsafe_field_name("om\tp", "sid", "/tmp/p"),
-            Some("tool")
-        );
+        assert_eq!(unsafe_field_name("om\tp", "sid", "/tmp/p"), Some("tool"));
     }
 
     #[test]
@@ -778,10 +816,7 @@ mod tests {
 
     #[test]
     fn unsafe_field_name_detects_null_in_path() {
-        assert_eq!(
-            unsafe_field_name("omp", "sid", "/tmp/\0p"),
-            Some("path")
-        );
+        assert_eq!(unsafe_field_name("omp", "sid", "/tmp/\0p"), Some("path"));
     }
 
     #[test]
@@ -791,17 +826,20 @@ mod tests {
 
     #[test]
     fn unsafe_field_name_checks_tool_first() {
-        assert_eq!(
-            unsafe_field_name("om\tp", "si\nd", "/tm\0p"),
-            Some("tool")
-        );
+        assert_eq!(unsafe_field_name("om\tp", "si\nd", "/tm\0p"), Some("tool"));
     }
 
     // -- format_row --
 
     #[test]
     fn format_row_widths_and_content() {
-        let r = row("abcdef-1234-5678-9012-abcdef123456", SourceTool::Omp, "Hello", "/tmp", 1.0);
+        let r = row(
+            "abcdef-1234-5678-9012-abcdef123456",
+            SourceTool::Omp,
+            "Hello",
+            "/tmp",
+            1.0,
+        );
         let line = format_row(&r, false);
         // tool (10) + 2 spaces + time (19) + 2 spaces + id (36) + 2 spaces + summary
         assert!(line.starts_with("omp         "));
@@ -900,7 +938,11 @@ mod tests {
         let r = row("sid", SourceTool::Grok, "Hello", "/tmp", 1.0);
         let line = format_picker_line(&r, false).unwrap();
         let fields: Vec<&[u8]> = line.split(|byte| *byte == b'\t').collect();
-        assert!(fields[0].windows(b"grok/hyper".len()).any(|part| part == b"grok/hyper"));
+        assert!(
+            fields[0]
+                .windows(b"grok/hyper".len())
+                .any(|part| part == b"grok/hyper")
+        );
         assert_eq!(fields[1], b"grok"); // raw tool unchanged
     }
 
@@ -976,7 +1018,11 @@ mod tests {
     fn pick_session_round_trips_non_utf8_path_through_stub_fzf() {
         let temp = tempfile::tempdir().unwrap();
         let fzf = temp.path().join("fzf");
-        fs::write(&fzf, b"#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' \"$line\"; done\n").unwrap();
+        fs::write(
+            &fzf,
+            b"#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' \"$line\"; done\n",
+        )
+        .unwrap();
         let mut permissions = fs::metadata(&fzf).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&fzf, permissions).unwrap();
@@ -985,6 +1031,18 @@ mod tests {
         let mut r = row("sid", SourceTool::Omp, "Hello", "/tmp", 1.0);
         r.path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes.to_vec()));
         let line = format_picker_line(&r, false).unwrap();
+
+        let tsv = pick_tsv_line_with_fzf(
+            &["omp  demo\tlocal\t%3\ts\t=s:0.0".to_owned()],
+            "agents> ",
+            Some("omp"),
+            &fzf,
+        )
+        .unwrap();
+        assert_eq!(
+            tsv,
+            LineOutcome::Selected("omp  demo\tlocal\t%3\ts\t=s:0.0".to_owned())
+        );
 
         let outcome = pick_session_with_fzf(&[line], "sessions> ", &fzf).unwrap();
         let SessionOutcome::Selected { source, path } = outcome else {
@@ -1035,7 +1093,10 @@ mod tests {
             target_tools_for_source(SourceTool::Agent),
             vec![TargetTool::Agent]
         );
-        for source in SourceTool::ALL.into_iter().filter(|source| *source != SourceTool::Agent) {
+        for source in SourceTool::ALL
+            .into_iter()
+            .filter(|source| *source != SourceTool::Agent)
+        {
             assert!(!target_tools_for_source(source).contains(&TargetTool::Agent));
         }
     }
@@ -1116,7 +1177,10 @@ mod tests {
 
     #[test]
     fn target_tools_non_agent_sources_keep_all_conversion_targets() {
-        for source in SourceTool::ALL.into_iter().filter(|source| *source != SourceTool::Agent) {
+        for source in SourceTool::ALL
+            .into_iter()
+            .filter(|source| *source != SourceTool::Agent)
+        {
             let tools = target_tools_for_source(source);
             assert_eq!(tools.len(), 8, "wrong count for {source:?}");
             let set: HashSet<TargetTool> = tools.iter().copied().collect();

@@ -119,7 +119,8 @@ fn read_meta(connection: &Connection, path: &Path) -> Result<Option<Value>> {
         Ok(value) => value,
         Err(error) if is_missing_table(&error) => None,
         Err(error) => {
-            return Err(error).with_context(|| format!("reading Agent metadata {}", path.display()));
+            return Err(error)
+                .with_context(|| format!("reading Agent metadata {}", path.display()));
         }
     };
     value

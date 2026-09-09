@@ -32,7 +32,10 @@ pub enum Endpoint {
 impl Endpoint {
     pub fn from_host(value: impl Into<String>) -> Self {
         let value = value.into();
-        if matches!(value.as_str(), "" | "." | "local" | "localhost" | "this" | "self") {
+        if matches!(
+            value.as_str(),
+            "" | "." | "local" | "localhost" | "this" | "self"
+        ) {
             Self::Local
         } else {
             Self::Remote(value)
@@ -305,7 +308,9 @@ pub enum SyncError {
         status: i32,
         detail: String,
     },
-    #[error("{operation} pipeline failed (producer exit {producer_status}, consumer exit {consumer_status}){detail}")]
+    #[error(
+        "{operation} pipeline failed (producer exit {producer_status}, consumer exit {consumer_status}){detail}"
+    )]
     PipelineFailed {
         operation: &'static str,
         producer_status: i32,
@@ -339,9 +344,8 @@ pub fn sync<E: CommandExecutor>(
 ) -> Result<SyncReport> {
     validate_request(src, dst)?;
     let selected = selected_tools(&options.tools);
-    let rsync_available = !src.is_local()
-        && !dst.is_local()
-        || executor.program_exists(OsStr::new("rsync"));
+    let rsync_available =
+        !src.is_local() && !dst.is_local() || executor.program_exists(OsStr::new("rsync"));
     let catalog = Catalog::new(home);
     let mut tools = Vec::new();
     let mut messages = Vec::new();
@@ -516,7 +520,11 @@ fn sync_tool<E: CommandExecutor>(
         }
         messages.push(format!(
             "{} codex history into {}: {} (+{} entries)",
-            if options.dry_run { "would merge" } else { "merged" },
+            if options.dry_run {
+                "would merge"
+            } else {
+                "merged"
+            },
             dst.label(),
             history_path.display(),
             history.added
@@ -607,7 +615,11 @@ fn directory_exists<E: CommandExecutor>(
             match output.status {
                 0 => Ok(true),
                 3 => Ok(false),
-                status => Err(command_failed("remote directory probe", status, &output.stderr)),
+                status => Err(command_failed(
+                    "remote directory probe",
+                    status,
+                    &output.stderr,
+                )),
             }
         }
     }
@@ -631,7 +643,11 @@ fn create_directory<E: CommandExecutor>(
             if output.status == 0 {
                 Ok(())
             } else {
-                Err(command_failed("remote mkdir", output.status, &output.stderr))
+                Err(command_failed(
+                    "remote mkdir",
+                    output.status,
+                    &output.stderr,
+                ))
             }
         }
     }
@@ -744,7 +760,11 @@ fn remote_inventory<E: CommandExecutor>(
         return Ok(BTreeSet::new());
     }
     if output.status != 0 {
-        return Err(command_failed("remote inventory", output.status, &output.stderr));
+        return Err(command_failed(
+            "remote inventory",
+            output.status,
+            &output.stderr,
+        ));
     }
 
     let mut files = BTreeSet::new();
@@ -771,9 +791,7 @@ fn matches_tool_path(tool: SourceTool, path: &Path) -> bool {
         SourceTool::Pi | SourceTool::Rpi | SourceTool::Omp => {
             depth == 2 && path.extension() == Some(OsStr::new("jsonl"))
         }
-        SourceTool::Droid | SourceTool::Claude => {
-            path.extension() == Some(OsStr::new("jsonl"))
-        }
+        SourceTool::Droid | SourceTool::Claude => path.extension() == Some(OsStr::new("jsonl")),
         SourceTool::Codex => {
             path.extension() == Some(OsStr::new("jsonl")) && os_starts_with(name, b"rollout-")
         }
@@ -908,7 +926,11 @@ fn transfer_remote_relay<E: CommandExecutor>(
             OsString::from("-"),
             OsString::from("--"),
         ];
-        tar_args.extend(batch.iter().map(|path| path.as_path().as_os_str().to_owned()));
+        tar_args.extend(
+            batch
+                .iter()
+                .map(|path| path.as_path().as_os_str().to_owned()),
+        );
         let create = CommandSpec::new("tar", tar_args);
         let extract = remote_tar_extract(destination_host, root, batch)?;
         ensure_pipeline_success(
@@ -930,12 +952,12 @@ fn remote_tar_create(host: &str, root: &Path, files: &[SyncRelativePath]) -> Res
     Ok(remote_bash(host, script, None))
 }
 
-fn remote_tar_extract(
-    host: &str,
-    root: &Path,
-    files: &[SyncRelativePath],
-) -> Result<CommandSpec> {
-    Ok(remote_bash(host, remote_tar_install_script(root, files)?, None))
+fn remote_tar_extract(host: &str, root: &Path, files: &[SyncRelativePath]) -> Result<CommandSpec> {
+    Ok(remote_bash(
+        host,
+        remote_tar_install_script(root, files)?,
+        None,
+    ))
 }
 
 fn remote_tar_install_script(root: &Path, files: &[SyncRelativePath]) -> Result<OsString> {
@@ -1102,9 +1124,8 @@ fn merge_codex_history<E: CommandExecutor>(
 }
 
 fn merge_codex_history_bytes(source: &[u8], destination: &[u8]) -> (usize, Vec<u8>) {
-    let mut keys: HashSet<HistoryKey> = history_lines(destination)
-        .filter_map(history_key)
-        .collect();
+    let mut keys: HashSet<HistoryKey> =
+        history_lines(destination).filter_map(history_key).collect();
     let mut missing = Vec::new();
     for line in history_lines(source) {
         let Some(key) = history_key(line) else {
@@ -1221,7 +1242,11 @@ fn append_history<E: CommandExecutor>(
     match endpoint {
         Endpoint::Local => append_history_local(path, content),
         Endpoint::Remote(host) => {
-            let command = remote_bash(host, remote_history_append_script(path)?, Some(content.to_vec()));
+            let command = remote_bash(
+                host,
+                remote_history_append_script(path)?,
+                Some(content.to_vec()),
+            );
             let output = execute(executor, &command, "remote Codex history append")?;
             if output.status == 0 {
                 Ok(())
@@ -1258,7 +1283,9 @@ fn append_history_local(path: &Path, content: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).mode(0o600);
+        options
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .mode(0o600);
     }
     let mut file = options.open(path).map_err(|source| SyncError::Filesystem {
         operation: "opening Codex history for append",
@@ -1319,11 +1346,7 @@ fn remote_bash(host: &str, script: OsString, stdin: Option<Vec<u8>>) -> CommandS
     remote_command.push(quote_posix(&script).expect("constructed script is quoteable"));
     let mut command = CommandSpec::new(
         "ssh",
-        vec![
-            OsString::from("--"),
-            OsString::from(host),
-            remote_command,
-        ],
+        vec![OsString::from("--"), OsString::from(host), remote_command],
     );
     command.stdin = stdin;
     command
@@ -1374,7 +1397,10 @@ fn command_failed(operation: &'static str, status: i32, stderr: &[u8]) -> SyncEr
 
 fn stderr_detail(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
-    let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
     let start = lines.len().saturating_sub(8);
     if start == lines.len() {
         String::new()
@@ -1479,14 +1505,11 @@ fn resolve_program(program: &OsStr) -> Option<PathBuf> {
         }
         #[cfg(windows)]
         {
-            let extensions = env::var_os("PATHEXT")
-                .unwrap_or_else(|| OsString::from(".EXE;.CMD;.BAT;.COM"));
+            let extensions =
+                env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".EXE;.CMD;.BAT;.COM"));
             for extension in extensions.to_string_lossy().split(';') {
-                let candidate = directory.join(format!(
-                    "{}{}",
-                    program.to_string_lossy(),
-                    extension
-                ));
+                let candidate =
+                    directory.join(format!("{}{}", program.to_string_lossy(), extension));
                 if executable_file(&candidate) {
                     return Some(candidate);
                 }
@@ -1727,10 +1750,12 @@ mod tests {
             .as_bytes()
         );
         assert_eq!(executor.commands.len(), 2);
-        assert!(executor
-            .commands
-            .iter()
-            .all(|command| command.program != OsStr::new("rsync")));
+        assert!(
+            executor
+                .commands
+                .iter()
+                .all(|command| command.program != OsStr::new("rsync"))
+        );
     }
 
     #[test]
@@ -1994,7 +2019,11 @@ mod tests {
         assert_eq!(rsync.program, OsStr::new("rsync"));
         assert!(rsync.args.contains(&OsString::from("--from0")));
         assert!(rsync.args.contains(&OsString::from("--ignore-existing")));
-        assert!(rsync.args.contains(&OsString::from("--rsync-path=command rsync")));
+        assert!(
+            rsync
+                .args
+                .contains(&OsString::from("--rsync-path=command rsync"))
+        );
         let mut expected = os_bytes(relative.as_os_str()).unwrap().to_vec();
         expected.push(0);
         assert_eq!(rsync.stdin.as_deref(), Some(expected.as_slice()));
@@ -2006,7 +2035,12 @@ mod tests {
         let session_root = root(temporary.path(), SourceTool::Grok);
         let session = session_root.join("encoded/session-id");
         fs::create_dir_all(session.join(".rsync-partial")).unwrap();
-        for name in ["summary.json", "chat_history.jsonl", "updates.jsonl", ".cwd"] {
+        for name in [
+            "summary.json",
+            "chat_history.jsonl",
+            "updates.jsonl",
+            ".cwd",
+        ] {
             fs::write(session.join(name), b"x").unwrap();
         }
         fs::write(session.join("active.lock"), b"x").unwrap();
@@ -2057,7 +2091,10 @@ mod tests {
         let output = SystemCommandExecutor.pipeline(&archive, &install).unwrap();
         assert_eq!(output.producer_status, 0);
         assert_eq!(output.consumer_status, 0);
-        assert_eq!(fs::read(root.join("project/session.jsonl")).unwrap(), b"source");
+        assert_eq!(
+            fs::read(root.join("project/session.jsonl")).unwrap(),
+            b"source"
+        );
 
         fs::remove_dir_all(root.join("project")).unwrap();
         #[cfg(unix)]
@@ -2076,14 +2113,17 @@ mod tests {
         let mut inventory = os_bytes(relative.as_os_str()).unwrap().to_vec();
         inventory.push(0);
 
-
         let mut executor = FakeExecutor::default();
         executor.output(0, Vec::new(), Vec::new());
         executor.output(0, Vec::new(), Vec::new());
         executor.output(0, inventory, Vec::new());
         executor.output(0, Vec::new(), Vec::new());
-        executor.pipeline_outputs.push_back(PipelineOutput::success());
-        executor.pipeline_outputs.push_back(PipelineOutput::success());
+        executor
+            .pipeline_outputs
+            .push_back(PipelineOutput::success());
+        executor
+            .pipeline_outputs
+            .push_back(PipelineOutput::success());
         executor.materialize_on_pull.push(relative.clone());
 
         let report = sync(
@@ -2132,8 +2172,20 @@ mod tests {
 
         assert_eq!(report.failure_count(), 2);
         assert_eq!(executor.commands.len(), 2);
-        assert!(report.tools[0].error.as_deref().unwrap().contains("pi unavailable"));
-        assert!(report.tools[1].error.as_deref().unwrap().contains("omp unavailable"));
+        assert!(
+            report.tools[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("pi unavailable")
+        );
+        assert!(
+            report.tools[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("omp unavailable")
+        );
     }
 
     #[test]
@@ -2205,15 +2257,51 @@ mod tests {
     fn sync_relative_path_parse_rejects_unsafe_and_accepts_normal_paths() {
         let reject: [(&str, PathBuf, &str); 10] = [
             ("empty path", PathBuf::new(), "path is empty"),
-            ("absolute path", PathBuf::from("/etc/passwd"), "absolute paths are not allowed"),
-            ("nul byte", PathBuf::from("a\0b"), "NUL bytes are not allowed"),
-            ("rsync-partial at root", PathBuf::from(".rsync-partial"), ".rsync-partial is excluded"),
-            ("rsync-partial nested", PathBuf::from("project/.rsync-partial"), ".rsync-partial is excluded"),
-            ("rsync-partial mid path", PathBuf::from("a/.rsync-partial/b"), ".rsync-partial is excluded"),
-            ("parent dir", PathBuf::from(".."), "only normal relative components are allowed"),
-            ("parent escape", PathBuf::from("a/../b"), "only normal relative components are allowed"),
-            ("cur dir", PathBuf::from("."), "only normal relative components are allowed"),
-            ("cur dir prefix", PathBuf::from("./a"), "only normal relative components are allowed"),
+            (
+                "absolute path",
+                PathBuf::from("/etc/passwd"),
+                "absolute paths are not allowed",
+            ),
+            (
+                "nul byte",
+                PathBuf::from("a\0b"),
+                "NUL bytes are not allowed",
+            ),
+            (
+                "rsync-partial at root",
+                PathBuf::from(".rsync-partial"),
+                ".rsync-partial is excluded",
+            ),
+            (
+                "rsync-partial nested",
+                PathBuf::from("project/.rsync-partial"),
+                ".rsync-partial is excluded",
+            ),
+            (
+                "rsync-partial mid path",
+                PathBuf::from("a/.rsync-partial/b"),
+                ".rsync-partial is excluded",
+            ),
+            (
+                "parent dir",
+                PathBuf::from(".."),
+                "only normal relative components are allowed",
+            ),
+            (
+                "parent escape",
+                PathBuf::from("a/../b"),
+                "only normal relative components are allowed",
+            ),
+            (
+                "cur dir",
+                PathBuf::from("."),
+                "only normal relative components are allowed",
+            ),
+            (
+                "cur dir prefix",
+                PathBuf::from("./a"),
+                "only normal relative components are allowed",
+            ),
         ];
         for (name, path, reason) in reject {
             let error = SyncRelativePath::parse(path).expect_err(name);
@@ -2244,12 +2332,19 @@ mod tests {
         fs::create_dir_all(root.join("project")).unwrap();
         fs::write(root.join("project/session.jsonl"), b"x").unwrap();
         fs::write(root.join("project/extra.jsonl"), b"x").unwrap();
-        let requested = vec![SyncRelativePath::parse(PathBuf::from("project/session.jsonl")).unwrap()];
+        let requested =
+            vec![SyncRelativePath::parse(PathBuf::from("project/session.jsonl")).unwrap()];
 
         let error = validate_staging(&root, &requested).unwrap_err();
 
         assert!(matches!(error, SyncError::UnsafeArchive));
-        assert!(!root.join("project/extra.jsonl").metadata().unwrap().is_dir());
+        assert!(
+            !root
+                .join("project/extra.jsonl")
+                .metadata()
+                .unwrap()
+                .is_dir()
+        );
     }
 
     #[test]
@@ -2331,7 +2426,11 @@ mod tests {
             (SourceTool::Grok, "encoded/session-id/active.lock", false),
             (SourceTool::Grok, "session-id/summary.json", false),
             (SourceTool::Grok, "a/b/c/d", false),
-            (SourceTool::Agent, "0123456789abcdef0123456789abcdef/id/store.db", false),
+            (
+                SourceTool::Agent,
+                "0123456789abcdef0123456789abcdef/id/store.db",
+                false,
+            ),
         ];
         for (tool, path, expected) in cases {
             let actual = matches_tool_path(*tool, Path::new(path));
@@ -2383,7 +2482,11 @@ mod tests {
         let history = temporary.path().join(".codex/history.jsonl");
         let outside = temporary.path().join("outside-history.jsonl");
         fs::create_dir_all(history.parent().unwrap()).unwrap();
-        fs::write(&outside, b"{\"session_id\":\"x\",\"ts\":1,\"text\":\"x\"}\n").unwrap();
+        fs::write(
+            &outside,
+            b"{\"session_id\":\"x\",\"ts\":1,\"text\":\"x\"}\n",
+        )
+        .unwrap();
         std::os::unix::fs::symlink(&outside, &history).unwrap();
 
         let mut executor = FakeExecutor::default();
@@ -2403,7 +2506,11 @@ mod tests {
 
         let mut executor = FakeExecutor::with_rsync();
         executor.output(3, Vec::new(), Vec::new());
-        executor.output(0, b"{\"session_id\":\"x\",\"ts\":1,\"text\":\"x\"}\n".to_vec(), Vec::new());
+        executor.output(
+            0,
+            b"{\"session_id\":\"x\",\"ts\":1,\"text\":\"x\"}\n".to_vec(),
+            Vec::new(),
+        );
         let report = sync(
             &Endpoint::Remote("source".into()),
             &Endpoint::Local,
@@ -2564,7 +2671,9 @@ mod tests {
 
         assert_eq!(report.failure_count(), 1);
         let message = report.tools[0].error.as_deref().unwrap();
-        assert!(message.contains("remote tar pull pipeline failed (producer exit 0, consumer exit 2)"));
+        assert!(
+            message.contains("remote tar pull pipeline failed (producer exit 0, consumer exit 2)")
+        );
         assert!(message.contains("boom: tar failed"));
         assert_eq!(executor.pipelines.len(), 1);
     }

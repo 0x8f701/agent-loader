@@ -21,6 +21,8 @@ pub(crate) mod cli;
 #[cfg(feature = "cli")]
 pub(crate) mod launcher;
 #[cfg(feature = "cli")]
+pub(crate) mod live;
+#[cfg(feature = "cli")]
 pub(crate) mod new;
 #[cfg(feature = "cli")]
 pub(crate) mod picker;

@@ -736,7 +736,10 @@ fn build_omp(args: &[OsString], home: &Path) -> Result<LaunchPlan> {
     } else if args[0] == "--session" {
         let id = required_selector(LauncherKind::Omp, args, "--session")?;
         let remaining = &args[2..];
-        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+        if remaining
+            .first()
+            .is_some_and(|arg| arg == "--fork" || arg == "fork")
+        {
             command_with_tail("omp", [os("--fork"), id.clone()], &remaining[1..])
         } else {
             command_with_tail("omp", [os("--resume"), id.clone()], remaining)
@@ -796,7 +799,10 @@ fn build_pi_family(
     } else if args[0] == "--session" {
         let id = required_selector(kind, args, "--session")?;
         let remaining = &args[2..];
-        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+        if remaining
+            .first()
+            .is_some_and(|arg| arg == "--fork" || arg == "fork")
+        {
             command_with_tail(program, [os("--fork"), id.clone()], &remaining[1..])
         } else {
             command_with_tail(program, [os("--session"), id.clone()], remaining)
@@ -838,8 +844,15 @@ fn build_grok(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Resul
     } else if args[0] == "--session" {
         let id = required_selector(LauncherKind::Grok, args, "--session")?;
         let remaining = &args[2..];
-        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
-            command_with_tail("grok", [os("--fork-session"), os("--resume"), id.clone()], &remaining[1..])
+        if remaining
+            .first()
+            .is_some_and(|arg| arg == "--fork" || arg == "fork")
+        {
+            command_with_tail(
+                "grok",
+                [os("--fork-session"), os("--resume"), id.clone()],
+                &remaining[1..],
+            )
         } else {
             command_with_tail("grok", [os("--resume"), id.clone()], remaining)
         }
@@ -880,8 +893,15 @@ fn build_hyper(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Resu
     } else if args[0] == "--session" {
         let id = required_selector(LauncherKind::Hyper, args, "--session")?;
         let remaining = &args[2..];
-        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
-            command_with_tail(hyper, [os("--fork-session"), os("--resume"), id.clone()], &remaining[1..])
+        if remaining
+            .first()
+            .is_some_and(|arg| arg == "--fork" || arg == "fork")
+        {
+            command_with_tail(
+                hyper,
+                [os("--fork-session"), os("--resume"), id.clone()],
+                &remaining[1..],
+            )
         } else {
             command_with_tail(hyper, [os("--resume"), id.clone()], remaining)
         }
@@ -932,7 +952,10 @@ fn build_droid(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Resu
     } else if args[0] == "--resume" {
         let id = required_selector(LauncherKind::Droid, args, "--resume")?;
         let remaining = &args[2..];
-        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+        if remaining
+            .first()
+            .is_some_and(|arg| arg == "--fork" || arg == "fork")
+        {
             let mut prefix = base.to_vec();
             prefix.extend([os("--fork"), id.clone()]);
             command_with_tail("droid", prefix, &remaining[1..])
@@ -975,7 +998,10 @@ fn build_codex(args: &[OsString]) -> Result<LaunchPlan> {
         let id = required_selector(LauncherKind::Codex, args, "--session")?;
         let remaining = &args[2..];
         let mut prefix = base.to_vec();
-        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+        if remaining
+            .first()
+            .is_some_and(|arg| arg == "--fork" || arg == "fork")
+        {
             prefix.extend([os("fork"), id.clone()]);
             command_with_tail("codex", prefix, &remaining[1..])
         } else {
@@ -1014,7 +1040,10 @@ fn build_claude(args: &[OsString]) -> Result<LaunchPlan> {
         };
         let id = required_selector(LauncherKind::Claude, args, option)?;
         let remaining = &args[2..];
-        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+        if remaining
+            .first()
+            .is_some_and(|arg| arg == "--fork" || arg == "fork")
+        {
             let mut prefix = base.to_vec();
             prefix.push(os("--fork-session"));
             prefix.push(os("--resume"));
@@ -1065,7 +1094,10 @@ fn build_agent(args: &[OsString]) -> Result<LaunchPlan> {
     let command = if args[0] == "--session" {
         let id = required_selector(LauncherKind::Agent, args, "--session")?;
         let remaining = &args[2..];
-        if remaining.first().is_some_and(|arg| arg == "--fork" || arg == "fork") {
+        if remaining
+            .first()
+            .is_some_and(|arg| arg == "--fork" || arg == "fork")
+        {
             return Err(LauncherError::AgentForkRejected);
         }
         let mut prefix = base.to_vec();
@@ -1322,7 +1354,6 @@ fn latest_jsonl(root: &Path, recursive: bool) -> Option<PathBuf> {
     }
     latest.map(|(_, path)| path)
 }
-
 
 fn find_repo_root(cwd: &Path) -> Option<PathBuf> {
     let start = fs::canonicalize(cwd).ok()?;
@@ -1786,7 +1817,13 @@ mod tests {
             native_resume(TargetTool::Agent, path, "agent-id", home),
             command(
                 "agent",
-                strings(&["--force", "--trust", "--approve-mcps", "--resume", "agent-id"]),
+                strings(&[
+                    "--force",
+                    "--trust",
+                    "--approve-mcps",
+                    "--resume",
+                    "agent-id"
+                ]),
             )
         );
     }
@@ -1845,7 +1882,10 @@ mod tests {
             pi_session_root_in(&home, Some(configured.as_os_str())),
             configured.join("sessions")
         );
-        assert_eq!(pi_session_root_in(&home, None), home.join(".pi/agent/sessions"));
+        assert_eq!(
+            pi_session_root_in(&home, None),
+            home.join(".pi/agent/sessions")
+        );
     }
 
     #[test]
@@ -1875,7 +1915,8 @@ mod tests {
             program.clone(),
             &strings(&["--session", "/tmp/session.jsonl", "prompt"]),
             temp.path(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(resume.program, rpi.as_os_str());
         assert_eq!(
             resume.args,
@@ -1887,16 +1928,12 @@ mod tests {
             program.clone(),
             &strings(&["--fork", "session-id"]),
             temp.path(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(fork.program, rpi.as_os_str());
         assert_eq!(fork.args, strings(&["--fork", "session-id"]));
 
-        let empty = build_pi_family(
-            LauncherKind::Rpi,
-            program,
-            &[],
-            temp.path(),
-        ).unwrap();
+        let empty = build_pi_family(LauncherKind::Rpi, program, &[], temp.path()).unwrap();
         assert_eq!(empty.program, rpi.as_os_str());
         assert_eq!(empty.args, strings(&["--continue"]));
     }
@@ -1915,11 +1952,11 @@ mod tests {
             rpi.clone().into_os_string(),
             &[os("--fork")],
             temp.path(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(fork.program, rpi.as_os_str());
         assert_eq!(fork.args, vec![os("--fork"), session.into_os_string()]);
     }
-
 
     #[test]
     fn local_omp_arguments_are_not_shell_quoted_or_reparsed() {
@@ -2135,19 +2172,45 @@ mod tests {
 
     #[test]
     fn agentlo_default_continues_then_falls_back_to_new_chat() {
-        let plan = build_launcher(LauncherKind::Agent, &[], &test_home(), Path::new("/tmp")).unwrap();
-        let LaunchPlan::Fallback { primary, fallback } = plan else { panic!("expected fallback plan") };
+        let plan =
+            build_launcher(LauncherKind::Agent, &[], &test_home(), Path::new("/tmp")).unwrap();
+        let LaunchPlan::Fallback { primary, fallback } = plan else {
+            panic!("expected fallback plan")
+        };
         assert_eq!(primary.program, "agent");
-        assert_eq!(primary.args, strings(&["--force", "--trust", "--approve-mcps", "--continue"]));
+        assert_eq!(
+            primary.args,
+            strings(&["--force", "--trust", "--approve-mcps", "--continue"])
+        );
         assert_eq!(fallback.program, "agent");
-        assert_eq!(fallback.args, strings(&["--force", "--trust", "--approve-mcps"]));
+        assert_eq!(
+            fallback.args,
+            strings(&["--force", "--trust", "--approve-mcps"])
+        );
     }
     #[test]
     fn agentlo_tmux_preserves_new_chat_fallback() {
-        let plan = build_launcher(LauncherKind::Agent, &strings(&["--tmux"]), &test_home(), Path::new("/tmp/project")).unwrap();
-        let LaunchPlan::Tmux { command, fallback, .. } = plan else { panic!("expected tmux plan") };
-        assert_eq!(command.args, strings(&["--force", "--trust", "--approve-mcps", "--continue"]));
-        assert_eq!(fallback.unwrap().args, strings(&["--force", "--trust", "--approve-mcps"]));
+        let plan = build_launcher(
+            LauncherKind::Agent,
+            &strings(&["--tmux"]),
+            &test_home(),
+            Path::new("/tmp/project"),
+        )
+        .unwrap();
+        let LaunchPlan::Tmux {
+            command, fallback, ..
+        } = plan
+        else {
+            panic!("expected tmux plan")
+        };
+        assert_eq!(
+            command.args,
+            strings(&["--force", "--trust", "--approve-mcps", "--continue"])
+        );
+        assert_eq!(
+            fallback.unwrap().args,
+            strings(&["--force", "--trust", "--approve-mcps"])
+        );
     }
 
     #[test]
@@ -2833,7 +2896,10 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(command.program, "grok");
-        assert_eq!(command.args, strings(&["--fork-session", "--resume", "sid"]));
+        assert_eq!(
+            command.args,
+            strings(&["--fork-session", "--resume", "sid"])
+        );
         assert!(command.cwd.is_none());
     }
 
@@ -2850,15 +2916,13 @@ mod tests {
         fs::set_permissions(&hyper, fs::Permissions::from_mode(0o755)).unwrap();
 
         let command = assert_command(
-            build_hyper(
-                &strings(&["--session", "sid", "--fork"]),
-                temp.path(),
-                None,
-            )
-            .unwrap(),
+            build_hyper(&strings(&["--session", "sid", "--fork"]), temp.path(), None).unwrap(),
         );
         assert_eq!(command.program, preferred_hyper_executable(temp.path()));
-        assert_eq!(command.args, strings(&["--fork-session", "--resume", "sid"]));
+        assert_eq!(
+            command.args,
+            strings(&["--fork-session", "--resume", "sid"])
+        );
         assert!(command.cwd.is_none());
     }
     // `build_hyper` reads GROK_HOME/HYPER_HOME from the process environment,
@@ -2972,9 +3036,8 @@ mod tests {
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).unwrap();
         let latest = hyper_session_fixture(temp.path(), &repo);
-        let command = assert_command(
-            build_hyper(&strings(&["--fork"]), temp.path(), Some(&repo)).unwrap(),
-        );
+        let command =
+            assert_command(build_hyper(&strings(&["--fork"]), temp.path(), Some(&repo)).unwrap());
         assert_eq!(command.program, preferred_hyper_executable(temp.path()));
         assert_eq!(
             command.args,
@@ -3007,8 +3070,7 @@ mod tests {
             assert!(!worktree);
             assert!(headless);
         }
-        let (normalized, worktree, headless) =
-            normalize_hyper_fork_args(&strings(&["prompt"]));
+        let (normalized, worktree, headless) = normalize_hyper_fork_args(&strings(&["prompt"]));
         assert_eq!(normalized, strings(&["prompt"]));
         assert!(!worktree);
         assert!(!headless);
@@ -3038,12 +3100,7 @@ mod tests {
         let (temp, _guard) = hyper_fixture();
         let session_id = "12345678-1234-4234-8234-123456789abc";
         let command = assert_command(
-            build_hyper(
-                &strings(&["--fork", session_id, "-w"]),
-                temp.path(),
-                None,
-            )
-            .unwrap(),
+            build_hyper(&strings(&["--fork", session_id, "-w"]), temp.path(), None).unwrap(),
         );
         assert_eq!(
             command.args,
@@ -3077,9 +3134,7 @@ mod tests {
     #[test]
     fn hyperlo_sets_color_environment() {
         let (temp, _guard) = hyper_fixture();
-        let command = assert_command(
-            build_hyper(&strings(&["hello"]), temp.path(), None).unwrap(),
-        );
+        let command = assert_command(build_hyper(&strings(&["hello"]), temp.path(), None).unwrap());
         assert_eq!(command.env_remove, strings(&["NO_COLOR"]));
         assert_eq!(command.env_set, vec![(os("COLORTERM"), os("truecolor"))]);
     }

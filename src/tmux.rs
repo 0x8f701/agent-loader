@@ -1543,7 +1543,10 @@ mod platform {
         fn exact_session_target_prefixes_equals() {
             assert_eq!(exact_session_target(OsStr::new("demo")), os("=demo"));
             assert_eq!(exact_session_target(OsStr::new("=demo")), os("=demo"));
-            assert_eq!(exact_session_target(OsStr::new("demo-e2e")), os("=demo-e2e"));
+            assert_eq!(
+                exact_session_target(OsStr::new("demo-e2e")),
+                os("=demo-e2e")
+            );
         }
 
         fn request(argv: &[&str]) -> Request {

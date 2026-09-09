@@ -1,11 +1,11 @@
 #[cfg(unix)]
 use std::ffi::CString;
 use std::ffi::OsStr;
-use std::fs::{File, Metadata};
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::fs::Permissions;
+use std::fs::{File, Metadata};
 use std::io::{self, BufWriter, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -277,7 +277,9 @@ pub fn atomic_write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> Result<()
             Some(metadata.permissions())
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).with_context(|| format!("inspecting output {}", path.display())),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting output {}", path.display()));
+        }
     };
     let (temporary_path, mut temporary_file) = create_temporary_file_at(&parent_directory)
         .with_context(|| format!("creating temporary file in {}", parent.display()))?;
@@ -291,16 +293,23 @@ pub fn atomic_write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> Result<()
             writer.flush().context("flushing temporary JSONL file")?;
         }
         if let Some(permissions) = permissions {
-            temporary_file.set_permissions(permissions).context("setting temporary JSONL file permissions")?;
+            temporary_file
+                .set_permissions(permissions)
+                .context("setting temporary JSONL file permissions")?;
         }
-        temporary_file.sync_all().context("syncing temporary JSONL file")?;
+        temporary_file
+            .sync_all()
+            .context("syncing temporary JSONL file")?;
         validate_open_directory(&parent_directory)
             .with_context(|| format!("revalidating output directory {}", parent.display()))?;
         match inspect_entry_at(&parent_directory, name) {
             Ok(metadata) if metadata.is_file() && !metadata_is_link_or_reparse(&metadata) => {}
             Ok(_) => bail!("refusing to replace non-regular file {}", path.display()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).with_context(|| format!("reinspecting output {}", path.display())),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reinspecting output {}", path.display()));
+            }
         }
         std::fs::rename(&temporary_path, &path)
             .with_context(|| format!("replacing output {}", path.display()))?;
@@ -339,9 +348,13 @@ pub fn open_directory_under_root(directory: &Path, root: &Path) -> Result<OwnedF
         .with_context(|| format!("validating directory {}", directory.display()))?;
     let root = absolute_without_parent_components(root)
         .with_context(|| format!("validating root {}", root.display()))?;
-    directory.strip_prefix(&root).with_context(|| format!(
-        "directory {} is not beneath root {}", directory.display(), root.display()
-    ))?;
+    directory.strip_prefix(&root).with_context(|| {
+        format!(
+            "directory {} is not beneath root {}",
+            directory.display(),
+            root.display()
+        )
+    })?;
     open_absolute_directory(&directory)
 }
 
@@ -401,12 +414,20 @@ fn absolute_without_parent_components(path: &Path) -> io::Result<PathBuf> {
 
 #[cfg(not(unix))]
 fn absolute_without_parent_components(path: &Path) -> io::Result<PathBuf> {
-    if path.components().any(|component| matches!(component, Component::ParentDir)) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!(
-            "parent path component is not allowed: {}", path.display()
-        )));
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("parent path component is not allowed: {}", path.display()),
+        ));
     }
-    let path = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -420,13 +441,19 @@ fn absolute_without_parent_components(path: &Path) -> io::Result<PathBuf> {
                 validate_platform_name(name)?;
                 normalized.push(name);
             }
-            Component::ParentDir => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!(
-                "parent path component is not allowed: {}", path.display()
-            ))),
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("parent path component is not allowed: {}", path.display()),
+                ));
+            }
         }
     }
     if !normalized.is_absolute() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("path is not absolute: {}", path.display())));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path is not absolute: {}", path.display()),
+        ));
     }
     Ok(normalized)
 }
@@ -434,12 +461,8 @@ fn absolute_without_parent_components(path: &Path) -> io::Result<PathBuf> {
 #[cfg(unix)]
 fn open_absolute_directory(directory: &Path) -> Result<OwnedFd> {
     debug_assert!(directory.is_absolute());
-    let mut descriptor = openat_owned(
-        libc::AT_FDCWD,
-        OsStr::new("/"),
-        DIRECTORY_OPEN_FLAGS,
-    )
-    .context("opening filesystem root")?;
+    let mut descriptor = openat_owned(libc::AT_FDCWD, OsStr::new("/"), DIRECTORY_OPEN_FLAGS)
+        .context("opening filesystem root")?;
     for component in directory.components() {
         match component {
             Component::RootDir | Component::CurDir => {}
@@ -471,8 +494,10 @@ fn open_absolute_directory(directory: &Path) -> Result<OwnedFd> {
             Component::Normal(name) => {
                 validate_platform_name(name)?;
                 current.push(name);
-                guards.push(open_directory_no_follow(&current)
-                    .with_context(|| format!("opening directory component {:?}", name))?);
+                guards.push(
+                    open_directory_no_follow(&current)
+                        .with_context(|| format!("opening directory component {:?}", name))?,
+                );
             }
             Component::ParentDir => bail!("unsafe directory path {}", directory.display()),
         }
@@ -480,7 +505,10 @@ fn open_absolute_directory(directory: &Path) -> Result<OwnedFd> {
     if guards.is_empty() {
         guards.push(open_directory_no_follow(directory).context("opening filesystem root")?);
     }
-    Ok(OwnedFd { path: directory.to_path_buf(), guards })
+    Ok(OwnedFd {
+        path: directory.to_path_buf(),
+        guards,
+    })
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -495,8 +523,10 @@ fn open_absolute_directory(directory: &Path) -> Result<OwnedFd> {
             Component::Normal(name) => {
                 validate_platform_name(name)?;
                 current.push(name);
-                descriptor = Some(open_directory_no_follow(&current)
-                    .with_context(|| format!("opening directory component {:?}", name))?);
+                descriptor = Some(
+                    open_directory_no_follow(&current)
+                        .with_context(|| format!("opening directory component {:?}", name))?,
+                );
             }
             Component::ParentDir => bail!("unsafe directory path {}", directory.display()),
         }
@@ -505,7 +535,10 @@ fn open_absolute_directory(directory: &Path) -> Result<OwnedFd> {
         Some(file) => file,
         None => open_directory_no_follow(directory).context("opening filesystem root")?,
     };
-    Ok(OwnedFd { path: directory.to_path_buf(), file })
+    Ok(OwnedFd {
+        path: directory.to_path_buf(),
+        file,
+    })
 }
 
 #[cfg(unix)]
@@ -530,7 +563,10 @@ fn open_regular_file_at_os(directory: &OwnedFd, name: &OsStr) -> io::Result<(Fil
     let file = open_regular_no_follow(&directory.path.join(name))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata_is_link_or_reparse(&metadata) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "opened entry is not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened entry is not a regular file",
+        ));
     }
     Ok((file, metadata))
 }
@@ -548,7 +584,10 @@ fn inspect_entry_at(directory: &OwnedFd, name: &OsStr) -> io::Result<Metadata> {
     validate_open_directory(directory)?;
     let metadata = std::fs::symlink_metadata(directory.path.join(name))?;
     if metadata_is_link_or_reparse(&metadata) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "entry is a symbolic link or reparse point"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "entry is a symbolic link or reparse point",
+        ));
     }
     Ok(metadata)
 }
@@ -556,10 +595,16 @@ fn inspect_entry_at(directory: &OwnedFd, name: &OsStr) -> io::Result<Metadata> {
 fn validate_single_name(name: &OsStr) -> io::Result<()> {
     let mut components = Path::new(name).components();
     let Some(Component::Normal(component)) = components.next() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "entry name must be exactly one normal path component"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name must be exactly one normal path component",
+        ));
     };
     if components.next().is_some() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "entry name must be exactly one normal path component"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name must be exactly one normal path component",
+        ));
     }
     validate_platform_name(component)
 }
@@ -655,7 +700,9 @@ fn c_string(name: &OsStr) -> io::Result<CString> {
 }
 
 #[cfg(unix)]
-fn validate_platform_name(_name: &OsStr) -> io::Result<()> { Ok(()) }
+fn validate_platform_name(_name: &OsStr) -> io::Result<()> {
+    Ok(())
+}
 
 #[cfg(not(unix))]
 fn validate_path_prefix(prefix: &OsStr, path: &Path) -> io::Result<()> {
@@ -663,42 +710,68 @@ fn validate_path_prefix(prefix: &OsStr, path: &Path) -> io::Result<()> {
     {
         use std::path::Prefix;
         match Path::new(prefix).components().next() {
-            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(_, _)) => Ok(()),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unsupported path prefix: {}", path.display()))),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(_, _)) =>
+            {
+                Ok(())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported path prefix: {}", path.display()),
+            )),
         }
     }
     #[cfg(not(windows))]
-    { let _ = (prefix, path); Ok(()) }
+    {
+        let _ = (prefix, path);
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
 fn validate_platform_name(name: &OsStr) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     let name: Vec<u16> = name.encode_wide().collect();
-    let invalid_character = name.iter().any(|character| *character == 0 || *character < 32
-        || matches!(*character, 34 | 42 | 47 | 58 | 60 | 62 | 63 | 92 | 124));
+    let invalid_character = name.iter().any(|character| {
+        *character == 0
+            || *character < 32
+            || matches!(*character, 34 | 42 | 47 | 58 | 60 | 62 | 63 | 92 | 124)
+    });
     let ambiguous_ending = matches!(name.last(), Some(32 | 46));
-    let stem_end = name.iter().position(|character| *character == 46).unwrap_or(name.len());
+    let stem_end = name
+        .iter()
+        .position(|character| *character == 46)
+        .unwrap_or(name.len());
     let stem = &name[..stem_end];
-    let reserved = windows_name_eq(stem, b"CON") || windows_name_eq(stem, b"PRN")
-        || windows_name_eq(stem, b"AUX") || windows_name_eq(stem, b"NUL")
-        || windows_name_eq(stem, b"CLOCK$") || windows_numbered_device(stem, b"COM")
+    let reserved = windows_name_eq(stem, b"CON")
+        || windows_name_eq(stem, b"PRN")
+        || windows_name_eq(stem, b"AUX")
+        || windows_name_eq(stem, b"NUL")
+        || windows_name_eq(stem, b"CLOCK$")
+        || windows_numbered_device(stem, b"COM")
         || windows_numbered_device(stem, b"LPT");
     if invalid_character || ambiguous_ending || reserved {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "entry name is unsafe on Windows"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name is unsafe on Windows",
+        ));
     }
     Ok(())
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn validate_platform_name(_name: &OsStr) -> io::Result<()> { Ok(()) }
+fn validate_platform_name(_name: &OsStr) -> io::Result<()> {
+    Ok(())
+}
 
 #[cfg(windows)]
 fn windows_name_eq(name: &[u16], expected: &[u8]) -> bool {
-    name.len() == expected.len() && name.iter().zip(expected).all(|(actual, expected)| {
-        let uppercase = u16::from(*expected);
-        *actual == uppercase || *actual == uppercase + u16::from(expected.is_ascii_alphabetic()) * 32
-    })
+    name.len() == expected.len()
+        && name.iter().zip(expected).all(|(actual, expected)| {
+            let uppercase = u16::from(*expected);
+            *actual == uppercase
+                || *actual == uppercase + u16::from(expected.is_ascii_alphabetic()) * 32
+        })
 }
 
 #[cfg(windows)]
@@ -709,12 +782,18 @@ fn windows_numbered_device(name: &[u16], prefix: &[u8; 3]) -> bool {
 #[cfg(windows)]
 fn validate_open_directory(directory: &OwnedFd) -> io::Result<()> {
     if directory.guards.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "directory has no held handles"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory has no held handles",
+        ));
     }
     for guard in &directory.guards {
         let metadata = guard.metadata()?;
         if !metadata.is_dir() || metadata_is_link_or_reparse(&metadata) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "directory handle is not a regular directory"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "directory handle is not a regular directory",
+            ));
         }
     }
     open_directory_no_follow(&directory.path).map(drop)
@@ -724,9 +803,14 @@ fn validate_open_directory(directory: &OwnedFd) -> io::Result<()> {
 fn validate_open_directory(directory: &OwnedFd) -> io::Result<()> {
     let metadata = directory.file.metadata()?;
     if !metadata.is_dir() || metadata_is_link_or_reparse(&metadata) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "directory handle is not a regular directory"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory handle is not a regular directory",
+        ));
     }
-    open_absolute_directory(&directory.path).map(|_| ()).map_err(io::Error::other)
+    open_absolute_directory(&directory.path)
+        .map(|_| ())
+        .map_err(io::Error::other)
 }
 
 #[cfg(not(unix))]
@@ -743,17 +827,25 @@ fn create_temporary_file_at(directory: &OwnedFd) -> io::Result<(PathBuf, File)> 
             Err(error) => return Err(error),
         }
     }
-    Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not allocate a unique temporary file name"))
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary file name",
+    ))
 }
 
 #[cfg(windows)]
 fn open_directory_no_follow(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new().read(true)
+    let file = OpenOptions::new()
+        .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS).open(path)?;
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_dir() || metadata_is_link_or_reparse(&metadata) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "path component is not a regular directory"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "path component is not a regular directory",
+        ));
     }
     Ok(file)
 }
@@ -762,23 +854,31 @@ fn open_directory_no_follow(path: &Path) -> io::Result<File> {
 fn open_directory_no_follow(path: &Path) -> io::Result<File> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "path component is not a regular directory"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "path component is not a regular directory",
+        ));
     }
     File::open(path)
 }
 
 #[cfg(windows)]
 fn open_regular_no_follow(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true)
+    OpenOptions::new()
+        .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 #[cfg(all(not(unix), not(windows)))]
 fn open_regular_no_follow(path: &Path) -> io::Result<File> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "entry is not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "entry is not a regular file",
+        ));
     }
     File::open(path)
 }
@@ -790,11 +890,14 @@ fn metadata_is_link_or_reparse(metadata: &Metadata) -> bool {
 
 #[cfg(windows)]
 fn metadata_is_link_or_reparse(metadata: &Metadata) -> bool {
-    metadata.file_type().is_symlink() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn metadata_is_link_or_reparse(metadata: &Metadata) -> bool { metadata.file_type().is_symlink() }
+fn metadata_is_link_or_reparse(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -881,7 +984,9 @@ mod tests {
         let wrong = directory.join("meta.json");
         let bad_hash = root.join("not-a-workspace-hash/session-id/store.db");
         fs::create_dir_all(bad_hash.parent().unwrap()).unwrap();
-        for path in [&store, &nested, &wrong, &bad_hash] { fs::write(path, "x").unwrap(); }
+        for path in [&store, &nested, &wrong, &bad_hash] {
+            fs::write(path, "x").unwrap();
+        }
         assert!(is_agent_store(&store, &root));
         assert!(!is_agent_store(&nested, &root));
         assert!(!is_agent_store(&wrong, &root));
@@ -930,7 +1035,10 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "{\"one\":1}\n{\"two\":\"✓\"}\n"
         );
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o640);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
     }
 
     #[test]
@@ -956,7 +1064,9 @@ mod tests {
             where
                 S: serde::Serializer,
             {
-                Err(serde::ser::Error::custom("intentional serialization failure"))
+                Err(serde::ser::Error::custom(
+                    "intentional serialization failure",
+                ))
             }
         }
 
@@ -977,7 +1087,10 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .filter(|name| name.to_string_lossy().starts_with(".al-jsonl-"))
             .collect();
-        assert!(leftovers.is_empty(), "temporary files leaked: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temporary files leaked: {leftovers:?}"
+        );
     }
 
     #[test]

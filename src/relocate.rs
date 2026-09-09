@@ -78,9 +78,8 @@ pub fn move_sessions(catalog: &Catalog, options: &MoveOptions) -> Result<Vec<Mov
         }
     }
     planned.sort_by(|left, right| left.session.path.cmp(&right.session.path));
-    planned.retain(|plan| {
-        plan.rewrite_cwd || !same_resolved(&plan.session.path, &plan.destination)
-    });
+    planned
+        .retain(|plan| plan.rewrite_cwd || !same_resolved(&plan.session.path, &plan.destination));
     if planned.is_empty() {
         bail!("no sessions found to move from {}", from.display());
     }
@@ -123,12 +122,7 @@ fn selects_session(session: &Session, from: &Path) -> bool {
     path_is_under(&session.path, from) || cwd_is_under(&session.cwd, from)
 }
 
-fn plan_move(
-    catalog: &Catalog,
-    session: Session,
-    from: &Path,
-    to: &Path,
-) -> Result<PlannedMove> {
+fn plan_move(catalog: &Catalog, session: Session, from: &Path, to: &Path) -> Result<PlannedMove> {
     let cwd_match = cwd_is_under(&session.cwd, from);
     if catalog_dir_for_tool(to, catalog, session.tool) {
         let destination = dump_destination(&session, to)?;
@@ -186,11 +180,7 @@ fn grok_session_dir_name(session: &Session) -> Result<String> {
         .context("grok session id is not a safe directory name")
 }
 
-fn native_session_path(
-    catalog: &Catalog,
-    session: &Session,
-    cwd: &Path,
-) -> Result<PathBuf> {
+fn native_session_path(catalog: &Catalog, session: &Session, cwd: &Path) -> Result<PathBuf> {
     let cwd_text = cwd
         .to_str()
         .with_context(|| format!("session cwd is not valid UTF-8: {}", cwd.display()))?;
@@ -208,9 +198,9 @@ fn native_session_path(
                 &env::temp_dir(),
             ))
             .join(name),
-        SourceTool::Droid | SourceTool::Claude => {
-            root.join(crate::emit::encode_single_dash_cwd(cwd_text)).join(name)
-        }
+        SourceTool::Droid | SourceTool::Claude => root
+            .join(crate::emit::encode_single_dash_cwd(cwd_text))
+            .join(name),
         SourceTool::Codex => session.path.clone(),
         SourceTool::Grok => root
             .join(crate::emit::encode_grok_cwd(cwd_text))
@@ -234,10 +224,7 @@ fn validate_destinations(planned: &[PlannedMove]) -> Result<()> {
             );
         }
         if !same_resolved(&plan.session.path, &plan.destination) && plan.destination.exists() {
-            bail!(
-                "destination already exists: {}",
-                plan.destination.display()
-            );
+            bail!("destination already exists: {}", plan.destination.display());
         }
         if plan.session.tool == SourceTool::Grok {
             if let Some(directory) = plan.destination.parent() {
@@ -368,23 +355,17 @@ fn write_rewritten_jsonl(
         .with_context(|| format!("reading session {}", session.path.display()))?;
     let mut records = Vec::new();
     for line in BufReader::new(file).lines() {
-        let line =
-            line.with_context(|| format!("reading session {}", session.path.display()))?;
+        let line = line.with_context(|| format!("reading session {}", session.path.display()))?;
         if line.trim().is_empty() {
             continue;
         }
-        let mut record: Value = serde_json::from_str(&line).with_context(|| {
-            format!(
-                "parsing session record in {}",
-                session.path.display()
-            )
-        })?;
+        let mut record: Value = serde_json::from_str(&line)
+            .with_context(|| format!("parsing session record in {}", session.path.display()))?;
         rewrite_record_cwd(&mut record, from, to);
         records.push(record);
     }
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     atomic_write_jsonl(destination, &records)
 }
@@ -408,16 +389,16 @@ fn copy_session(session: &Session, destination: &Path) -> Result<()> {
         return copy_grok_session(session, destination);
     }
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     copy_regular_file(&session.path, destination)
 }
 
 fn copy_grok_session(session: &Session, destination: &Path) -> Result<()> {
-    let directory = session.path.parent().with_context(|| {
-        format!("grok session has no directory: {}", session.path.display())
-    })?;
+    let directory = session
+        .path
+        .parent()
+        .with_context(|| format!("grok session has no directory: {}", session.path.display()))?;
     let dest_dir = destination.parent().with_context(|| {
         format!(
             "grok destination has no directory: {}",
@@ -428,8 +409,8 @@ fn copy_grok_session(session: &Session, destination: &Path) -> Result<()> {
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("inspecting {}", source.display()))?;
+    let metadata =
+        fs::symlink_metadata(source).with_context(|| format!("inspecting {}", source.display()))?;
     if metadata.file_type().is_symlink() {
         bail!("refusing to copy symlink {}", source.display());
     }
@@ -438,9 +419,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     }
     fs::create_dir_all(destination)
         .with_context(|| format!("creating {}", destination.display()))?;
-    for entry in fs::read_dir(source)
-        .with_context(|| format!("reading {}", source.display()))?
-    {
+    for entry in fs::read_dir(source).with_context(|| format!("reading {}", source.display()))? {
         let entry = entry.with_context(|| format!("reading entry under {}", source.display()))?;
         let name = entry.file_name();
         if name.to_string_lossy().ends_with(".lock") {
@@ -469,17 +448,16 @@ fn rewrite_json_file_cwd(path: &Path, from: &Path, to: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let mut record: Value = serde_json::from_str(text.trim())
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut record: Value =
+        serde_json::from_str(text.trim()).with_context(|| format!("parsing {}", path.display()))?;
     rewrite_record_cwd(&mut record, from, to);
     atomic_write_jsonl(path, std::slice::from_ref(&record))
 }
 
 fn copy_regular_file(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("inspecting {}", source.display()))?;
+    let metadata =
+        fs::symlink_metadata(source).with_context(|| format!("inspecting {}", source.display()))?;
     if metadata.file_type().is_symlink() {
         bail!("refusing to copy symlink {}", source.display());
     }
@@ -489,13 +467,8 @@ fn copy_regular_file(source: &Path, destination: &Path) -> Result<()> {
     if destination.exists() {
         bail!("destination already exists: {}", destination.display());
     }
-    fs::copy(source, destination).with_context(|| {
-        format!(
-            "copying {} to {}",
-            source.display(),
-            destination.display()
-        )
-    })?;
+    fs::copy(source, destination)
+        .with_context(|| format!("copying {} to {}", source.display(), destination.display()))?;
     Ok(())
 }
 
@@ -600,11 +573,25 @@ mod tests {
 
     use crate::sessions::Catalog;
 
-    fn write_pi(home: &Path, project: &str, file: &str, cwd: &str, id: &str, text: &str) -> PathBuf {
+    fn write_pi(
+        home: &Path,
+        project: &str,
+        file: &str,
+        cwd: &str,
+        id: &str,
+        text: &str,
+    ) -> PathBuf {
         write_pi_jsonl(home, ".pi/agent/sessions", project, file, cwd, id, text)
     }
 
-    fn write_rpi(home: &Path, project: &str, file: &str, cwd: &str, id: &str, text: &str) -> PathBuf {
+    fn write_rpi(
+        home: &Path,
+        project: &str,
+        file: &str,
+        cwd: &str,
+        id: &str,
+        text: &str,
+    ) -> PathBuf {
         write_pi_jsonl(home, ".rpi/sessions", project, file, cwd, id, text)
     }
 
@@ -617,10 +604,7 @@ mod tests {
         id: &str,
         text: &str,
     ) -> PathBuf {
-        let path = home
-            .join(root)
-            .join(project)
-            .join(file);
+        let path = home.join(root).join(project).join(file);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut handle = fs::File::create(&path).unwrap();
         writeln!(
@@ -716,9 +700,9 @@ mod tests {
             },
         )
         .unwrap();
-        let dest = home.path().join(
-            ".pi/agent/sessions/--workspace-new--/2026-01-01T00-00-00_sid.jsonl",
-        );
+        let dest = home
+            .path()
+            .join(".pi/agent/sessions/--workspace-new--/2026-01-01T00-00-00_sid.jsonl");
         assert_eq!(moved[0].destination, dest);
         assert!(!source.exists());
         let text = fs::read_to_string(&dest).unwrap();
@@ -899,9 +883,9 @@ mod tests {
     }
 
     fn write_codex(home: &Path, cwd: &str, id: &str) -> PathBuf {
-        let path = home.join(".codex/sessions/2026/01/01").join(format!(
-            "rollout-2026-01-01T00-00-00-{id}.jsonl"
-        ));
+        let path = home
+            .join(".codex/sessions/2026/01/01")
+            .join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
@@ -963,21 +947,17 @@ mod tests {
             "grok-id",
             FEAT_A,
         );
-        let codex = write_codex(
-            home.path(),
-            FEAT_A,
-            "11111111-1111-4111-8111-111111111111",
-        );
+        let codex = write_codex(home.path(), FEAT_A, "11111111-1111-4111-8111-111111111111");
 
         let moved = move_feat(&catalog, Vec::new());
         assert_eq!(moved.len(), 7, "{moved:?}");
 
-        let pi_dest = home.path().join(
-            ".pi/agent/sessions/--workspace-feat-b-projectX--/2026-01-01T00-00-00_pi.jsonl",
-        );
-        let rpi_dest = home.path().join(
-            ".rpi/sessions/--workspace-feat-b-projectX--/2026-01-01T00-00-00_rpi.jsonl",
-        );
+        let pi_dest = home
+            .path()
+            .join(".pi/agent/sessions/--workspace-feat-b-projectX--/2026-01-01T00-00-00_pi.jsonl");
+        let rpi_dest = home
+            .path()
+            .join(".rpi/sessions/--workspace-feat-b-projectX--/2026-01-01T00-00-00_rpi.jsonl");
         let omp_home = crate::formats::omp::encode_omp_cwd_with(
             Path::new(FEAT_B),
             catalog.user_home(),
@@ -988,15 +968,15 @@ mod tests {
             .join(".omp/agent/sessions")
             .join(omp_home)
             .join("2026-01-01T00-00-00_omp.jsonl");
-        let claude_dest = home.path().join(
-            ".claude/projects/-workspace-feat-b-projectX/claude-id.jsonl",
-        );
+        let claude_dest = home
+            .path()
+            .join(".claude/projects/-workspace-feat-b-projectX/claude-id.jsonl");
         let droid_dest = home
             .path()
             .join(".factory/sessions/-workspace-feat-b-projectX/droid-id.jsonl");
-        let grok_dest = home.path().join(
-            ".grok/sessions/%2Fworkspace%2Ffeat-b%2FprojectX/grok-id/summary.json",
-        );
+        let grok_dest = home
+            .path()
+            .join(".grok/sessions/%2Fworkspace%2Ffeat-b%2FprojectX/grok-id/summary.json");
 
         assert!(!pi.exists());
         assert!(pi_dest.is_file());
@@ -1063,14 +1043,16 @@ mod tests {
         let catalog = Catalog::new(home.path());
         let moved = move_feat(&catalog, vec![SourceTool::Pi]);
         assert_eq!(moved.len(), 1);
-        let dest = home.path().join(
-            ".pi/agent/sessions/--workspace-feat-b-projectX-crates-foo--/nested.jsonl",
-        );
+        let dest = home
+            .path()
+            .join(".pi/agent/sessions/--workspace-feat-b-projectX-crates-foo--/nested.jsonl");
         assert_eq!(moved[0].destination, dest);
         assert!(!keep_nested.exists());
-        assert!(fs::read_to_string(&dest).unwrap().contains(&format!(
-            "{FEAT_B}/crates/foo"
-        )));
+        assert!(
+            fs::read_to_string(&dest)
+                .unwrap()
+                .contains(&format!("{FEAT_B}/crates/foo"))
+        );
         assert!(keep_sibling.exists());
         assert!(keep_parent.exists());
         assert!(fs::read_to_string(&keep_sibling).unwrap().contains(sibling));
@@ -1103,11 +1085,8 @@ mod tests {
         let to = home.path().join("Projects/feat-b/projectX");
         fs::create_dir_all(&from).unwrap();
         fs::create_dir_all(&to).unwrap();
-        let encoded = crate::formats::omp::encode_omp_cwd_with(
-            &from,
-            home.path(),
-            &env::temp_dir(),
-        );
+        let encoded =
+            crate::formats::omp::encode_omp_cwd_with(&from, home.path(), &env::temp_dir());
         assert_eq!(encoded, "-Projects-feat-a-projectX");
         let source = write_omp(
             home.path(),
@@ -1132,7 +1111,11 @@ mod tests {
             .join(".omp/agent/sessions/-Projects-feat-b-projectX/omp.jsonl");
         assert_eq!(moved[0].destination, dest);
         assert!(!source.exists());
-        assert!(fs::read_to_string(&dest).unwrap().contains(to.to_str().unwrap()));
+        assert!(
+            fs::read_to_string(&dest)
+                .unwrap()
+                .contains(to.to_str().unwrap())
+        );
     }
 
     #[test]
@@ -1203,18 +1186,22 @@ mod tests {
             vec![SourceTool::Pi, SourceTool::Droid, SourceTool::Omp],
         );
 
-        let pi_dest = home.path().join(
-            ".pi/agent/sessions/--workspace-feat-b-projectX--/2026-01-01T00-00-00_sid.jsonl",
-        );
+        let pi_dest = home
+            .path()
+            .join(".pi/agent/sessions/--workspace-feat-b-projectX--/2026-01-01T00-00-00_sid.jsonl");
         assert!(pi_dest.is_file());
-        assert!(pi_dest
-            .with_file_name("2026-01-01T00-00-00_sid.jsonl.loops.json")
-            .is_file());
-        assert!(pi_dest
-            .parent()
-            .unwrap()
-            .join("children/sid/orchestration-state.json")
-            .is_file());
+        assert!(
+            pi_dest
+                .with_file_name("2026-01-01T00-00-00_sid.jsonl.loops.json")
+                .is_file()
+        );
+        assert!(
+            pi_dest
+                .parent()
+                .unwrap()
+                .join("children/sid/orchestration-state.json")
+                .is_file()
+        );
         assert!(!loops.exists());
         assert!(!child.exists());
 
@@ -1222,9 +1209,11 @@ mod tests {
             .path()
             .join(".factory/sessions/-workspace-feat-b-projectX/droid-id.jsonl");
         assert!(droid_dest.is_file());
-        assert!(droid_dest
-            .with_file_name("droid-id.settings.json")
-            .is_file());
+        assert!(
+            droid_dest
+                .with_file_name("droid-id.settings.json")
+                .is_file()
+        );
         assert!(!settings.exists());
 
         let omp_home = crate::formats::omp::encode_omp_cwd_with(
@@ -1238,10 +1227,12 @@ mod tests {
             .join(omp_home)
             .join("2026-01-01T00-00-00_omp.jsonl");
         assert!(omp_dest.is_file());
-        assert!(omp_dest
-            .with_file_name("2026-01-01T00-00-00_omp")
-            .join("log.txt")
-            .is_file());
+        assert!(
+            omp_dest
+                .with_file_name("2026-01-01T00-00-00_omp")
+                .join("log.txt")
+                .is_file()
+        );
         assert!(!omp_dir.exists());
     }
 

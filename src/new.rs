@@ -1,6 +1,7 @@
 //! Create or update a git project on this machine or a remote host, then
 //! optionally open it in tmux (and optionally launch a coding agent).
 
+use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -42,6 +43,7 @@ pub struct NewProject {
     pub orchestrator: Option<LauncherKind>,
     pub reviewer: Option<LauncherKind>,
     pub worktree: Option<String>,
+    pub gits: Vec<String>,
     pub tmux: bool,
     pub print_command: bool,
 }
@@ -61,6 +63,12 @@ pub fn parse_launcher_tool(value: &str) -> Result<LauncherKind, String> {
             "unsupported tool {value:?}; expected omlo, pilo, rpilo, grolo, hyperlo, dolo, colo, cclo, or agentlo"
         )),
     }
+}
+
+pub fn parse_git_url(value: &str) -> Result<String, String> {
+    validate_git_url(value).map_err(|error| error.to_string())?;
+    repo_name_from_git(value).map_err(|error| error.to_string())?;
+    Ok(value.to_owned())
 }
 
 pub fn validate_project_name(name: &str) -> Result<()> {
@@ -121,6 +129,7 @@ pub fn run(spec: NewProject) -> Result<()> {
         crate::launcher::validate_worktree_name(OsStr::new(name))
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
+    validate_gits(&spec)?;
     if let Some(host) = spec.host.as_deref() {
         validate_host(host)?;
     }
@@ -166,6 +175,9 @@ fn apply(spec: &NewProject) -> Result<PathBuf> {
 }
 
 fn apply_local(spec: &NewProject) -> Result<PathBuf> {
+    if !spec.gits.is_empty() {
+        return apply_local_clones(spec);
+    }
     let repo = resolve_local_repo(&spec.path)?;
     if !repo.exists() {
         create_local_repo(&repo, &spec.goal)?;
@@ -190,11 +202,7 @@ fn apply_local(spec: &NewProject) -> Result<PathBuf> {
 }
 
 fn apply_remote(spec: &NewProject, host: &str) -> Result<PathBuf> {
-    let repo = resolve_remote_repo(&spec.path)?;
-    let destination = match spec.worktree.as_deref() {
-        Some(name) => remote_worktree_destination(&spec.path, name)?,
-        None => repo,
-    };
+    let destination = project_destination(spec, true)?;
     let script = remote_script(spec)?;
     let status = Command::new("ssh")
         .args([
@@ -215,6 +223,153 @@ fn apply_remote(spec: &NewProject, host: &str) -> Result<PathBuf> {
         );
     }
     Ok(destination)
+}
+
+fn apply_local_clones(spec: &NewProject) -> Result<PathBuf> {
+    let destination = git_destination(spec, false)?;
+    if spec.gits.len() == 1 {
+        ensure_local_clone(&spec.gits[0], &destination)?;
+    } else {
+        fs::create_dir_all(&destination)
+            .with_context(|| format!("creating {}", destination.display()))?;
+        for url in &spec.gits {
+            let name = repo_name_from_git(url)?;
+            ensure_local_clone(url, &destination.join(name))?;
+        }
+    }
+    write_goal_file(&destination, &spec.goal)?;
+    write_role_files(spec, &destination)?;
+    commit_goal(&destination)?;
+    Ok(destination)
+}
+
+fn validate_gits(spec: &NewProject) -> Result<()> {
+    if spec.gits.is_empty() {
+        return Ok(());
+    }
+    if spec.gits.len() > 1 && spec.worktree.is_none() {
+        bail!("multiple --git requires --worktree; clones go under ~/Projects/worktree");
+    }
+    let mut seen = HashSet::new();
+    for url in &spec.gits {
+        validate_git_url(url)?;
+        let name = repo_name_from_git(url)?;
+        if !seen.insert(name.clone()) {
+            bail!("duplicate --git repo name {name}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_git_url(url: &str) -> Result<()> {
+    if url.is_empty() {
+        bail!("git URL must not be empty");
+    }
+    if url.len() > 2048 {
+        bail!("git URL is too long");
+    }
+    if url.starts_with('-') {
+        bail!("git URL must not start with '-'");
+    }
+    if url
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        bail!("git URL must not contain whitespace or control characters");
+    }
+    Ok(())
+}
+
+fn repo_name_from_git(url: &str) -> Result<String> {
+    let trimmed = url.trim().trim_end_matches(['/', '\\']);
+    let without_git = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let name = without_git
+        .rsplit(['/', ':', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("");
+    if name.is_empty() {
+        bail!("could not read a repository name from git URL {url:?}");
+    }
+    validate_project_name(name)?;
+    Ok(name.to_owned())
+}
+
+fn project_destination(spec: &NewProject, remote: bool) -> Result<PathBuf> {
+    if !spec.gits.is_empty() {
+        return git_destination(spec, remote);
+    }
+    let repo = if remote {
+        resolve_remote_repo(&spec.path)?
+    } else {
+        resolve_local_repo(&spec.path)?
+    };
+    match spec.worktree.as_deref() {
+        Some(name) if remote => remote_worktree_destination(&spec.path, name),
+        Some(name) => local_worktree_destination(&repo, name),
+        None => Ok(repo),
+    }
+}
+
+fn git_destination(spec: &NewProject, remote: bool) -> Result<PathBuf> {
+    if spec.gits.len() == 1 && spec.worktree.is_none() {
+        return if remote {
+            resolve_remote_repo(&spec.path)
+        } else {
+            resolve_local_repo(&spec.path)
+        };
+    }
+    let folder = git_clone_folder_name(spec.worktree.as_deref().unwrap_or("worktree"));
+    crate::launcher::validate_worktree_name(OsStr::new(folder))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if remote {
+        Ok(PathBuf::from("$HOME").join(DEFAULT_PARENT_DIR).join(folder))
+    } else {
+        Ok(local_parent()?.join(folder))
+    }
+}
+
+fn git_clone_folder_name(name: &str) -> &str {
+    if name == "wt" { "worktree" } else { name }
+}
+
+fn ensure_local_clone(url: &str, dest: &Path) -> Result<()> {
+    if is_git_checkout(dest) {
+        return Ok(());
+    }
+    if dest.exists() {
+        if !(dest.is_dir() && dir_is_empty(dest)?) {
+            bail!(
+                "destination exists and is not a git checkout: {}",
+                dest.display()
+            );
+        }
+    } else if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    clone_into(url, dest)
+}
+
+fn dir_is_empty(path: &Path) -> Result<bool> {
+    Ok(fs::read_dir(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .next()
+        .is_none())
+}
+
+fn clone_into(url: &str, dest: &Path) -> Result<()> {
+    let dest_str = dest.to_str().context("clone path is not UTF-8")?;
+    let output = Command::new("git")
+        .args(["clone", "--", url, dest_str])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .stdin(Stdio::null())
+        .output()
+        .context("could not run git")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("git clone failed: {}", stderr.trim().replace('\n', " "))
 }
 
 fn create_local_repo(destination: &Path, goal: &str) -> Result<()> {
@@ -934,6 +1089,9 @@ fn repo_file_name(path: &Path) -> Result<String> {
 }
 
 fn remote_script(spec: &NewProject) -> Result<String> {
+    if !spec.gits.is_empty() {
+        return remote_clone_script(spec);
+    }
     let repo = fish_path(&resolve_remote_repo(&spec.path)?)?;
     let name = repo_file_name(&spec.path)?;
     let readme = posix_quote(readme_contents(&name, &spec.goal).trim_end());
@@ -962,11 +1120,39 @@ fn remote_script(spec: &NewProject) -> Result<String> {
     ))
 }
 
+fn remote_clone_script(spec: &NewProject) -> Result<String> {
+    let dest_path = git_destination(spec, true)?;
+    let dest = fish_path(&dest_path)?;
+    let goal_file = posix_quote(goal_contents(&spec.goal).trim_end());
+    let mut script = format!("set dest {dest}; ");
+    if spec.gits.len() == 1 {
+        script.push_str(&format!(
+            "mkdir -p (dirname $dest); and begin; test -d $dest/.git; or git clone -- {url} $dest; end; and ",
+            url = posix_quote(&spec.gits[0]),
+        ));
+    } else {
+        script.push_str("mkdir -p $dest; and ");
+        for url in &spec.gits {
+            let child = dest_path.join(repo_name_from_git(url)?);
+            let child = fish_path(&child)?;
+            script.push_str(&format!(
+                "begin; test -d {child}/.git; or git clone -- {url} {child}; end; and ",
+                url = posix_quote(url),
+                child = child,
+            ));
+        }
+    }
+    let roles = remote_role_files(spec)?;
+    script.push_str(&format!(
+        "begin; printf '%s\\n' {goal_file} > $dest/GOAL.md; end; {roles} if test -d $dest/.git; cd $dest; and git add GOAL.md; and begin; git diff --cached --quiet; or begin; git commit -m 'Set goal'; or git -c user.name=al -c user.email=al@localhost commit -m 'Set goal'; end; end; end",
+        goal_file = goal_file,
+        roles = roles,
+    ));
+    Ok(script)
+}
+
 fn remote_role_files(spec: &NewProject) -> Result<String> {
-    let destination = match spec.worktree.as_deref() {
-        Some(name) => remote_worktree_destination(&spec.path, name)?,
-        None => resolve_remote_repo(&spec.path)?,
-    };
+    let destination = project_destination(spec, true)?;
     let launches = role_launches(spec, &destination);
     if launches.is_empty() {
         return Ok(String::new());
@@ -985,31 +1171,41 @@ fn remote_role_files(spec: &NewProject) -> Result<String> {
 }
 
 fn print_plan(spec: &NewProject) -> Result<()> {
-    let repo = if spec.host.is_some() {
-        resolve_remote_repo(&spec.path)?
-    } else {
-        resolve_local_repo(&spec.path)?
-    };
-    let destination = match spec.worktree.as_deref() {
-        Some(name) if spec.host.is_some() => remote_worktree_destination(&spec.path, name)?,
-        Some(name) => local_worktree_destination(&repo, name)?,
-        None => repo.clone(),
-    };
-    println!("project\t{}", repo.display());
+    let remote = spec.host.is_some();
+    let destination = project_destination(spec, remote)?;
+    if spec.gits.is_empty() {
+        let repo = if remote {
+            resolve_remote_repo(&spec.path)?
+        } else {
+            resolve_local_repo(&spec.path)?
+        };
+        println!("project\t{}", repo.display());
+    }
     println!("destination\t{}", destination.display());
-    if let Some(name) = spec.worktree.as_deref() {
-        println!(
-            "worktree\tgit worktree add -b {name} -- {}",
-            destination.display()
-        );
+    if spec.gits.is_empty() {
+        if let Some(name) = spec.worktree.as_deref() {
+            println!(
+                "worktree\tgit worktree add -b {name} -- {}",
+                destination.display()
+            );
+        }
+    } else if spec.gits.len() == 1 {
+        println!("clone\t{}\t{}", spec.gits[0], destination.display());
+    } else {
+        for url in &spec.gits {
+            let child = destination.join(repo_name_from_git(url)?);
+            println!("clone\t{url}\t{}", child.display());
+        }
     }
     if let Some(host) = spec.host.as_deref() {
         println!(
             "bootstrap\tssh -- {host} fish -c {}",
             posix_quote(&remote_script(spec)?)
         );
-    } else {
+    } else if spec.gits.is_empty() {
         println!("bootstrap\tcreate-or-update GOAL.md && commit");
+    } else {
+        println!("bootstrap\tclone-or-update GOAL.md && commit");
     }
     let launches = role_launches(spec, &destination);
     if !launches.is_empty() || spec.tmux {
@@ -1144,6 +1340,7 @@ mod tests {
             orchestrator: None,
             reviewer: None,
             worktree: None,
+            gits: Vec::new(),
             tmux: false,
             print_command: false,
         }
@@ -1235,6 +1432,176 @@ mod tests {
     }
 
     #[test]
+    fn git_url_name_and_validation() {
+        assert_eq!(
+            repo_name_from_git("https://example.test/org/demo.git").unwrap(),
+            "demo"
+        );
+        assert_eq!(
+            repo_name_from_git("git@example.test:org/demo.git").unwrap(),
+            "demo"
+        );
+        assert_eq!(repo_name_from_git("/tmp/foo/bar").unwrap(), "bar");
+        assert!(parse_git_url("-evil").is_err());
+        assert!(parse_git_url("https://example.test/org/has space.git").is_err());
+        assert!(parse_git_url("").is_err());
+    }
+
+    #[test]
+    fn multiple_gits_require_worktree() {
+        let mut project = spec(PathBuf::from("bundle"), "ship");
+        project.gits = vec![
+            "https://example.test/org/alpha.git".into(),
+            "https://example.test/org/beta.git".into(),
+        ];
+        let error = run(project).unwrap_err().to_string();
+        assert!(
+            error.contains("multiple --git requires --worktree"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_git_repo_names_are_rejected() {
+        let mut project = spec(PathBuf::from("bundle"), "ship");
+        project.worktree = Some("wt".into());
+        project.gits = vec![
+            "https://example.test/org/demo.git".into(),
+            "https://example.test/other/demo.git".into(),
+        ];
+        let error = run(project).unwrap_err().to_string();
+        assert!(error.contains("duplicate --git repo name demo"), "{error}");
+    }
+
+    #[test]
+    fn single_git_clones_into_named_project() {
+        let home = TempDir::new().unwrap();
+        let upstream = seed_git_repo(home.path().join("demo"));
+        let dest = home.path().join("sample-app");
+        let mut project = spec(dest.clone(), "ship the parser");
+        project.gits = vec![upstream.display().to_string()];
+        let destination = apply_local(&project).unwrap();
+        assert_eq!(destination, dest);
+        assert!(dest.join(".git").exists());
+        assert!(dest.join("README.md").exists());
+        let goal = fs::read_to_string(dest.join("GOAL.md")).unwrap();
+        assert!(goal.contains("ship the parser"));
+        let log = Command::new("git")
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(&dest)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "Set goal");
+    }
+
+    #[test]
+    fn existing_git_clone_skips_clone_and_updates_goal() {
+        let home = TempDir::new().unwrap();
+        let upstream = seed_git_repo(home.path().join("demo"));
+        let dest = home.path().join("sample-app");
+        let mut project = spec(dest.clone(), "first");
+        project.gits = vec![upstream.display().to_string()];
+        apply_local(&project).unwrap();
+        project.goal = "ship the parser".into();
+        apply_local(&project).unwrap();
+        let goal = fs::read_to_string(dest.join("GOAL.md")).unwrap();
+        assert!(goal.contains("ship the parser"));
+        let log = Command::new("git")
+            .args(["log", "--pretty=%s"])
+            .current_dir(&dest)
+            .output()
+            .unwrap();
+        let subjects = String::from_utf8_lossy(&log.stdout);
+        assert!(subjects.contains("Set goal"), "{subjects}");
+        assert_eq!(subjects.matches("Set goal").count(), 2);
+    }
+
+    #[test]
+    fn git_destination_maps_bare_worktree_to_projects_worktree() {
+        let mut project = spec(PathBuf::from("bundle"), "ship");
+        project.worktree = Some("wt".into());
+        project.gits = vec![
+            "https://example.test/org/alpha.git".into(),
+            "https://example.test/org/beta.git".into(),
+        ];
+        assert_eq!(
+            git_destination(&project, true).unwrap(),
+            PathBuf::from("$HOME/Projects/worktree")
+        );
+        project.worktree = Some("feat".into());
+        assert_eq!(
+            git_destination(&project, true).unwrap(),
+            PathBuf::from("$HOME/Projects/feat")
+        );
+        project.gits = vec!["https://example.test/org/demo.git".into()];
+        project.worktree = Some("wt".into());
+        assert_eq!(
+            git_destination(&project, true).unwrap(),
+            PathBuf::from("$HOME/Projects/worktree")
+        );
+    }
+
+    #[test]
+    fn remote_clone_script_skips_init_and_worktree_add() {
+        let spec = NewProject {
+            host: Some("host-a".to_owned()),
+            path: PathBuf::from("bundle"),
+            goal: "don't leak 'quotes'".to_owned(),
+            executor: None,
+            orchestrator: None,
+            reviewer: None,
+            worktree: Some("wt".to_owned()),
+            gits: vec![
+                "https://example.test/org/alpha.git".into(),
+                "https://example.test/org/beta.git".into(),
+            ],
+            tmux: false,
+            print_command: true,
+        };
+        let script = remote_script(&spec).unwrap();
+        assert!(script.contains("git clone -- 'https://example.test/org/alpha.git'"));
+        assert!(script.contains("\"$HOME/Projects/worktree/alpha\""));
+        assert!(script.contains("\"$HOME/Projects/worktree/beta\""));
+        assert!(!script.contains("git init"));
+        assert!(!script.contains("git worktree add"));
+        assert!(script.contains(&posix_quote("# Goal\n\ndon't leak 'quotes'")));
+    }
+
+    fn seed_git_repo(dir: PathBuf) -> PathBuf {
+        fs::create_dir_all(&dir).unwrap();
+        let status = Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::write(dir.join("README.md"), "# upstream\n").unwrap();
+        let status = Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=al",
+                "-c",
+                "user.email=al@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "upstream",
+            ])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        dir
+    }
+
+    #[test]
     fn print_command_does_not_create_files() {
         let home = TempDir::new().unwrap();
         let path = home.path().join("sample-app");
@@ -1256,6 +1623,7 @@ mod tests {
             orchestrator: Some(LauncherKind::Pi),
             reviewer: Some(LauncherKind::Grok),
             worktree: Some("wt".to_owned()),
+            gits: Vec::new(),
             tmux: true,
             print_command: true,
         };
@@ -1298,6 +1666,7 @@ mod tests {
             orchestrator: Some(LauncherKind::Pi),
             reviewer: Some(LauncherKind::Grok),
             worktree: Some("wt".to_owned()),
+            gits: Vec::new(),
             tmux: true,
             print_command: true,
         };
@@ -1339,13 +1708,14 @@ mod tests {
     #[test]
     fn remote_open_forwards_no_tmux_and_uses_copied_al() {
         let spec = NewProject {
-            host: Some("x3".to_owned()),
+            host: Some("host-a".to_owned()),
             path: PathBuf::from("~/Projects/sample-app"),
             goal: "ship the parser".to_owned(),
             executor: Some(LauncherKind::Grok),
             orchestrator: None,
             reviewer: None,
             worktree: None,
+            gits: Vec::new(),
             tmux: false,
             print_command: false,
         };
