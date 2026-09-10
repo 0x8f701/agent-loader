@@ -80,15 +80,24 @@ pub fn parse(path: &Path) -> Result<Session> {
     let mut compaction_summary = None;
 
     for value in values {
-        if value.get("type").and_then(Value::as_str) == Some("compaction_state") {
-            if let Some(summary) = ["summary", "text", "message"]
-                .into_iter()
-                .find_map(|key| value.get(key).and_then(Value::as_str))
-                .filter(|text| !text.is_empty())
-            {
-                compaction_summary = Some(summary.to_owned());
+        match value.get("type").and_then(Value::as_str) {
+            Some("compaction_state") => {
+                if let Some(summary) = ["summaryText", "summary", "text", "message"]
+                    .into_iter()
+                    .find_map(|key| value.get(key).and_then(Value::as_str))
+                    .filter(|text| !text.is_empty())
+                {
+                    compaction_summary = Some(summary.to_owned());
+                }
+                continue;
             }
-            continue;
+            Some("todo_state") => {
+                if let Some(message) = droid_todo_message(&value) {
+                    messages.push(message);
+                }
+                continue;
+            }
+            _ => {}
         }
         match classify(value) {
             FlexibleRecord::Known(DroidRecord::SessionStart(start)) => {
@@ -191,6 +200,46 @@ fn classify(record: Value) -> FlexibleRecord<DroidRecord> {
             raw: record,
         },
     }
+}
+
+fn droid_todo_message(value: &Value) -> Option<Message> {
+    let todos = value.get("todos")?;
+    let text = match todos {
+        Value::String(text) if !text.is_empty() => text.clone(),
+        Value::Object(object) => ["todos", "text", "markdown"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(Value::as_str))
+            .filter(|text| !text.is_empty())?
+            .to_owned(),
+        Value::Array(items) => {
+            let joined = items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .or_else(|| item.get("content"))
+                        .and_then(Value::as_str)
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if joined.is_empty() {
+                return None;
+            }
+            joined
+        }
+        _ => return None,
+    };
+    Some(Message::from_parts(
+        crate::domain::Role::Assistant,
+        vec![crate::domain::ContentPart::Note {
+            kind: "todo".to_owned(),
+            text,
+        }],
+        value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    ))
 }
 
 /// Project a typed Droid message record into the lossy `Message` contract via
@@ -375,6 +424,26 @@ mod tests {
     }
 
     #[test]
+    fn compaction_state_summary_text_is_native() {
+        let compaction = r#"{"type":"compaction_state","id":"c1","summaryText":"prior context","summaryKind":"auto"}"#;
+        let file = session_file(&[SESSION_START, compaction, USER_MSG]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(
+            session.hints.compaction_summary.as_deref(),
+            Some("prior context")
+        );
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    crate::domain::ContentPart::Note { kind, text }
+                        if kind == "compaction" && text == "prior context"
+                )
+            })
+        }));
+    }
+
+    #[test]
     fn compaction_state_summary_becomes_a_note() {
         let compaction = r#"{"type":"compaction_state","id":"c1","summary":"prior context"}"#;
         let file = session_file(&[SESSION_START, compaction, USER_MSG]);
@@ -397,15 +466,24 @@ mod tests {
     #[test]
     fn unknown_records_are_preserved_internally_and_skipped() {
         let compaction = r#"{"type":"compaction_state","id":"c1","tokens":4096}"#;
-        let todo = r#"{"type":"todo_state","items":[{"text":"do thing","done":false}]}"#;
+        let todo = r#"{"type":"todo_state","timestamp":"2026-01-01T00:00:00.000Z","todos":{"todos":"1. [pending] do thing"}}"#;
         let outcome = r#"{"type":"agent_turn_outcome","id":"o1","ok":true}"#;
         let end = r#"{"type":"session_end","id":"e1"}"#;
         let file = session_file(&[SESSION_START, compaction, todo, outcome, USER_MSG, end]);
         let session = parse(file.path()).expect("parse");
 
         assert_eq!(session.summary, "hello world");
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].role, Role::User);
+        assert_eq!(session.messages.len(), 2);
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    crate::domain::ContentPart::Note { kind, text }
+                        if kind == "todo" && text.contains("do thing")
+                )
+            })
+        }));
+        assert_eq!(session.messages.last().unwrap().role, Role::User);
     }
 
     #[test]

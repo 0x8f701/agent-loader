@@ -106,6 +106,7 @@ pub fn parse(path: &Path) -> Result<Session> {
             summary: object.get("summary").and_then(Value::as_str),
             short_summary: None,
             first_kept_entry_id: object.get("firstKeptEntryId").and_then(Value::as_str),
+            retained_tail: object.get("retainedTail"),
         });
     }
 
@@ -298,9 +299,10 @@ pub(crate) fn tree_role<'a>(
 ) -> Option<&'a str> {
     match role {
         Some("user" | "assistant" | "tool" | "toolResult" | "tool_result") => role,
-        Some("bashExecution" | "branchSummary" | "compactionSummary" | "custom") => {
-            Some("assistant")
-        }
+        Some(
+            "bashExecution" | "pythonExecution" | "fileMention" | "branchSummary"
+            | "compactionSummary" | "custom" | "hookMessage",
+        ) => Some("assistant"),
         Some(_) => None,
         None => matches!(
             object.get("type").and_then(Value::as_str),
@@ -329,6 +331,8 @@ pub(crate) fn synthesized_tree_content(record: &Value) -> Option<Value> {
     match role {
         Some("toolResult") => Some(pi_tool_result_content(message, content)),
         Some("bashExecution") => bash_execution_note(message),
+        Some("pythonExecution") => execution_note("pythonExecution", message, &["code", "command"]),
+        Some("fileMention") => file_mention_note(message),
         Some("branchSummary") => note_blocks(
             "branch_summary",
             message.get("summary").and_then(Value::as_str)?,
@@ -337,7 +341,7 @@ pub(crate) fn synthesized_tree_content(record: &Value) -> Option<Value> {
             "compaction",
             message.get("summary").and_then(Value::as_str)?,
         ),
-        Some("custom") => Some(visible_custom_note(message).unwrap_or(json!([]))),
+        Some("custom" | "hookMessage") => Some(visible_custom_note(message).unwrap_or(json!([]))),
         _ => None,
     }
 }
@@ -366,9 +370,17 @@ fn visible_custom_note(object: &Map<String, Value>) -> Option<Value> {
 }
 
 fn bash_execution_note(message: &Map<String, Value>) -> Option<Value> {
-    let command = message
-        .get("command")
-        .and_then(Value::as_str)
+    execution_note("bashExecution", message, &["command"])
+}
+
+fn execution_note(
+    kind: &str,
+    message: &Map<String, Value>,
+    command_keys: &[&str],
+) -> Option<Value> {
+    let command = command_keys
+        .iter()
+        .find_map(|key| message.get(*key).and_then(Value::as_str))
         .unwrap_or("")
         .trim();
     let output = message
@@ -384,7 +396,30 @@ fn bash_execution_note(message: &Map<String, Value>) -> Option<Value> {
     if text.is_empty() {
         return None;
     }
-    note_blocks("bashExecution", &text)
+    note_blocks(kind, &text)
+}
+
+fn file_mention_note(message: &Map<String, Value>) -> Option<Value> {
+    let path = ["path", "fileName", "filename"]
+        .into_iter()
+        .find_map(|key| message.get(key).and_then(Value::as_str))
+        .unwrap_or("")
+        .trim();
+    let text = message
+        .get("content")
+        .and_then(Value::as_str)
+        .or_else(|| message.get("text").and_then(Value::as_str))
+        .unwrap_or("")
+        .trim();
+    let joined = [path, text]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if joined.is_empty() {
+        return None;
+    }
+    note_blocks("fileMention", &joined)
 }
 
 fn note_blocks(kind: &str, text: &str) -> Option<Value> {
@@ -899,6 +934,53 @@ mod tests {
     }
 
     #[test]
+    fn compaction_retained_tail_replaces_first_kept_replay() {
+        let file = write_session(&[
+            HEADER,
+            &msg("a", None, "user", r#""old""#),
+            r#"{"type":"compaction","id":"c","parentId":"a","timestamp":"2026-01-01T00:00:03.000Z","summary":"prior context","firstKeptEntryId":"a","retainedTail":[{"role":"assistant","content":[{"type":"text","text":"kept tail"}]}]}"#,
+            &msg(
+                "d",
+                Some("c"),
+                "assistant",
+                r#"[{"type":"text","text":"done"}]"#,
+            ),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(texts, ["prior context", "kept tail", "done"]);
+    }
+
+    #[test]
+    fn v3_display_hook_message_becomes_a_note() {
+        let file = write_session(&[
+            HEADER,
+            r#"{"type":"message","id":"h","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"hookMessage","customType":"system-reminder","content":"context injected","display":true}}"#,
+            &msg("a", Some("h"), "assistant", r#""ready""#),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    crate::domain::ContentPart::Note { kind, text }
+                        if kind == "system-reminder" && text == "context injected"
+                )
+            })
+        }));
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.text == "ready")
+        );
+    }
+
+    #[test]
     fn custom_message_projects_as_a_note() {
         let file = write_session(&[
             HEADER,
@@ -943,7 +1025,9 @@ mod tests {
             HEADER,
             r#"{"type":"branch_summary","id":"b1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","fromId":"root","summary":"other branch work"}"#,
             r#"{"type":"message","id":"x1","parentId":"b1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"bashExecution","command":"ls","output":"src","timestamp":2}}"#,
-            r#"{"type":"message","id":"c1","parentId":"x1","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"compactionSummary","summary":"prior context","tokensBefore":12,"timestamp":3}}"#,
+            r#"{"type":"message","id":"p1","parentId":"x1","timestamp":"2026-01-01T00:00:02.500Z","message":{"role":"pythonExecution","code":"print(1)","output":"1","timestamp":2}}"#,
+            r#"{"type":"message","id":"f1","parentId":"p1","timestamp":"2026-01-01T00:00:02.750Z","message":{"role":"fileMention","path":"src/lib.rs","text":"fn main","timestamp":2}}"#,
+            r#"{"type":"message","id":"c1","parentId":"f1","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"compactionSummary","summary":"prior context","tokensBefore":12,"timestamp":3}}"#,
         ]);
         let session = parse(file.path()).expect("parse");
         assert!(
@@ -956,6 +1040,20 @@ mod tests {
         assert!(
             session.messages.iter().any(|message| message.parts.iter().any(
                 |part| matches!(part, crate::domain::ContentPart::Note { kind, text } if kind == "bashExecution" && text.contains("ls") && text.contains("src"))
+            )),
+            "{:?}",
+            session.messages
+        );
+        assert!(
+            session.messages.iter().any(|message| message.parts.iter().any(
+                |part| matches!(part, crate::domain::ContentPart::Note { kind, text } if kind == "pythonExecution" && text.contains("print(1)"))
+            )),
+            "{:?}",
+            session.messages
+        );
+        assert!(
+            session.messages.iter().any(|message| message.parts.iter().any(
+                |part| matches!(part, crate::domain::ContentPart::Note { kind, text } if kind == "fileMention" && text.contains("src/lib.rs"))
             )),
             "{:?}",
             session.messages

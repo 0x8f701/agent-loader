@@ -1957,7 +1957,7 @@ impl Drop for TmuxKillOnDrop {
 }
 
 #[test]
-fn live_list_is_not_the_session_catalog_and_emits_json_rows() {
+fn live_list_attach_watch_and_supervise_surface() {
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     let help = run(home.path(), &["list", "--help"]);
@@ -1972,8 +1972,32 @@ fn live_list_is_not_the_session_catalog_and_emits_json_rows() {
         "list help should distinguish live panes from the catalog: {help_text}"
     );
     assert!(
-        help_text.contains("--fzf"),
-        "list help should mention fzf attach: {help_text}"
+        !help_text.contains("--fzf"),
+        "list help should not mention fzf after the move to attach: {help_text}"
+    );
+
+    let attach_help = run(home.path(), &["attach", "--help"]);
+    assert!(
+        attach_help.status.success(),
+        "attach --help failed: {}",
+        String::from_utf8_lossy(&attach_help.stderr)
+    );
+    let attach_text = String::from_utf8_lossy(&attach_help.stdout);
+    assert!(
+        attach_text.contains("--target") && attach_text.contains("fzf"),
+        "{attach_text}"
+    );
+
+    let watch_help = run(home.path(), &["watch", "--help"]);
+    assert!(
+        watch_help.status.success(),
+        "watch --help failed: {}",
+        String::from_utf8_lossy(&watch_help.stderr)
+    );
+    let watch_text = String::from_utf8_lossy(&watch_help.stdout);
+    assert!(
+        watch_text.contains("Seconds between table refreshes") && watch_text.contains("--no-git"),
+        "{watch_text}"
     );
 
     let sessions = run(home.path(), &["sessions", "list", "--help"]);
@@ -2009,16 +2033,39 @@ fn live_list_is_not_the_session_catalog_and_emits_json_rows() {
         assert!(row.get("pane").and_then(Value::as_str).is_some());
     }
 
-    let watch_help = run(home.path(), &["supervise", "--help"]);
-    assert!(
-        watch_help.status.success(),
-        "supervise --help failed: {}",
-        String::from_utf8_lossy(&watch_help.stderr)
+    let plain = run_with_env(
+        home.path(),
+        &["list"],
+        &[("AL_LIVE_STATE_DIR", state.path().as_os_str())],
     );
-    let watch_text = String::from_utf8_lossy(&watch_help.stdout);
     assert!(
-        watch_text.contains("Seconds between table refreshes"),
-        "{watch_text}"
+        plain.status.success(),
+        "al list failed: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain_out = String::from_utf8_lossy(&plain.stdout);
+    if plain_out.trim().is_empty() {
+        panic!("al list should print a table or 'no live agents'");
+    }
+    assert!(
+        plain_out.contains("no live agents")
+            || plain_out.contains("asking")
+            || plain_out.contains("working")
+            || plain_out.contains("idle")
+            || plain_out.contains("blocked"),
+        "unexpected list output: {plain_out}"
+    );
+
+    let supervise_help = run(home.path(), &["supervise", "--help"]);
+    assert!(
+        supervise_help.status.success(),
+        "supervise --help failed: {}",
+        String::from_utf8_lossy(&supervise_help.stderr)
+    );
+    let supervise_text = String::from_utf8_lossy(&supervise_help.stdout);
+    assert!(
+        supervise_text.contains("Seconds between table refreshes"),
+        "{supervise_text}"
     );
     let send_help = run(home.path(), &["supervise", "send", "--help"]);
     assert!(

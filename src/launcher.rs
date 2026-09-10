@@ -2198,11 +2198,15 @@ mod tests {
         )
         .unwrap();
         let LaunchPlan::Tmux {
-            command, fallback, ..
+            session,
+            command,
+            fallback,
+            ..
         } = plan
         else {
             panic!("expected tmux plan")
         };
+        assert_eq!(session, "agentlo-project");
         assert_eq!(
             command.args,
             strings(&["--force", "--trust", "--approve-mcps", "--continue"])

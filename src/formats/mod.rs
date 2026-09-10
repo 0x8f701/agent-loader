@@ -105,7 +105,22 @@ fn part_from_value(value: &Value) -> Vec<ContentPart> {
         Some("thinking" | "reasoning" | "agent_thought") => thinking_part(object)
             .map(|part| vec![part])
             .unwrap_or_default(),
-        Some("tool_use" | "toolCall" | "tool_call" | "function_call") => {
+        Some("redacted-reasoning" | "redactedThinking" | "redacted_thinking") => {
+            vec![ContentPart::Thinking {
+                text: thinking_part(object)
+                    .and_then(|part| match part {
+                        ContentPart::Thinking { text, .. } if !text.is_empty() => Some(text),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "[redacted]".to_owned()),
+                signature: object
+                    .get("data")
+                    .or_else(|| object.get("signature"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }]
+        }
+        Some("tool_use" | "toolCall" | "tool_call" | "tool-call" | "function_call") => {
             vec![ContentPart::ToolUse {
                 id: string_field(object, &["id", "toolCallId", "tool_call_id", "call_id"]),
                 name: string_field(object, &["name", "toolName", "tool_name"]),
@@ -113,13 +128,17 @@ fn part_from_value(value: &Value) -> Vec<ContentPart> {
                     object
                         .get("input")
                         .or_else(|| object.get("arguments"))
+                        .or_else(|| object.get("args"))
                         .cloned()
                         .unwrap_or_else(|| serde_json::json!({})),
                 ),
             }]
         }
-        Some("tool_result" | "toolResult" | "function_call_output") => {
-            let content = object.get("content").or_else(|| object.get("output"));
+        Some("tool_result" | "toolResult" | "tool-result" | "function_call_output") => {
+            let content = object
+                .get("content")
+                .or_else(|| object.get("output"))
+                .or_else(|| object.get("result"));
             let mut parts = vec![ContentPart::ToolResult {
                 tool_use_id: string_field(
                     object,
@@ -136,6 +155,12 @@ fn part_from_value(value: &Value) -> Vec<ContentPart> {
             parts
         }
         Some("image" | "input_image" | "output_image" | "image_url") => image_from_object(object)
+            .map(|part| vec![part])
+            .unwrap_or_default(),
+        Some("document") => document_note(object)
+            .map(|part| vec![part])
+            .unwrap_or_default(),
+        Some("search_result") => search_result_note(object)
             .map(|part| vec![part])
             .unwrap_or_default(),
         Some("note") => note_part(object, "note")
@@ -193,6 +218,50 @@ pub(crate) fn image_from_object(object: &serde_json::Map<String, Value>) -> Opti
         _ => None,
     })?;
     Some(ContentPart::Image { mime_type, data })
+}
+
+fn document_note(object: &serde_json::Map<String, Value>) -> Option<ContentPart> {
+    let title = object
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let media = object
+        .get("source")
+        .and_then(Value::as_object)
+        .and_then(|source| {
+            ["media_type", "mediaType", "mimeType"]
+                .into_iter()
+                .find_map(|key| source.get(key).and_then(Value::as_str))
+        })
+        .filter(|value| !value.is_empty());
+    let text = [title, media]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        return None;
+    }
+    Some(ContentPart::Note {
+        kind: "document".to_owned(),
+        text,
+    })
+}
+
+fn search_result_note(object: &serde_json::Map<String, Value>) -> Option<ContentPart> {
+    let text = ["title", "url", "snippet", "text"]
+        .into_iter()
+        .filter_map(|key| object.get(key).and_then(Value::as_str))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        return None;
+    }
+    Some(ContentPart::Note {
+        kind: "search_result".to_owned(),
+        text,
+    })
 }
 
 fn note_part(object: &serde_json::Map<String, Value>, default_kind: &str) -> Option<ContentPart> {
@@ -493,10 +562,15 @@ mod tests {
             {"type": "text", "text": "hello"},
             {"type": "toolCall", "id": "c1", "name": "read", "arguments": {"path": "a.rs"}},
             {"type": "tool_use", "id": "c2", "name": "Read", "arguments": "{\"path\":\"b.rs\"}"},
+            {"type": "tool-call", "toolCallId": "c3", "toolName": "Grep", "args": {"pattern": "fn"}},
             {"type": "tool_result", "tool_use_id": "c1", "content": [
                 {"type": "text", "text": "ok"},
                 {"type": "image", "source": {"media_type": "image/png", "data": "nested"}}
             ], "is_error": false},
+            {"type": "tool-result", "toolCallId": "c3", "result": "match", "isError": false},
+            {"type": "redacted-reasoning", "data": "opaque"},
+            {"type": "document", "title": "spec.pdf", "source": {"media_type": "application/pdf"}},
+            {"type": "search_result", "title": "Example", "url": "https://example.test", "snippet": "excerpt"},
             {"type": "image", "source": {"media_type": "image/png", "data": "abc"}},
             {"type": "note", "kind": "compaction", "text": "prior"}
         ]);
@@ -519,6 +593,11 @@ mod tests {
                     name: "Read".to_owned(),
                     input: json!({"path": "b.rs"}),
                 },
+                ContentPart::ToolUse {
+                    id: "c3".to_owned(),
+                    name: "Grep".to_owned(),
+                    input: json!({"pattern": "fn"}),
+                },
                 ContentPart::ToolResult {
                     tool_use_id: "c1".to_owned(),
                     content: "ok".to_owned(),
@@ -527,6 +606,23 @@ mod tests {
                 ContentPart::Image {
                     mime_type: Some("image/png".to_owned()),
                     data: "nested".to_owned(),
+                },
+                ContentPart::ToolResult {
+                    tool_use_id: "c3".to_owned(),
+                    content: "match".to_owned(),
+                    is_error: false,
+                },
+                ContentPart::Thinking {
+                    text: "[redacted]".to_owned(),
+                    signature: Some("opaque".to_owned()),
+                },
+                ContentPart::Note {
+                    kind: "document".to_owned(),
+                    text: "spec.pdf application/pdf".to_owned(),
+                },
+                ContentPart::Note {
+                    kind: "search_result".to_owned(),
+                    text: "Example\nhttps://example.test\nexcerpt".to_owned(),
                 },
                 ContentPart::Image {
                     mime_type: Some("image/png".to_owned()),

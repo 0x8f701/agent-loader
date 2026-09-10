@@ -16,7 +16,7 @@ use crate::domain::{ContentPart, Message, Role, Session, TargetTool, ThinkingLev
 use crate::fs::atomic_write_jsonl;
 
 const MAX_FILESYSTEM_COMPONENT_BYTES: usize = 255;
-const CLAUDE_VERSION: &str = "2.1.226";
+const CLAUDE_VERSION: &str = "2.1.263";
 const DEFAULT_GROK_MODEL: &str = "grok-4.5";
 
 const URL_PATH_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -757,6 +757,7 @@ fn emit_droid<D: EmitDefaults>(
                 "type": "compaction_state",
                 "id": defaults.next_uuid().to_string(),
                 "summary": text,
+                "summaryText": text,
             }));
         }
     }
@@ -771,6 +772,7 @@ fn emit_droid<D: EmitDefaults>(
                     "type": "compaction_state",
                     "id": note_id,
                     "summary": text,
+                    "summaryText": text,
                 }));
             } else {
                 let mut record = json!({
@@ -1772,6 +1774,7 @@ fn grok_records(
             chat.push(json!({
                 "type": "reasoning",
                 "content": text,
+                "summary": [{ "type": "summary_text", "text": text }],
                 "model_id": provenance,
             }));
             push_grok_update(
@@ -1927,6 +1930,7 @@ fn grok_records(
                 json!({
                     "type": "reasoning",
                     "content": text,
+                    "summary": [{ "type": "summary_text", "text": text }],
                     "model_id": provenance,
                 }),
                 "agent_thought_chunk",

@@ -165,6 +165,7 @@ pub fn parse(path: &Path) -> Result<Session> {
             summary: object.get("summary").and_then(Value::as_str),
             short_summary: object.get("shortSummary").and_then(Value::as_str),
             first_kept_entry_id: object.get("firstKeptEntryId").and_then(Value::as_str),
+            retained_tail: object.get("retainedTail"),
         });
     }
 

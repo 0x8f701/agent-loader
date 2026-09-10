@@ -1,6 +1,9 @@
 //! Live tmux coding-agent discovery, status, and pane delivery.
 //!
-//! `al list` prints a snapshot. `al supervise` refreshes the same table.
+//! `al list` prints a one-shot snapshot. `al attach` picks a pane with fzf
+//! (or a direct `--target`) and attaches. `al watch` refreshes the table in
+//! place across local and remote hosts. `al supervise` keeps send/diff and
+//! still accepts a bare watch for compatibility.
 //! Identification prefers the pane process tree, then `al` session/window
 //! names. State comes from the captured screen, not a hash-only idle timer
 //! and not an automatic reply.
@@ -138,6 +141,7 @@ struct Pane {
     pane_index: String,
     pid: i32,
     cwd: String,
+    activity: u64,
     title: String,
 }
 
@@ -176,7 +180,7 @@ impl GitInfo {
             parts.push(format!("?{}", self.untracked));
         }
         if parts.is_empty() {
-            "clean".to_owned()
+            String::new()
         } else {
             parts.join(" ")
         }
@@ -219,14 +223,21 @@ pub struct ListOptions {
     pub hosts: Vec<String>,
     pub json: bool,
     pub diff: bool,
-    pub fzf: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachOptions {
+    pub hosts: Vec<String>,
     pub query: String,
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchOptions {
     pub hosts: Vec<String>,
     pub interval: u64,
+    pub no_git: bool,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,19 +261,14 @@ pub fn run_list(options: &ListOptions) -> Result<()> {
         GitMode::Status
     };
     let scan = collect_agents(&options.hosts, mode);
-    if options.fzf {
-        let result = pick_and_attach(&scan.agents, &options.query);
-        if scan.failed {
-            bail!("one or more hosts failed");
-        }
-        return result;
-    }
     if options.json {
         for agent in &scan.agents {
             println!("{}", serde_json::to_string(agent)?);
         }
+    } else if scan.agents.is_empty() {
+        println!("no live agents");
     } else {
-        print_table(&scan.agents, use_color())?;
+        print!("{}", format_table(&scan.agents, use_color()));
         if options.diff {
             print_diffs(&scan.agents);
         }
@@ -273,22 +279,64 @@ pub fn run_list(options: &ListOptions) -> Result<()> {
     Ok(())
 }
 
+pub fn run_attach(options: &AttachOptions) -> Result<()> {
+    let scan = collect_agents(&options.hosts, GitMode::Status);
+    let result = if let Some(target) = options.target.as_deref() {
+        let agent = resolve_agent(&scan.agents, Some(target))?;
+        attach_agent(agent)
+    } else {
+        pick_and_attach(&scan.agents, &options.query)
+    };
+    if scan.failed {
+        bail!("one or more hosts failed");
+    }
+    result
+}
+
 pub fn run_watch(options: &WatchOptions) -> Result<()> {
     let interval = options.interval.max(1);
     let tty = io::stdout().is_terminal();
+    let mode = if options.no_git {
+        GitMode::Off
+    } else {
+        GitMode::Status
+    };
     loop {
-        let scan = collect_agents(&options.hosts, GitMode::Status);
-        let agents = scan.agents;
+        let scan = collect_agents(&options.hosts, mode);
+        let frame = render_watch_frame(
+            &options.label,
+            &scan.agents,
+            interval,
+            &scan.failed_hosts,
+            use_color(),
+        );
         if tty {
             print!("\x1b[2J\x1b[H");
         }
-        print_summary(&agents, interval, use_color())?;
-        print_table(&agents, use_color())?;
+        print!("{frame}");
         if !tty {
             println!("---");
         }
+        let _ = io::stdout().flush();
         std::thread::sleep(std::time::Duration::from_secs(interval));
     }
+}
+
+fn render_watch_frame(
+    label: &str,
+    agents: &[LiveAgent],
+    interval: u64,
+    failed_hosts: &[String],
+    color: bool,
+) -> String {
+    let mut out = format_summary(label, agents, interval, failed_hosts, color);
+    out.push('\n');
+    if agents.is_empty() {
+        out.push_str("no live agents\n");
+    } else {
+        out.push_str(&format_table(agents, color));
+    }
+    out
 }
 
 pub fn run_send(options: &SendOptions) -> Result<()> {
@@ -320,7 +368,11 @@ pub fn run_diff(options: &DiffOptions) -> Result<()> {
     } else {
         agent.cwd.as_str()
     };
-    println!("== {} {cwd} {} ==", agent.host, agent.diff_summary);
+    if agent.diff_summary.is_empty() {
+        println!("== {} {cwd} ==", agent.host);
+    } else {
+        println!("== {} {cwd} {} ==", agent.host, agent.diff_summary);
+    }
     match agent
         .diff
         .as_deref()
@@ -331,7 +383,7 @@ pub fn run_diff(options: &DiffOptions) -> Result<()> {
         None if agent.diff_summary == "-" => {
             bail!("not a git worktree: {cwd}")
         }
-        None if agent.diff_summary == "clean" => println!("clean"),
+        None if agent.diff_summary.is_empty() => {}
         None => println!("(no textual diff)"),
     }
     Ok(())
@@ -340,6 +392,7 @@ pub fn run_diff(options: &DiffOptions) -> Result<()> {
 struct HostScan {
     agents: Vec<LiveAgent>,
     failed: bool,
+    failed_hosts: Vec<String>,
 }
 
 fn collect_agents(hosts: &[String], mode: GitMode) -> HostScan {
@@ -348,28 +401,64 @@ fn collect_agents(hosts: &[String], mode: GitMode) -> HostScan {
             Ok(agents) => HostScan {
                 agents,
                 failed: false,
+                failed_hosts: Vec::new(),
             },
             Err(error) => {
-                eprintln!("al: list failed for host \"local\": {error}");
+                eprintln!("al: scan failed for host \"local\": {error}");
                 HostScan {
                     agents: Vec::new(),
                     failed: true,
+                    failed_hosts: vec!["local".to_owned()],
                 }
             }
         };
     }
-    let mut agents = Vec::new();
-    let mut failed = false;
-    for host in hosts {
-        match scan_host(host, mode) {
-            Ok(rows) => agents.extend(rows),
+    if hosts.len() == 1 {
+        let host = &hosts[0];
+        return match scan_host(host, mode) {
+            Ok(agents) => HostScan {
+                agents,
+                failed: false,
+                failed_hosts: Vec::new(),
+            },
             Err(error) => {
-                eprintln!("al: list failed for host {host:?}: {error}");
-                failed = true;
+                eprintln!("al: scan failed for host {host:?}: {error}");
+                HostScan {
+                    agents: Vec::new(),
+                    failed: true,
+                    failed_hosts: vec![host.clone()],
+                }
+            }
+        };
+    }
+
+    let mut agents = Vec::new();
+    let mut failed_hosts = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = hosts
+            .iter()
+            .map(|host| {
+                scope.spawn(|| match scan_host(host, mode) {
+                    Ok(rows) => Ok(rows),
+                    Err(error) => Err((host.clone(), error)),
+                })
+            })
+            .collect();
+        for handle in handles {
+            match handle.join().expect("host scan thread") {
+                Ok(rows) => agents.extend(rows),
+                Err((host, error)) => {
+                    eprintln!("al: scan failed for host {host:?}: {error}");
+                    failed_hosts.push(host);
+                }
             }
         }
+    });
+    HostScan {
+        agents,
+        failed: !failed_hosts.is_empty(),
+        failed_hosts,
     }
-    HostScan { agents, failed }
 }
 
 fn scan_host(host: &str, mode: GitMode) -> Result<Vec<LiveAgent>> {
@@ -494,7 +583,7 @@ fn agents_from_snapshot(host: &str, snapshot: &Snapshot) -> Vec<LiveAgent> {
             diff_summary: "-".to_owned(),
             diff: None,
             state,
-            idle_secs: now.saturating_sub(changed_at),
+            idle_secs: idle_since(now, pane.activity),
             snippet: snippet(&capture),
         });
     }
@@ -773,6 +862,9 @@ fn resolve_agent<'a>(agents: &'a [LiveAgent], target: Option<&str>) -> Result<&'
 }
 
 fn attention_agent(agents: &[LiveAgent]) -> Result<&LiveAgent> {
+    if agents.is_empty() {
+        bail!("no live agents on this host");
+    }
     agents
         .iter()
         .find(|agent| agent.state == AgentState::Blocked)
@@ -781,7 +873,14 @@ fn attention_agent(agents: &[LiveAgent]) -> Result<&LiveAgent> {
                 .iter()
                 .find(|agent| agent.state == AgentState::Asking)
         })
-        .ok_or_else(|| anyhow::anyhow!("no blocked or asking agent on this host"))
+        .ok_or_else(|| {
+            let summary = agents
+                .iter()
+                .map(|agent| format!("{}:{}", agent.agent, agent.state.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::anyhow!("no blocked or asking agent on this host ({summary})")
+        })
 }
 
 fn deliver(host: &str, pane: &str, message: &[u8], submit: bool) -> Result<()> {
@@ -877,7 +976,7 @@ TOKEN=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
 [ "${#TOKEN}" -ge 8 ] || TOKEN="t$$"
 printf '%s %s\n' 'AL_LIVE_1' "$TOKEN"
 printf '%s\n' 'PANES'
-tmux list-panes -a -F '#{pane_id}	#{session_name}	#{window_name}	#{window_index}	#{pane_index}	#{pane_pid}	#{pane_current_path}	#{pane_title}' 2>/dev/null || true
+tmux list-panes -a -F '#{pane_id}	#{session_name}	#{window_name}	#{window_index}	#{pane_index}	#{pane_pid}	#{pane_current_path}	#{pane_activity}	#{pane_title}' 2>/dev/null || true
 printf '%s\n' 'PS'
 ps -axo pid=,ppid=,pgid=,tpgid=,comm=,args= 2>/dev/null || true
 PANE_PIDS=$(tmux list-panes -a -F '#{pane_pid}' 2>/dev/null || true)
@@ -1058,7 +1157,7 @@ fn parse_panes(text: &str) -> Vec<Pane> {
 }
 
 fn parse_pane_line(line: &str) -> Option<Pane> {
-    let mut fields = line.splitn(8, '\t');
+    let mut fields = line.splitn(9, '\t');
     let pane_id = fields.next()?;
     if !pane_id.starts_with('%') {
         return None;
@@ -1069,7 +1168,11 @@ fn parse_pane_line(line: &str) -> Option<Pane> {
     let pane_index = fields.next()?;
     let pid = fields.next()?.parse().ok()?;
     let cwd = fields.next().unwrap_or("").to_owned();
-    let title = fields.next().unwrap_or("").to_owned();
+    let eighth = fields.next().unwrap_or("");
+    let (activity, title) = match fields.next() {
+        Some(title) => (eighth.parse().unwrap_or(0), title.to_owned()),
+        None => (0, eighth.to_owned()),
+    };
     Some(Pane {
         pane_id: pane_id.to_owned(),
         session: session.to_owned(),
@@ -1078,6 +1181,7 @@ fn parse_pane_line(line: &str) -> Option<Pane> {
         pane_index: pane_index.to_owned(),
         pid,
         cwd,
+        activity,
         title,
     })
 }
@@ -1088,7 +1192,7 @@ fn list_panes() -> Result<Vec<Pane>> {
             "list-panes",
             "-a",
             "-F",
-            "#{pane_id}\t#{session_name}\t#{window_name}\t#{window_index}\t#{pane_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}",
+            "#{pane_id}\t#{session_name}\t#{window_name}\t#{window_index}\t#{pane_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_activity}\t#{pane_title}",
         ])
         .output();
     let output = match output {
@@ -1537,9 +1641,7 @@ fn is_chrome_line(line: &str) -> bool {
     {
         return true;
     }
-    if looks_like_resume_command(trimmed)
-        || trimmed.starts_with("Resume this session with")
-    {
+    if looks_like_resume_command(trimmed) || trimmed.starts_with("Resume this session with") {
         return true;
     }
     false
@@ -1590,6 +1692,14 @@ fn ellipsize(text: &str, max_chars: usize) -> String {
     }
     let kept: String = text.chars().take(max_chars.saturating_sub(3)).collect();
     format!("{kept}...")
+}
+
+fn idle_since(now: u64, activity: u64) -> u64 {
+    if activity == 0 || activity > now {
+        0
+    } else {
+        now.saturating_sub(activity)
+    }
 }
 
 fn format_idle(secs: u64) -> String {
@@ -1653,14 +1763,24 @@ fn format_live_picker_line(agent: &LiveAgent, color: bool) -> String {
     } else {
         format!("{state:<8}")
     };
+    let session = if agent.session.is_empty() || numeric_session(&agent.session) {
+        "-"
+    } else {
+        agent.session.as_str()
+    };
     let idle = if agent.idle_secs == 0 {
-        String::new()
+        "-".to_owned()
     } else {
         format_idle(agent.idle_secs)
     };
+    let snippet = if agent.snippet.is_empty() {
+        "-"
+    } else {
+        agent.snippet.as_str()
+    };
     let display = sanitize_picker(&format!(
-        "{state_cell} {:<6} {host}{cwd} · {branch}  {}  {}  {idle}  {}",
-        agent.agent, agent.diff_summary, agent.pane, agent.snippet
+        "{state_cell} {:<6} {host}{cwd} · {branch}  {}  {}  {session}  {idle}  {snippet}",
+        agent.agent, agent.diff_summary, agent.pane
     ));
     format!(
         "{display}\t{}\t{}\t{}\t{}",
@@ -1763,7 +1883,13 @@ fn content_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
-fn print_summary(agents: &[LiveAgent], interval: u64, color: bool) -> Result<()> {
+fn format_summary(
+    label: &str,
+    agents: &[LiveAgent],
+    interval: u64,
+    failed_hosts: &[String],
+    color: bool,
+) -> String {
     let mut blocked = 0;
     let mut asking = 0;
     let mut working = 0;
@@ -1776,23 +1902,19 @@ fn print_summary(agents: &[LiveAgent], interval: u64, color: bool) -> Result<()>
             AgentState::Idle | AgentState::Unknown => idle += 1,
         }
     }
-    let line = format!(
-        "al supervise  {} agents  {blocked} blocked  {asking} asking  {working} working  {idle} idle  {interval}s",
+    let mut line = format!(
+        "al {label}  {} agents  {blocked} blocked  {asking} asking  {working} working  {idle} idle  {interval}s",
         agents.len()
     );
+    if !failed_hosts.is_empty() {
+        line.push_str("  failed: ");
+        line.push_str(&failed_hosts.join(","));
+    }
     if color {
-        println!("\x1b[1m{line}\x1b[0m");
+        format!("\x1b[1m{line}\x1b[0m")
     } else {
-        println!("{line}");
+        line
     }
-    Ok(())
-}
-
-fn print_table(agents: &[LiveAgent], color: bool) -> Result<()> {
-    if !agents.is_empty() {
-        print!("{}", format_table(agents, color));
-    }
-    Ok(())
 }
 
 fn format_table(agents: &[LiveAgent], color: bool) -> String {
@@ -1806,25 +1928,12 @@ fn format_table(agents: &[LiveAgent], color: bool) -> String {
         .collect::<HashSet<_>>()
         .len()
         > 1;
-    let show_session = groups
-        .iter()
-        .flat_map(|group| &group.agents)
-        .any(|agent| !numeric_session(&agent.session));
-    let show_idle = groups
-        .iter()
-        .flat_map(|group| &group.agents)
-        .any(|agent| agent.idle_secs > 0);
     let mut rows: Vec<Vec<String>> = groups
         .iter()
-        .flat_map(|group| {
-            group
-                .agents
-                .iter()
-                .copied()
-                .map(|agent| pane_cells(agent, show_session, show_idle))
-        })
+        .flat_map(|group| group.agents.iter().copied().map(pane_cells))
         .collect();
     let snippet_idx = rows.first().map(|row| row.len() - 1).unwrap_or(0);
+    let idle_idx = snippet_idx.saturating_sub(1);
     let widths: Vec<usize> = (0..snippet_idx)
         .map(|index| {
             rows.iter()
@@ -1835,7 +1944,7 @@ fn format_table(agents: &[LiveAgent], color: bool) -> String {
         .collect();
     let indent = if multi_host { "    " } else { "  " };
     let used = indent.len() + widths.iter().sum::<usize>() + widths.len().saturating_mul(2);
-    let snippet_budget = terminal_columns().saturating_sub(used).max(20);
+    let snippet_budget = terminal_columns().saturating_sub(used).max(24);
     for row in &mut rows {
         if let Some(snippet) = row.get_mut(snippet_idx) {
             *snippet = ellipsize_width(snippet, snippet_budget);
@@ -1871,7 +1980,7 @@ fn format_table(agents: &[LiveAgent], color: bool) -> String {
                 cells[0] = format!("{}{padded}\x1b[0m", agent.state.color());
             }
             out.push_str(indent);
-            out.push_str(&join_row(&cells, &widths, show_idle));
+            out.push_str(&join_row(&cells, &widths, idle_idx));
             out.push('\n');
         }
     }
@@ -1928,8 +2037,9 @@ fn grouped_agents<'a>(agents: &'a [LiveAgent]) -> Vec<AgentGroup<'a>> {
             .min()
             .unwrap_or(AgentState::Unknown);
         if multi_host {
-            left.host
-                .cmp(right.host)
+            host_rank(left.host)
+                .cmp(&host_rank(right.host))
+                .then(left.host.cmp(right.host))
                 .then(left_state.cmp(&right_state))
                 .then(left.cwd.cmp(right.cwd))
         } else {
@@ -1937,6 +2047,10 @@ fn grouped_agents<'a>(agents: &'a [LiveAgent]) -> Vec<AgentGroup<'a>> {
         }
     });
     groups
+}
+
+fn host_rank(host: &str) -> u8 {
+    if host == "local" { 0 } else { 1 }
 }
 
 fn group_header(group: &AgentGroup<'_>, multi_host: bool, color: bool) -> String {
@@ -1960,7 +2074,7 @@ fn group_header(group: &AgentGroup<'_>, multi_host: bool, color: bool) -> String
     if diff.is_empty() {
         return format!("{indent}{title}");
     }
-    let diff = if diff == "clean" || diff == "-" {
+    let diff = if diff == "-" {
         format!("\x1b[90m{diff}\x1b[0m")
     } else {
         format!("\x1b[33m{diff}\x1b[0m")
@@ -1968,43 +2082,40 @@ fn group_header(group: &AgentGroup<'_>, multi_host: bool, color: bool) -> String
     format!("{indent}{title}  {diff}")
 }
 
-fn pane_cells(agent: &LiveAgent, show_session: bool, show_idle: bool) -> Vec<String> {
-    let mut cells = vec![
+fn pane_cells(agent: &LiveAgent) -> Vec<String> {
+    vec![
         agent.state.as_str().to_owned(),
         agent.agent.clone(),
         agent.pane.clone(),
-    ];
-    if show_session {
-        cells.push(if numeric_session(&agent.session) {
-            String::new()
+        if agent.session.is_empty() || numeric_session(&agent.session) {
+            "-".to_owned()
         } else {
             ellipsize(&agent.session, SESSION_CHARS)
-        });
-    }
-    if show_idle {
-        cells.push(if agent.idle_secs == 0 {
-            String::new()
+        },
+        if agent.idle_secs == 0 {
+            "-".to_owned()
         } else {
             format_idle(agent.idle_secs)
-        });
-    }
-    cells.push(agent.snippet.clone());
-    cells
+        },
+        if agent.snippet.is_empty() {
+            "-".to_owned()
+        } else {
+            agent.snippet.clone()
+        },
+    ]
 }
 
 fn numeric_session(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|character| character.is_ascii_digit())
 }
 
-fn join_row(cells: &[String], widths: &[usize], right_align_last: bool) -> String {
+fn join_row(cells: &[String], widths: &[usize], right_align_idx: usize) -> String {
     cells
         .iter()
         .enumerate()
         .map(|(index, cell)| match widths.get(index).copied() {
             None | Some(0) => cell.clone(),
-            Some(width) if right_align_last && index + 1 == widths.len() => {
-                pad_cell_left(cell, width)
-            }
+            Some(width) if index == right_align_idx => pad_cell_left(cell, width),
             Some(width) => pad_cell(cell, width),
         })
         .collect::<Vec<_>>()
@@ -2128,7 +2239,7 @@ fn print_diffs(agents: &[LiveAgent]) {
                 println!("== {} {cwd} {} ==", agent.host, agent.diff_summary);
                 println!("{diff}");
             }
-            None if agent.diff_summary != "-" && agent.diff_summary != "clean" => {
+            None if agent.diff_summary != "-" && !agent.diff_summary.is_empty() => {
                 println!();
                 println!("== {} {cwd} {} ==", agent.host, agent.diff_summary);
                 println!("(no textual diff)");
@@ -2370,6 +2481,7 @@ mod tests {
             parse_pane_line("%12\tagents\tomlo-demo\t0\t1\t4242\t/workspace/demo\tomlo").unwrap();
         assert_eq!(pane.pane_id, "%12");
         assert_eq!(pane.cwd, "/workspace/demo");
+        assert_eq!(pane.activity, 0);
         assert_eq!(pane.title, "omlo");
     }
 
@@ -2487,10 +2599,7 @@ mod tests {
             snippet("ready\ngrok --resume 00000000-0000-0000-0000-000000000000\n"),
             "ready"
         );
-        assert_eq!(
-            snippet("done\nResume this session with:\n"),
-            "done"
-        );
+        assert_eq!(snippet("done\nResume this session with:\n"), "done");
     }
 
     #[test]
@@ -2499,6 +2608,51 @@ mod tests {
         assert_eq!(format_idle(3043), "50m");
         assert_eq!(format_idle(7200), "2h");
         assert_eq!(format_idle(90000), "1d");
+    }
+
+    #[test]
+    fn idle_since_uses_tmux_activity_not_first_sighting() {
+        assert_eq!(idle_since(1_000, 875), 125);
+        assert_eq!(idle_since(1_000, 0), 0);
+        assert_eq!(idle_since(1_000, 1_500), 0);
+    }
+
+    #[test]
+    fn parse_pane_line_reads_activity_before_title() {
+        let pane = parse_pane_line("%12\tagents\tomlo-demo\t0\t1\t4242\t/workspace/demo\t875\tomlo")
+            .unwrap();
+        assert_eq!(pane.activity, 875);
+        assert_eq!(pane.title, "omlo");
+        assert_eq!(
+            parse_pane_line("%12\tagents\tomlo-demo\t0\t1\t4242\t/workspace/demo\tomlo")
+                .unwrap()
+                .activity,
+            0
+        );
+    }
+
+    #[test]
+    fn clean_worktree_summary_is_blank() {
+        let git = GitInfo {
+            inside: true,
+            branch: "main".to_owned(),
+            ..GitInfo::default()
+        };
+        assert_eq!(git.summary(), "");
+        let mut agent = live("omp", AgentState::Idle, "/workspace/demo");
+        agent.branch = "main".into();
+        agent.diff_summary = git.summary();
+        let header = group_header(
+            &AgentGroup {
+                host: "local",
+                cwd: "/workspace/demo",
+                agents: vec![&agent],
+            },
+            false,
+            false,
+        );
+        assert_eq!(header, "workspace/demo · main");
+        assert!(!header.contains("clean"));
     }
 
     #[test]
@@ -2565,6 +2719,23 @@ mod tests {
         assert!(table.contains("%8"), "{table}");
         assert!(table.contains("50m"), "{table}");
         assert!(table.contains("Which file?"), "{table}");
+        assert!(table.contains("omlo-demo"), "{table}");
+        assert!(
+            table.lines().any(|line| line.contains("asking")
+                && line.contains("omp")
+                && line.contains("%9")
+                && line.contains("omlo-demo")
+                && line.contains("-")
+                && line.contains("Which file?")),
+            "fixed columns should keep session and idle placeholders: {table}"
+        );
+        assert!(
+            table.lines().any(|line| line.contains("idle")
+                && line.contains("%8")
+                && line.contains("50m")
+                && line.contains("-")),
+            "numeric sessions render as -: {table}"
+        );
         let colored = format_table(
             &[live("agent", AgentState::Idle, "/workspace/Projects/demo")],
             true,
@@ -2572,6 +2743,100 @@ mod tests {
         assert!(
             colored.contains("\x1b[92midle"),
             "idle should be green: {colored:?}"
+        );
+    }
+
+    #[test]
+    fn format_table_groups_multi_host_blocks() {
+        let mut local = live("omp", AgentState::Working, "/workspace/Projects/demo");
+        local.host = "local".into();
+        local.session = "omlo-demo".into();
+        local.pane = "%2".into();
+        local.branch = "main".into();
+        local.diff_summary = String::new();
+        local.snippet = "editing".into();
+        let mut remote = live("claude", AgentState::Blocked, "/workspace/Projects/other");
+        remote.host = "host-b".into();
+        remote.session = "cclo-other".into();
+        remote.pane = "%7".into();
+        remote.branch = "feat".into();
+        remote.diff_summary = "+1/-0".into();
+        remote.snippet = "Need approval".into();
+        let table = format_table(&[local, remote], false);
+        assert!(table.contains("local\n"), "{table}");
+        assert!(table.contains("host-b\n"), "{table}");
+        assert!(table.contains("demo · main"), "{table}");
+        assert!(table.contains("other · feat  +1/-0"), "{table}");
+        let local_pos = table.find("local\n").unwrap();
+        let remote_pos = table.find("host-b\n").unwrap();
+        assert!(local_pos < remote_pos, "{table}");
+    }
+
+    #[test]
+    fn watch_frame_includes_label_counts_and_failed_hosts() {
+        let agent = live("omp", AgentState::Asking, "/workspace/demo");
+        let frame = render_watch_frame(
+            "watch",
+            std::slice::from_ref(&agent),
+            3,
+            &["host-b".to_owned()],
+            false,
+        );
+        assert!(frame.starts_with("al watch  1 agents"), "{frame}");
+        assert!(frame.contains("1 asking"), "{frame}");
+        assert!(frame.contains("failed: host-b"), "{frame}");
+        assert!(frame.contains("asking"), "{frame}");
+        let empty = render_watch_frame("supervise", &[], 5, &[], false);
+        assert!(empty.contains("al supervise  0 agents"), "{empty}");
+        assert!(empty.contains("no live agents"), "{empty}");
+    }
+
+    #[test]
+    fn attention_agent_reports_empty_and_idle_hosts_clearly() {
+        assert!(
+            attention_agent(&[])
+                .unwrap_err()
+                .to_string()
+                .contains("no live agents")
+        );
+        let idle = live("omp", AgentState::Idle, "/workspace/demo");
+        let working = live("pi", AgentState::Working, "/workspace/other");
+        let err = attention_agent(&[idle, working]).unwrap_err().to_string();
+        assert!(err.contains("no blocked or asking"), "{err}");
+        assert!(err.contains("omp:idle"), "{err}");
+        assert!(err.contains("pi:working"), "{err}");
+    }
+
+    #[test]
+    fn pane_cells_always_use_fixed_placeholders() {
+        let mut agent = live("omp", AgentState::Asking, "/workspace/demo");
+        agent.session = "12".into();
+        agent.idle_secs = 0;
+        agent.snippet = String::new();
+        assert_eq!(
+            pane_cells(&agent),
+            [
+                "asking".to_owned(),
+                "omp".to_owned(),
+                "%1".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+            ]
+        );
+        agent.session = "omlo-demo".into();
+        agent.idle_secs = 90;
+        agent.snippet = "Which file?".into();
+        assert_eq!(
+            pane_cells(&agent),
+            [
+                "asking".to_owned(),
+                "omp".to_owned(),
+                "%1".to_owned(),
+                "omlo-demo".to_owned(),
+                "1m".to_owned(),
+                "Which file?".to_owned(),
+            ]
         );
     }
 

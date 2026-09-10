@@ -287,7 +287,8 @@ fn native_sources_convert_to_every_target() {
             r#"{"type":"session","version":3,"id":"pi-src","timestamp":"2026-09-04T10:00:00.000Z","cwd":"/workspace/project"}"#,
             r#"{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-09-04T10:00:00.100Z","provider":"source-provider","modelId":"source-model"}"#,
             r#"{"type":"thinking_level_change","id":"tl1","parentId":"m1","timestamp":"2026-09-04T10:00:00.150Z","thinkingLevel":"high"}"#,
-            r#"{"type":"message","id":"u1","parentId":"tl1","timestamp":"2026-09-04T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"list the file"},{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}],"timestamp":1}}"#,
+            r#"{"type":"compaction","id":"c0","parentId":"tl1","timestamp":"2026-09-04T10:00:00.200Z","summary":"prior context","retainedTail":[{"role":"assistant","content":[{"type":"text","text":"kept tail"}]}]}"#,
+            r#"{"type":"message","id":"u1","parentId":"c0","timestamp":"2026-09-04T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"list the file"},{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}],"timestamp":1}}"#,
             r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-04T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"I should read it"},{"type":"text","text":"reading now"},{"type":"toolCall","id":"call-1","name":"Read","arguments":{"path":"src/lib.rs"}}],"api":"openai-completions","provider":"anthropic","model":"test","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":2}}"#,
             r#"{"type":"message","id":"t1","parentId":"a1","timestamp":"2026-09-04T10:00:03.000Z","message":{"role":"toolResult","toolCallId":"call-1","toolName":"Read","content":[{"type":"text","text":"fn main() {}"}],"isError":false,"timestamp":3}}"#,
             r#"{"type":"message","id":"a2","parentId":"t1","timestamp":"2026-09-04T10:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"the file starts with fn main"}],"api":"openai-completions","provider":"anthropic","model":"test","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":4}}"#,
@@ -321,7 +322,7 @@ fn native_sources_convert_to_every_target() {
             r#"{"type":"user","uuid":"u1","parentUuid":"c0","timestamp":"2026-09-04T10:00:01.000Z","sessionId":"claude-src","cwd":"/workspace/project","message":{"role":"user","content":[{"type":"text","text":"list the file"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}}"#,
             r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-09-04T10:00:02.000Z","sessionId":"claude-src","cwd":"/workspace/project","effort":"high","message":{"role":"assistant","model":"source-model","content":[{"type":"thinking","thinking":"I should read it","signature":""},{"type":"text","text":"reading now"},{"type":"tool_use","id":"call-1","name":"Read","input":{"path":"src/lib.rs"}}]}}"#,
             r#"{"type":"user","uuid":"t1","parentUuid":"a1","timestamp":"2026-09-04T10:00:03.000Z","sessionId":"claude-src","cwd":"/workspace/project","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":[{"type":"text","text":"fn main() {}"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"toolImgData"}}],"is_error":false}]}}"#,
-            r#"{"type":"assistant","uuid":"a2","parentUuid":"t1","timestamp":"2026-09-04T10:00:04.000Z","sessionId":"claude-src","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"the file starts with fn main"}]}}"#,
+            r#"{"type":"assistant","uuid":"a2","parentUuid":"t1","timestamp":"2026-09-04T10:00:04.000Z","sessionId":"claude-src","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"the file starts with fn main"},{"type":"document","title":"spec.pdf","source":{"media_type":"application/pdf"}},{"type":"search_result","title":"Example","url":"https://example.test","snippet":"excerpt"}]}}"#,
             r#"{"type":"last-prompt","lastPrompt":"list the file","leafUuid":"a2","sessionId":"claude-src"}"#,
         ],
     );
@@ -331,6 +332,8 @@ fn native_sources_convert_to_every_target() {
         &droid,
         &[
             r#"{"type":"session_start","id":"droid-src","title":"read the file","cwd":"/workspace/project","version":2,"owner":"tester","model":"source-model","thinkingLevel":"high"}"#,
+            r#"{"type":"compaction_state","id":"c1","summaryText":"prior context","summaryKind":"auto"}"#,
+            r#"{"type":"todo_state","id":"td1","todos":{"todos":"1. [pending] inspect parser"}}"#,
             r#"{"type":"message","id":"u1","timestamp":"2026-09-04T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"list the file"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}}"#,
             r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-04T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"I should read it"},{"type":"text","text":"reading now"},{"type":"tool_use","id":"call-1","name":"Read","input":{"path":"src/lib.rs"}}]}}"#,
             r#"{"type":"message","id":"t1","parentId":"a1","timestamp":"2026-09-04T10:00:03.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"fn main() {}"}]}}"#,
@@ -350,7 +353,8 @@ fn native_sources_convert_to_every_target() {
             r#"{"timestamp":"2026-09-04T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"list the file"},{"type":"input_image","image_url":"iVBORw0KGgo="}]}}"#,
             r#"{"timestamp":"2026-09-04T10:00:02.000Z","type":"response_item","payload":{"type":"reasoning","content":[{"type":"output_text","text":"I should read it"}]}}"#,
             r#"{"timestamp":"2026-09-04T10:00:02.100Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"reading now"}]}}"#,
-            r#"{"timestamp":"2026-09-04T10:00:02.200Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"Read","arguments":"{\"path\":\"src/lib.rs\"}"}}"#,
+            r#"{"timestamp":"2026-09-04T10:00:02.200Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-1","name":"Read","input":"{\"path\":\"src/lib.rs\"}"}}"#,
+            r#"{"timestamp":"2026-09-04T10:00:02.250Z","type":"response_item","payload":{"type":"web_search_call","id":"ws_1","action":{"type":"search","query":"capybaras"}}}"#,
             r#"{"timestamp":"2026-09-04T10:00:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"fn main() {}"}}"#,
             r#"{"timestamp":"2026-09-04T10:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"the file starts with fn main"}]}}"#,
         ],
@@ -461,11 +465,37 @@ fn native_sources_convert_to_every_target() {
                     has_note(&parsed, "ls") || contains_text(&parsed, "ls"),
                     "{source}->{target} dropped bash execution"
                 );
+                assert!(
+                    contains_text(&parsed, "kept tail"),
+                    "{source}->{target} dropped compaction retainedTail"
+                );
             }
             if source == SourceTool::Grok {
                 assert!(
                     has_tool_use(&parsed, "web_search"),
                     "{source}->{target} dropped backend tool call"
+                );
+            }
+            if source == SourceTool::Codex {
+                assert!(
+                    has_tool_use(&parsed, "web_search"),
+                    "{source}->{target} dropped web_search_call"
+                );
+            }
+            if source == SourceTool::Droid {
+                assert!(
+                    has_note(&parsed, "inspect parser") || contains_text(&parsed, "inspect parser"),
+                    "{source}->{target} dropped todo_state"
+                );
+            }
+            if source == SourceTool::Claude {
+                assert!(
+                    has_note(&parsed, "spec.pdf") || contains_text(&parsed, "spec.pdf"),
+                    "{source}->{target} dropped document block"
+                );
+                assert!(
+                    has_note(&parsed, "excerpt") || contains_text(&parsed, "excerpt"),
+                    "{source}->{target} dropped search_result block"
                 );
             }
         }

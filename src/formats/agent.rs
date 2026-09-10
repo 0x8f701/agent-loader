@@ -500,6 +500,40 @@ mod tests {
         assert_eq!(session.summary, "Useful name");
     }
     #[test]
+    fn hyphenated_tool_blocks_and_redacted_reasoning_are_projected() {
+        let assistant = br#"{"role":"assistant","content":[{"type":"redacted-reasoning","data":"opaque"},{"type":"text","text":"calling"},{"type":"tool-call","toolCallId":"c1","toolName":"Read","args":{"path":"a.rs"}}]}"#;
+        let tool = br#"{"role":"tool","content":[{"type":"tool-result","toolCallId":"c1","toolName":"Read","result":"fn main() {}"}]}"#;
+        let (_home, path) = fixture(Some(r#"{"agentId":"id"}"#), &[assistant, tool], None);
+        let session = parse(&path).unwrap();
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::Thinking { text, signature }
+                        if text == "[redacted]" && signature.as_deref() == Some("opaque")
+                )
+            })
+        }));
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolUse { name, input, .. }
+                        if name == "Read" && input.get("path").and_then(Value::as_str) == Some("a.rs")
+                )
+            })
+        }));
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolResult { content, .. } if content.contains("fn main")
+                )
+            })
+        }));
+    }
+
+    #[test]
     fn tool_calls_and_model_are_projected() {
         let blob = br#"{"role":"assistant","content":"calling","tool_calls":[{"id":"c1","name":"Read","arguments":"{\"path\":\"a.rs\"}"}]}"#;
         let (_home, path) = fixture(

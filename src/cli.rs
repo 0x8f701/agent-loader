@@ -80,7 +80,11 @@ pub enum Command {
     /// List live tmux coding-agent panes, not saved sessions.
     #[command(about = "List live tmux coding-agent panes, not saved sessions")]
     List(LiveListArgs),
-    /// Watch live tmux coding-agent panes, or send / diff one of them.
+    /// Pick a live pane with fzf (or a direct target) and attach to it.
+    Attach(AttachArgs),
+    /// Refresh live tmux coding-agent panes across local and remote hosts.
+    Watch(WatchArgs),
+    /// Send a message or print a diff for a live pane; bare form watches like `al watch`.
     Supervise(SuperviseCli),
     #[command(name = "tmux-run")]
     TmuxRun(RawTail),
@@ -213,33 +217,32 @@ pub struct LiveListArgs {
     /// Print each unique worktree's git diff after the table.
     #[arg(long)]
     pub diff: bool,
-    /// Pick a live pane with fzf and attach to it. Requires fzf on PATH.
-    #[arg(long, conflicts_with_all = ["json", "diff"])]
-    pub fzf: bool,
-    /// Initial fzf query. Requires `--fzf`.
-    #[arg(value_name = "QUERY", num_args = 0.., trailing_var_arg = true, requires = "fzf")]
-    pub query: Vec<String>,
-}
-
-#[derive(Debug, Args)]
-#[command(args_conflicts_with_subcommands = true)]
-pub struct SuperviseCli {
-    #[command(subcommand)]
-    pub command: Option<SuperviseCommand>,
-    #[command(flatten)]
-    pub watch: SuperviseWatchArgs,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum SuperviseCommand {
-    /// Paste a message into a live pane.
-    Send(SuperviseSendArgs),
-    /// Print the git diff for one live agent worktree.
-    Diff(SuperviseDiffArgs),
 }
 
 #[derive(Debug, Args, Default, PartialEq, Eq)]
-pub struct SuperviseWatchArgs {
+pub struct AttachArgs {
+    /// Remote host to scan. Repeatable. Omit for this machine.
+    #[arg(
+        long = "host",
+        value_name = "HOST",
+        value_parser = nonempty_host
+    )]
+    pub hosts: Vec<String>,
+    /// Attach directly to a pane (`%12`), unique agent, session, or cwd without fzf.
+    #[arg(long, value_name = "TARGET")]
+    pub target: Option<String>,
+    /// Initial fzf query when `--target` is omitted. Requires `fzf` on PATH.
+    #[arg(
+        value_name = "QUERY",
+        num_args = 0..,
+        trailing_var_arg = true,
+        conflicts_with = "target"
+    )]
+    pub query: Vec<String>,
+}
+
+#[derive(Debug, Args, Default, PartialEq, Eq)]
+pub struct WatchArgs {
     /// Remote host to scan. Repeatable. Omit for this machine.
     #[arg(
         long = "host",
@@ -250,6 +253,26 @@ pub struct SuperviseWatchArgs {
     /// Seconds between table refreshes.
     #[arg(long, default_value_t = crate::live::default_interval())]
     pub interval: u64,
+    /// Skip git status/diff lookups for a cheaper refresh.
+    #[arg(long)]
+    pub no_git: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct SuperviseCli {
+    #[command(subcommand)]
+    pub command: Option<SuperviseCommand>,
+    #[command(flatten)]
+    pub watch: WatchArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SuperviseCommand {
+    /// Paste a message into a live pane.
+    Send(SuperviseSendArgs),
+    /// Print the git diff for one live agent worktree.
+    Diff(SuperviseDiffArgs),
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -417,6 +440,8 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         }
         Command::New(args) => dispatch_new(args),
         Command::List(args) => dispatch_live_list(args),
+        Command::Attach(args) => dispatch_attach(args),
+        Command::Watch(args) => dispatch_watch(args, "watch"),
         Command::Supervise(args) => dispatch_supervise(args),
         Command::TmuxRun(args) => dispatch_tmux_run(args.argv),
         Command::TmuxChild(args) => dispatch_tmux_child(args),
@@ -964,18 +989,32 @@ fn dispatch_live_list(args: LiveListArgs) -> anyhow::Result<()> {
         hosts: args.hosts,
         json: args.json,
         diff: args.diff,
-        fzf: args.fzf,
+    })
+}
+
+fn dispatch_attach(args: AttachArgs) -> anyhow::Result<()> {
+    require_unix_live("attach")?;
+    crate::live::run_attach(&crate::live::AttachOptions {
+        hosts: args.hosts,
         query: args.query.join(" "),
+        target: args.target,
+    })
+}
+
+fn dispatch_watch(args: WatchArgs, label: &str) -> anyhow::Result<()> {
+    require_unix_live(label)?;
+    crate::live::run_watch(&crate::live::WatchOptions {
+        hosts: args.hosts,
+        interval: args.interval,
+        no_git: args.no_git,
+        label: label.to_owned(),
     })
 }
 
 fn dispatch_supervise(args: SuperviseCli) -> anyhow::Result<()> {
     require_unix_live("supervise")?;
     match args.command {
-        None => crate::live::run_watch(&crate::live::WatchOptions {
-            hosts: args.watch.hosts,
-            interval: args.watch.interval,
-        }),
+        None => dispatch_watch(args.watch, "supervise"),
         Some(SuperviseCommand::Send(send)) => crate::live::run_send(&crate::live::SendOptions {
             host: send.host,
             target: send.target,
@@ -1055,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn live_list_and_supervise_parse() {
+    fn live_list_attach_watch_and_supervise_parse() {
         let list =
             Cli::try_parse_from(["al", "list", "--host", "host-a", "--json", "--diff"]).unwrap();
         let Some(Command::List(list)) = list.command else {
@@ -1064,26 +1103,42 @@ mod tests {
         assert_eq!(list.hosts, ["host-a"]);
         assert!(list.json);
         assert!(list.diff);
-        assert!(!list.fzf);
-        assert!(list.query.is_empty());
-
-        let picked = Cli::try_parse_from(["al", "list", "--fzf", "omp", "sample-app"]).unwrap();
-        let Some(Command::List(picked)) = picked.command else {
-            panic!("expected list command");
-        };
-        assert!(picked.fzf);
-        assert_eq!(picked.query, ["omp", "sample-app"]);
-        assert!(Cli::try_parse_from(["al", "list", "--fzf", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["al", "list", "--fzf"]).is_err());
         assert!(Cli::try_parse_from(["al", "list", "omp"]).is_err());
 
+        let attach = Cli::try_parse_from(["al", "attach", "--host", "host-a", "omp", "demo"]).unwrap();
+        let Some(Command::Attach(attach)) = attach.command else {
+            panic!("expected attach command");
+        };
+        assert_eq!(attach.hosts, ["host-a"]);
+        assert_eq!(attach.query, ["omp", "demo"]);
+        assert!(attach.target.is_none());
+        let direct = Cli::try_parse_from(["al", "attach", "--target", "%12"]).unwrap();
+        let Some(Command::Attach(direct)) = direct.command else {
+            panic!("expected attach command");
+        };
+        assert_eq!(direct.target.as_deref(), Some("%12"));
+        assert!(Cli::try_parse_from(["al", "attach", "--target", "%12", "omp"]).is_err());
+
         let watch =
+            Cli::try_parse_from(["al", "watch", "--interval", "4", "--host", "host-b", "--no-git"])
+                .unwrap();
+        let Some(Command::Watch(watch)) = watch.command else {
+            panic!("expected watch command");
+        };
+        assert_eq!(watch.interval, 4);
+        assert_eq!(watch.hosts, ["host-b"]);
+        assert!(watch.no_git);
+
+        let supervise =
             Cli::try_parse_from(["al", "supervise", "--interval", "4", "--host", "host-b"]).unwrap();
-        let Some(Command::Supervise(watch)) = watch.command else {
+        let Some(Command::Supervise(supervise)) = supervise.command else {
             panic!("expected supervise command");
         };
-        assert!(watch.command.is_none());
-        assert_eq!(watch.watch.interval, 4);
-        assert_eq!(watch.watch.hosts, ["host-b"]);
+        assert!(supervise.command.is_none());
+        assert_eq!(supervise.watch.interval, 4);
+        assert_eq!(supervise.watch.hosts, ["host-b"]);
+        assert!(!supervise.watch.no_git);
 
         let send = Cli::try_parse_from([
             "al",
