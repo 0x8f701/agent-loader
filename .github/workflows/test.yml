@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust 1.85.0
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.85.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+          rustc_version="$("$HOME/.cargo/bin/rustc" +1.85.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.85.0 "*) ;;
+            *)
+              echo "Expected rustc 1.85.0" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: test-ubuntu-24.04
+
+      - name: Test
+        run: cargo +1.85.0 test --locked

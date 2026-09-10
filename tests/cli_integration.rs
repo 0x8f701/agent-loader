@@ -2078,4 +2078,15 @@ fn live_list_attach_watch_and_supervise_surface() {
         !missing_message.status.success(),
         "supervise send without --message must fail"
     );
+
+    let attach_missing = run_with_env(
+        home.path(),
+        &["attach", "--target", "%999"],
+        &[("AL_LIVE_STATE_DIR", state.path().as_os_str())],
+    );
+    assert!(
+        !attach_missing.status.success(),
+        "attach --target with no matching pane must fail: {}",
+        String::from_utf8_lossy(&attach_missing.stderr)
+    );
 }

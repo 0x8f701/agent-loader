@@ -15,6 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -28,6 +29,7 @@ const CWD_CHARS: usize = 24;
 const SESSION_CHARS: usize = 16;
 const DEFAULT_INTERVAL: u64 = 3;
 const DUMP_VERSION: &str = "AL_LIVE_1";
+static PANE_MEMORY_LOCK: Mutex<()> = Mutex::new(());
 
 const AGENT_ALIASES: &[(&str, &str)] = &[
     ("agent", "agent"),
@@ -281,16 +283,18 @@ pub fn run_list(options: &ListOptions) -> Result<()> {
 
 pub fn run_attach(options: &AttachOptions) -> Result<()> {
     let scan = collect_agents(&options.hosts, GitMode::Status);
-    let result = if let Some(target) = options.target.as_deref() {
+    if scan.agents.is_empty() {
+        if scan.failed {
+            bail!("one or more hosts failed");
+        }
+        bail!("no live agents");
+    }
+    if let Some(target) = options.target.as_deref() {
         let agent = resolve_agent(&scan.agents, Some(target))?;
         attach_agent(agent)
     } else {
         pick_and_attach(&scan.agents, &options.query)
-    };
-    if scan.failed {
-        bail!("one or more hosts failed");
     }
-    result
 }
 
 pub fn run_watch(options: &WatchOptions) -> Result<()> {
@@ -544,6 +548,9 @@ fn collect_remote_snapshot(host: &str, mode: GitMode) -> Result<Snapshot> {
 
 fn agents_from_snapshot(host: &str, snapshot: &Snapshot) -> Vec<LiveAgent> {
     let now = unix_now();
+    let _lock = PANE_MEMORY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut memory = load_memory();
     let mut agents = Vec::new();
     for pane in &snapshot.panes {
@@ -617,6 +624,11 @@ fn agent_cwd(pane: &Pane, job: &[Process], proc_cwds: &HashMap<i32, String>) -> 
 
 fn attach_git(agents: &mut [LiveAgent], snapshot: &Snapshot, mode: GitMode) {
     if !mode.want_status() {
+        for agent in agents {
+            agent.branch.clear();
+            agent.diff_summary.clear();
+            agent.diff = None;
+        }
         return;
     }
     let pane_cwd: HashMap<&str, &str> = snapshot
@@ -3034,6 +3046,10 @@ mod tests {
         );
         attach_git(std::slice::from_mut(&mut agent), &snapshot, GitMode::Status);
         assert_eq!(agent.diff_summary, "+4/-1");
+        assert!(agent.diff.is_none());
+        attach_git(std::slice::from_mut(&mut agent), &snapshot, GitMode::Off);
+        assert_eq!(agent.diff_summary, "");
+        assert!(agent.branch.is_empty());
         assert!(agent.diff.is_none());
     }
 
