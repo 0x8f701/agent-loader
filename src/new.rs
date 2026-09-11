@@ -204,18 +204,9 @@ fn apply_local(spec: &NewProject) -> Result<PathBuf> {
 fn apply_remote(spec: &NewProject, host: &str) -> Result<PathBuf> {
     let destination = project_destination(spec, true)?;
     let script = remote_script(spec)?;
-    let status = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ConnectionAttempts=1",
-            "--",
-            host,
-        ])
-        .arg(format!("fish -c {}", posix_quote(&script)))
-        .status()
-        .context("could not run ssh")?;
+    let status =
+        crate::remote::status(host, &[&format!("fish -c {}", posix_quote(&script))], false)
+            .context("could not reach remote host")?;
     if !status.success() {
         bail!(
             "failed to apply project on host {host:?} (exit {})",
@@ -528,19 +519,8 @@ fn open_remote(
     let remote_al = push_self(host)?;
     let inner = remote_open_inner(spec, &dest, &remote_al);
     let remote = format!("fish -lic {}", posix_quote(&inner));
-    let status = Command::new("ssh")
-        .args([
-            "-tt",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ConnectionAttempts=1",
-            "--",
-            host,
-        ])
-        .arg(remote)
-        .status()
-        .context("could not run ssh")?;
+    let status =
+        crate::remote::status(host, &[&remote], true).context("could not reach remote host")?;
     if status.success() {
         Ok(())
     } else {
@@ -602,18 +582,12 @@ fn push_self(host: &str) -> Result<String> {
             status.code().unwrap_or(1)
         );
     }
-    let chmod = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ConnectionAttempts=1",
-            "--",
-            host,
-        ])
-        .arg(format!("chmod 755 {}", posix_quote(&remote)))
-        .status()
-        .context("could not chmod remote al")?;
+    let chmod = crate::remote::status(
+        host,
+        &[&format!("chmod 755 {}", posix_quote(&remote))],
+        false,
+    )
+    .context("could not chmod remote al")?;
     if !chmod.success() {
         bail!(
             "failed to chmod al on host {host:?} (exit {})",
@@ -624,17 +598,11 @@ fn push_self(host: &str) -> Result<String> {
 }
 
 fn remote_self_matches(host: &str, remote: &str) -> bool {
-    let output = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ConnectionAttempts=1",
-            "--",
-            host,
-        ])
-        .arg(format!("{} --version", posix_quote(remote)))
-        .output();
+    let output = crate::remote::output(
+        host,
+        &[&format!("{} --version", posix_quote(remote))],
+        false,
+    );
     match output {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION"))
@@ -1199,8 +1167,13 @@ fn print_plan(spec: &NewProject) -> Result<()> {
     }
     if let Some(host) = spec.host.as_deref() {
         println!(
-            "bootstrap\tssh -- {host} fish -c {}",
-            posix_quote(&remote_script(spec)?)
+            "bootstrap\t{}",
+            crate::remote::argv_preview(
+                host,
+                &[&format!("fish -c {}", posix_quote(&remote_script(spec)?))],
+                false
+            )
+            .join(" ")
         );
     } else if spec.gits.is_empty() {
         println!("bootstrap\tcreate-or-update GOAL.md && commit");

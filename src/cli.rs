@@ -229,9 +229,12 @@ pub struct AttachArgs {
     )]
     pub hosts: Vec<String>,
     /// Attach directly to a pane (`%12`), unique agent, session, or cwd without fzf.
-    #[arg(long, value_name = "TARGET")]
+    #[arg(long, value_name = "TARGET", conflicts_with = "all")]
     pub target: Option<String>,
-    /// Initial fzf query when `--target` is omitted. Requires `fzf` on PATH.
+    /// Create one local tmux session per host, with a window attached to each live session.
+    #[arg(long, conflicts_with = "query")]
+    pub all: bool,
+    /// Initial fzf query when `--target` and `--all` are omitted. Requires `fzf` on PATH.
     #[arg(
         value_name = "QUERY",
         num_args = 0..,
@@ -344,7 +347,7 @@ pub struct NewProjectArgs {
     /// Write the goal (and optionally launch) without wrapping in tmux.
     #[arg(long)]
     pub no_tmux: bool,
-    /// Print the create/open plan without writing files or running ssh.
+    /// Print the create/open plan without writing files or running mosh/ssh.
     #[arg(long)]
     pub print_command: bool,
 }
@@ -521,27 +524,17 @@ fn dispatch_local_list(args: &SessionListArgs) -> anyhow::Result<()> {
 }
 
 fn dispatch_remote_list(host: &str, remote_command: &str) -> anyhow::Result<bool> {
-    let output = match std::process::Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ConnectionAttempts=1",
-            "--",
-        ])
-        .arg(host)
-        .arg(remote_command)
-        .output()
-    {
+    let tool = crate::remote::preferred_for(host).as_str();
+    let output = match crate::remote::output(host, &[remote_command], false) {
         Ok(output) => output,
         Err(error) => {
-            eprintln!("al: sessions list failed for host {host:?}: could not run ssh: {error}");
+            eprintln!("al: sessions list failed for host {host:?}: could not run {tool}: {error}");
             return Ok(false);
         }
     };
     if !output.status.success() {
         eprintln!(
-            "al: sessions list failed for host {host:?}: ssh exited with {}",
+            "al: sessions list failed for host {host:?}: {tool} exited with {}",
             output.status
         );
         return Ok(false);
@@ -998,6 +991,7 @@ fn dispatch_attach(args: AttachArgs) -> anyhow::Result<()> {
         hosts: args.hosts,
         query: args.query.join(" "),
         target: args.target,
+        all: args.all,
     })
 }
 
@@ -1106,7 +1100,8 @@ mod tests {
         assert!(Cli::try_parse_from(["al", "list", "--fzf"]).is_err());
         assert!(Cli::try_parse_from(["al", "list", "omp"]).is_err());
 
-        let attach = Cli::try_parse_from(["al", "attach", "--host", "host-a", "omp", "demo"]).unwrap();
+        let attach =
+            Cli::try_parse_from(["al", "attach", "--host", "host-a", "omp", "demo"]).unwrap();
         let Some(Command::Attach(attach)) = attach.command else {
             panic!("expected attach command");
         };
@@ -1119,10 +1114,25 @@ mod tests {
         };
         assert_eq!(direct.target.as_deref(), Some("%12"));
         assert!(Cli::try_parse_from(["al", "attach", "--target", "%12", "omp"]).is_err());
+        let all = Cli::try_parse_from(["al", "attach", "--all", "--host", "host-a"]).unwrap();
+        let Some(Command::Attach(all)) = all.command else {
+            panic!("expected attach command");
+        };
+        assert!(all.all);
+        assert_eq!(all.hosts, ["host-a"]);
+        assert!(Cli::try_parse_from(["al", "attach", "--all", "--target", "%12"]).is_err());
+        assert!(Cli::try_parse_from(["al", "attach", "--all", "omp"]).is_err());
 
-        let watch =
-            Cli::try_parse_from(["al", "watch", "--interval", "4", "--host", "host-b", "--no-git"])
-                .unwrap();
+        let watch = Cli::try_parse_from([
+            "al",
+            "watch",
+            "--interval",
+            "4",
+            "--host",
+            "host-b",
+            "--no-git",
+        ])
+        .unwrap();
         let Some(Command::Watch(watch)) = watch.command else {
             panic!("expected watch command");
         };
@@ -1131,7 +1141,8 @@ mod tests {
         assert!(watch.no_git);
 
         let supervise =
-            Cli::try_parse_from(["al", "supervise", "--interval", "4", "--host", "host-b"]).unwrap();
+            Cli::try_parse_from(["al", "supervise", "--interval", "4", "--host", "host-b"])
+                .unwrap();
         let Some(Command::Supervise(supervise)) = supervise.command else {
             panic!("expected supervise command");
         };

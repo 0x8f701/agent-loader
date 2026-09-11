@@ -1,8 +1,10 @@
 //! Explicit point-to-point session sync.
 //!
-//! Local work uses filesystem APIs and exact `OsString` argv. SSH is the only shell boundary:
-//! fixed Bash programs are assembled from independently single-quoted path tokens, then passed as
-//! one SSH remote-command argument. Tests inject [`CommandExecutor`] and never touch the network.
+//! Local work uses filesystem APIs and exact `OsString` argv. mosh (when local `mosh` and
+//! remote `mosh-server` both exist; else ssh) is the only
+//! shell boundary: fixed Bash programs are assembled from independently single-quoted path
+//! tokens, then passed as one remote-command argument. Tests inject [`CommandExecutor`]
+//! and never touch the network.
 
 use std::collections::{BTreeSet, HashSet};
 use std::env;
@@ -1344,10 +1346,8 @@ fn remote_history_append_script(path: &Path) -> Result<OsString> {
 fn remote_bash(host: &str, script: OsString, stdin: Option<Vec<u8>>) -> CommandSpec {
     let mut remote_command = OsString::from("bash -lc ");
     remote_command.push(quote_posix(&script).expect("constructed script is quoteable"));
-    let mut command = CommandSpec::new(
-        "ssh",
-        vec![OsString::from("--"), OsString::from(host), remote_command],
-    );
+    let (program, args) = crate::remote::argv_os(OsStr::new(host), remote_command, false);
+    let mut command = CommandSpec::new(program, args);
     command.stdin = stdin;
     command
 }
@@ -2141,14 +2141,35 @@ mod tests {
         assert!(report.is_success());
         assert_eq!(executor.pipelines.len(), 2);
         let pull = &executor.pipelines[0].0;
-        assert_eq!(pull.program, OsStr::new("ssh"));
-        assert_eq!(pull.args[0], OsStr::new("--"));
-        assert_eq!(pull.args[1], OsStr::new("source"));
+        assert!(
+            pull.program == OsStr::new("mosh") || pull.program == OsStr::new("ssh"),
+            "{:?}",
+            pull.program
+        );
+        assert!(
+            pull.args
+                .iter()
+                .any(|argument| argument == OsStr::new("source")),
+            "{:?}",
+            pull.args
+        );
         assert!(command_text(pull).contains("'\\''"));
         let push = &executor.pipelines[1];
         assert_eq!(push.0.program, OsStr::new("tar"));
         assert!(push.0.args.contains(&relative.into_os_string()));
-        assert_eq!(push.1.args[1], OsStr::new("destination"));
+        assert!(
+            push.1.program == OsStr::new("mosh") || push.1.program == OsStr::new("ssh"),
+            "{:?}",
+            push.1.program
+        );
+        assert!(
+            push.1
+                .args
+                .iter()
+                .any(|argument| argument == OsStr::new("destination")),
+            "{:?}",
+            push.1.args
+        );
     }
 
     #[test]

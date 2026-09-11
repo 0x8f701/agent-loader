@@ -118,19 +118,29 @@ fn write_fake_tool(bin: &Path, name: &str, script: &str) {
 
 #[cfg(unix)]
 fn write_ssh_stub(bin: &Path) -> PathBuf {
+    write_remote_stub(bin, "mosh")
+}
+
+#[cfg(unix)]
+fn write_remote_stub(bin: &Path, name: &str) -> PathBuf {
     let invocations = bin
         .parent()
         .expect("stub bin parent")
         .join("ssh-invocations");
     write_fake_tool(
         bin,
-        "ssh",
+        name,
         r#"#!/bin/sh
 printf '%s\n' "$#" >> "$SSH_INVOCATIONS"
+host=""
+prev=""
 for argument in "$@"; do
   printf '<%s>\n' "$argument" >> "$SSH_INVOCATIONS"
+  if [ "$prev" = "--" ] && [ -z "$host" ]; then
+    host=$argument
+  fi
+  prev=$argument
 done
-host=$6
 case "$host" in
   host-a) printf 'remote-a\n' ;;
   host-b) printf 'remote-b\n' ;;
@@ -484,6 +494,7 @@ fn explicit_session_hosts_preserve_order_local_and_forward_only_list_flags() {
         &[
             ("PATH", path.as_os_str()),
             ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("AL_REMOTE", OsStr::new("mosh")),
         ],
     );
     assert!(
@@ -497,7 +508,7 @@ fn explicit_session_hosts_preserve_order_local_and_forward_only_list_flags() {
     );
     assert_eq!(
         fs::read_to_string(invocations).unwrap(),
-        "7\n<-o>\n<ConnectTimeout=10>\n<-o>\n<ConnectionAttempts=1>\n<-->\n<host-a>\n<exec 'al' 'sessions' 'list' '4' '--all' '--dedupe'>\n7\n<-o>\n<ConnectTimeout=10>\n<-o>\n<ConnectionAttempts=1>\n<-->\n<host-b>\n<exec 'al' 'sessions' 'list' '4' '--all' '--dedupe'>\n"
+        "3\n<-->\n<host-a>\n<exec 'al' 'sessions' 'list' '4' '--all' '--dedupe'>\n3\n<-->\n<host-b>\n<exec 'al' 'sessions' 'list' '4' '--all' '--dedupe'>\n"
     );
 }
 
@@ -516,6 +527,7 @@ fn session_host_metacharacters_are_one_literal_ssh_argument() {
         &[
             ("PATH", path.as_os_str()),
             ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("AL_REMOTE", OsStr::new("mosh")),
         ],
     );
     assert!(output.status.success());
@@ -525,7 +537,7 @@ fn session_host_metacharacters_are_one_literal_ssh_argument() {
     );
     assert_eq!(
         fs::read_to_string(invocations).unwrap(),
-        "7\n<-o>\n<ConnectTimeout=10>\n<-o>\n<ConnectionAttempts=1>\n<-->\n<host-a;printf-injected>\n<exec 'al' 'sessions' 'list'>\n"
+        "3\n<-->\n<host-a;printf-injected>\n<exec 'al' 'sessions' 'list'>\n"
     );
 }
 
@@ -543,6 +555,7 @@ fn session_hosts_continue_after_failure_return_one_and_hide_remote_stderr() {
         &[
             ("PATH", path.as_os_str()),
             ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("AL_REMOTE", OsStr::new("mosh")),
         ],
     );
     assert_eq!(output.status.code(), Some(1));
@@ -552,7 +565,7 @@ fn session_hosts_continue_after_failure_return_one_and_hide_remote_stderr() {
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("host-c"));
-    assert!(stderr.contains("ssh exited with exit status: 23"));
+    assert!(stderr.contains("mosh exited with exit status: 23"));
     assert!(!stderr.contains("private session body"));
     assert!(
         fs::read_to_string(invocations)
@@ -585,6 +598,183 @@ fn session_host_forbidden_combinations_fail_before_ssh() {
         }
     }
     assert!(!invocations.exists(), "ssh must not run on parser errors");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_host_can_force_ssh_instead_of_mosh() {
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let invocations = write_remote_stub(&bin, "ssh");
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "list", "--host", "host-a"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("AL_REMOTE", OsStr::new("ssh")),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "ssh host list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "== host-a ==\nremote-a\n"
+    );
+    let logged = fs::read_to_string(invocations).unwrap();
+    assert!(logged.contains("<host-a>"), "{logged}");
+    assert!(logged.contains("<-o>"), "{logged}");
+    assert!(logged.contains("<ConnectTimeout=10>"), "{logged}");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_host_forced_mosh_does_not_fall_back_to_ssh() {
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let invocations = write_remote_stub(&bin, "ssh");
+    let path = std::env::join_paths([bin.as_path()]).unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "list", "--host", "host-a"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("AL_REMOTE", OsStr::new("mosh")),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "forced mosh must not silently use ssh"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("mosh"), "{stderr}");
+    assert!(
+        !invocations.exists()
+            || !fs::read_to_string(&invocations)
+                .unwrap()
+                .contains("<host-a>"),
+        "ssh stub must not run when AL_REMOTE=mosh"
+    );
+}
+
+#[cfg(unix)]
+fn write_ssh_probe_stub(bin: &Path) -> PathBuf {
+    let invocations = bin
+        .parent()
+        .expect("stub bin parent")
+        .join("ssh-invocations");
+    write_fake_tool(
+        bin,
+        "ssh",
+        r#"#!/bin/sh
+printf '%s\n' "$#" >> "$SSH_INVOCATIONS"
+host=""
+prev=""
+probe=0
+for argument in "$@"; do
+  printf '<%s>\n' "$argument" >> "$SSH_INVOCATIONS"
+  if [ "$prev" = "--" ] && [ -z "$host" ]; then
+    host=$argument
+  fi
+  if [ "$argument" = "mosh-server" ]; then
+    probe=1
+  fi
+  prev=$argument
+done
+if [ "$probe" = 1 ]; then
+  exit "${MOSH_SERVER_STATUS:-1}"
+fi
+case "$host" in
+  host-a) printf 'remote-a\n' ;;
+  *) printf 'literal:%s\n' "$host" ;;
+esac
+"#,
+    );
+    invocations
+}
+
+#[cfg(unix)]
+#[test]
+fn session_host_uses_mosh_when_remote_has_mosh_server() {
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let invocations = write_ssh_probe_stub(&bin);
+    write_remote_stub(&bin, "mosh");
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "list", "--host", "host-a"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("MOSH_SERVER_STATUS", OsStr::new("0")),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "mosh host list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "== host-a ==\nremote-a\n"
+    );
+    let logged = fs::read_to_string(&invocations).unwrap();
+    assert!(logged.contains("<BatchMode=yes>"), "{logged}");
+    assert!(logged.contains("<mosh-server>"), "{logged}");
+    assert!(
+        logged.contains("3\n<-->\n<host-a>\n<exec 'al' 'sessions' 'list'>\n"),
+        "{logged}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_host_uses_ssh_when_remote_has_no_mosh_server() {
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let invocations = write_ssh_probe_stub(&bin);
+    write_fake_tool(
+        &bin,
+        "mosh",
+        r#"#!/bin/sh
+printf 'mosh-should-not-run\n' >> "$SSH_INVOCATIONS"
+exit 99
+"#,
+    );
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "list", "--host", "host-a"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("MOSH_SERVER_STATUS", OsStr::new("1")),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "ssh fallback list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "== host-a ==\nremote-a\n"
+    );
+    let logged = fs::read_to_string(&invocations).unwrap();
+    assert!(logged.contains("<mosh-server>"), "{logged}");
+    assert!(logged.contains("<-o>"), "{logged}");
+    assert!(logged.contains("<ConnectTimeout=10>"), "{logged}");
+    assert!(logged.contains("<exec 'al' 'sessions' 'list'>"), "{logged}");
+    assert!(!logged.contains("mosh-should-not-run"), "{logged}");
 }
 
 #[test]
@@ -1984,7 +2174,9 @@ fn live_list_attach_watch_and_supervise_surface() {
     );
     let attach_text = String::from_utf8_lossy(&attach_help.stdout);
     assert!(
-        attach_text.contains("--target") && attach_text.contains("fzf"),
+        attach_text.contains("--target")
+            && attach_text.contains("fzf")
+            && attach_text.contains("--all"),
         "{attach_text}"
     );
 

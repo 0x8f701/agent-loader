@@ -232,6 +232,7 @@ pub struct AttachOptions {
     pub hosts: Vec<String>,
     pub query: String,
     pub target: Option<String>,
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +289,9 @@ pub fn run_attach(options: &AttachOptions) -> Result<()> {
             bail!("one or more hosts failed");
         }
         bail!("no live agents");
+    }
+    if options.all {
+        return attach_all(&scan.agents);
     }
     if let Some(target) = options.target.as_deref() {
         let agent = resolve_agent(&scan.agents, Some(target))?;
@@ -507,34 +511,34 @@ fn collect_local_snapshot() -> Snapshot {
 }
 
 fn collect_remote_snapshot(host: &str, mode: GitMode) -> Result<Snapshot> {
-    let output = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ConnectionAttempts=1",
-            "--",
-            host,
-            "sh",
-            "-s",
-            "--",
-            mode.remote_arg(),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(REMOTE_DUMP_SCRIPT.as_bytes())?;
-            }
-            child.wait_with_output()
-        })
-        .with_context(|| format!("could not run ssh to {host}"))?;
+    let output = crate::remote::spawn_with(
+        host,
+        &["sh", "-s", "--", mode.remote_arg()],
+        false,
+        |command| {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        },
+    )
+    .and_then(|mut child| {
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(REMOTE_DUMP_SCRIPT.as_bytes())?;
+        }
+        child.wait_with_output()
+    })
+    .with_context(|| {
+        format!(
+            "could not run {} to {host}",
+            crate::remote::preferred_for(host).as_str()
+        )
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "ssh {host} exited with {}{}",
+            "{} {host} exited with {}{}",
+            crate::remote::preferred_for(host).as_str(),
             output.status,
             if stderr.trim().is_empty() {
                 String::new()
@@ -555,10 +559,7 @@ fn agents_from_snapshot(host: &str, snapshot: &Snapshot) -> Vec<LiveAgent> {
     let mut agents = Vec::new();
     for pane in &snapshot.panes {
         let job = foreground_job(pane.pid, &snapshot.processes);
-        let agent = identify_agent(&job, group_leader(&job))
-            .or_else(|| agent_from_tmux_name(&pane.window).map(str::to_owned))
-            .or_else(|| agent_from_tmux_name(&pane.session).map(str::to_owned));
-        let Some(agent) = agent else {
+        let Some(agent) = identify_agent(&job, group_leader(&job)) else {
             continue;
         };
         let capture = snapshot
@@ -908,24 +909,17 @@ fn deliver(host: &str, pane: &str, message: &[u8], submit: bool) -> Result<()> {
             .stderr(Stdio::piped())
             .spawn()
     } else {
-        Command::new("ssh")
-            .args([
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "ConnectionAttempts=1",
-                "--",
-                host,
-                "tmux",
-                "load-buffer",
-                "-b",
-                &buffer,
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
+        crate::remote::spawn_with(
+            host,
+            &["tmux", "load-buffer", "-b", &buffer, "-"],
+            false,
+            |command| {
+                command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped());
+            },
+        )
     }
     .context("could not start tmux load-buffer")?;
     {
@@ -966,19 +960,10 @@ fn tmux_on(host: &str, args: &[&str]) -> Result<std::process::Output> {
             .output()
             .context("could not run tmux")
     } else {
-        let mut command = Command::new("ssh");
-        command.args([
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ConnectionAttempts=1",
-            "--",
-            host,
-            "tmux",
-        ]);
-        command.args(args);
-        command
-            .output()
+        let mut remote = Vec::with_capacity(args.len() + 1);
+        remote.push("tmux");
+        remote.extend(args.iter().copied());
+        crate::remote::output(host, &remote, false)
             .with_context(|| format!("could not run tmux on {host}"))
     }
 }
@@ -1825,6 +1810,121 @@ fn sanitize_picker(text: &str) -> String {
         .collect()
 }
 
+fn attach_all(agents: &[LiveAgent]) -> Result<()> {
+    let plan = attach_all_plan(agents);
+    if plan.is_empty() {
+        bail!("no live agents");
+    }
+    for (host, sessions) in &plan {
+        create_host_aggregator(host, sessions)?;
+    }
+    attach_local_session(&plan[0].0)
+}
+
+fn attach_all_plan(agents: &[LiveAgent]) -> Vec<(String, Vec<String>)> {
+    let mut hosts: Vec<String> = Vec::new();
+    for agent in agents {
+        if !hosts.iter().any(|host| host == &agent.host) {
+            hosts.push(agent.host.clone());
+        }
+    }
+    hosts.sort_by(|left, right| host_rank(left).cmp(&host_rank(right)).then(left.cmp(right)));
+    hosts
+        .into_iter()
+        .map(|host| {
+            let mut sessions = Vec::new();
+            for agent in agents {
+                if agent.host == host && !sessions.iter().any(|session| session == &agent.session) {
+                    sessions.push(agent.session.clone());
+                }
+            }
+            sessions.sort();
+            (host, sessions)
+        })
+        .filter(|(_, sessions)| !sessions.is_empty())
+        .collect()
+}
+
+fn create_host_aggregator(host: &str, sessions: &[String]) -> Result<()> {
+    let target = format!("={host}");
+    let _ = Command::new("tmux")
+        .args(["kill-session", "-t", &target])
+        .output();
+    for (index, session) in sessions.iter().enumerate() {
+        let window = sanitize_tmux_name(session);
+        let mut command = Command::new("tmux");
+        if index == 0 {
+            command.args(["new-session", "-d", "-s", host, "-n", &window, "--"]);
+        } else {
+            command.args(["new-window", "-t", &target, "-n", &window, "--"]);
+        }
+        let status = command
+            .args(session_attach_command(host, session))
+            .status()
+            .with_context(|| format!("could not create tmux window for {host} {session}"))?;
+        if !status.success() {
+            bail!(
+                "could not create tmux window for {host} {session} (exit {})",
+                status.code().unwrap_or(1)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn session_attach_command(host: &str, session: &str) -> Vec<String> {
+    let target = format!("={}", session.trim_start_matches('='));
+    if host == "local" {
+        vec![
+            "env".into(),
+            "-u".into(),
+            "TMUX".into(),
+            "tmux".into(),
+            "attach-session".into(),
+            "-t".into(),
+            target,
+        ]
+    } else {
+        crate::remote::argv(host, &["tmux", "attach-session", "-t", &target], true)
+    }
+}
+
+fn sanitize_tmux_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|ch| match ch {
+            '.' | ':' | '\n' | '\r' | '\t' => '-',
+            other => other,
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "session".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+fn attach_local_session(name: &str) -> Result<()> {
+    let target = format!("={name}");
+    let argv = if env::var_os("TMUX").is_some() {
+        vec!["tmux", "switch-client", "-t", &target]
+    } else {
+        vec!["tmux", "attach-session", "-t", &target]
+    };
+    let status = Command::new(argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("could not attach to host session")?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("attach exited {}", status.code().unwrap_or(1))
+    }
+}
+
 fn attach_target(agent: &LiveAgent) -> String {
     if agent.target.is_empty() {
         format!("={}", agent.session.trim_start_matches('='))
@@ -1852,37 +1952,16 @@ fn attach_agent(agent: &LiveAgent) -> Result<()> {
 fn attach_argv(agent: &LiveAgent, inside_tmux: bool) -> Vec<String> {
     let target = attach_target(agent);
     if agent.host != "local" {
-        let remote = format!("tmux attach-session -t {}", posix_single_quote(&target));
-        vec![
-            "ssh".into(),
-            "-tt".into(),
-            "-o".into(),
-            "ConnectTimeout=10".into(),
-            "-o".into(),
-            "ConnectionAttempts=1".into(),
-            "--".into(),
-            agent.host.clone(),
-            remote,
-        ]
+        crate::remote::argv(
+            &agent.host,
+            &["tmux", "attach-session", "-t", &target],
+            true,
+        )
     } else if inside_tmux {
         vec!["tmux".into(), "switch-client".into(), "-t".into(), target]
     } else {
         vec!["tmux".into(), "attach-session".into(), "-t".into(), target]
     }
-}
-
-fn posix_single_quote(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('\'');
-    for character in value.chars() {
-        if character == '\'' {
-            quoted.push_str("'\\''");
-        } else {
-            quoted.push(character);
-        }
-    }
-    quoted.push('\'');
-    quoted
 }
 
 fn pane_activity_key(capture: &str, title: &str) -> String {
@@ -2631,8 +2710,9 @@ mod tests {
 
     #[test]
     fn parse_pane_line_reads_activity_before_title() {
-        let pane = parse_pane_line("%12\tagents\tomlo-demo\t0\t1\t4242\t/workspace/demo\t875\tomlo")
-            .unwrap();
+        let pane =
+            parse_pane_line("%12\tagents\tomlo-demo\t0\t1\t4242\t/workspace/demo\t875\tomlo")
+                .unwrap();
         assert_eq!(pane.activity, 875);
         assert_eq!(pane.title, "omlo");
         assert_eq!(
@@ -2686,7 +2766,29 @@ mod tests {
         assert_eq!(key.target, "=omlo-demo:0.1");
         assert_eq!(attach_target(&agent), "=omlo-demo:0.1");
         assert_eq!(
-            attach_argv(&agent, false),
+            crate::remote::argv_with(
+                crate::remote::RemoteTool::Mosh,
+                "host-a",
+                &["tmux", "attach-session", "-t", "=omlo-demo:0.1"],
+                true
+            ),
+            [
+                "mosh",
+                "--",
+                "host-a",
+                "tmux",
+                "attach-session",
+                "-t",
+                "=omlo-demo:0.1"
+            ]
+        );
+        assert_eq!(
+            crate::remote::argv_with(
+                crate::remote::RemoteTool::Ssh,
+                "host-a",
+                &["tmux", "attach-session", "-t", "=omlo-demo:0.1"],
+                true
+            ),
             [
                 "ssh",
                 "-tt",
@@ -2696,7 +2798,10 @@ mod tests {
                 "ConnectionAttempts=1",
                 "--",
                 "host-a",
-                "tmux attach-session -t '=omlo-demo:0.1'"
+                "tmux",
+                "attach-session",
+                "-t",
+                "=omlo-demo:0.1"
             ]
         );
         agent.host = "local".into();
@@ -3068,7 +3173,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_from_snapshot_keeps_named_windows() {
+    fn agents_from_snapshot_skips_exited_named_windows() {
         let dir = tempfile::tempdir().unwrap();
         let _lock = MEMORY_LOCK.lock().unwrap();
         unsafe {
@@ -3092,10 +3197,127 @@ mod tests {
         unsafe {
             env::remove_var("AL_LIVE_STATE_DIR");
         }
+        assert!(agents.is_empty(), "{agents:?}");
+    }
+
+    #[test]
+    fn agents_from_snapshot_keeps_live_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = MEMORY_LOCK.lock().unwrap();
+        unsafe {
+            env::set_var("AL_LIVE_STATE_DIR", dir.path());
+        }
+        let snapshot = parse_snapshot(
+            "AL_LIVE_1 tok\n\
+             PANES\n\
+             %3\ts\tomlo-demo\t0\t0\t9\t/workspace/demo\ttitle\n\
+             %4\ts\tnotes\t0\t1\t10\t/tmp\tshell\n\
+             PS\n\
+                 9     1     9     9 omp omp --yolo\n\
+                10     1    10    10 fish fish\n\
+             CAPTURE tok %3\n\
+             previous discussion\n\
+             ›\n\
+             ENDCAPTURE tok %3\n",
+        )
+        .unwrap();
+        let agents = agents_from_snapshot("local", &snapshot);
+        unsafe {
+            env::remove_var("AL_LIVE_STATE_DIR");
+        }
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].agent, "omp");
         assert_eq!(agents[0].cwd, "/workspace/demo");
         assert_eq!(agents[0].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn attach_all_plan_groups_sessions_by_host() {
+        let mut local_a = live("omp", AgentState::Asking, "/workspace/a");
+        local_a.session = "omlo-a".into();
+        let mut local_b = live("pi", AgentState::Working, "/workspace/b");
+        local_b.session = "pilo-b".into();
+        let mut remote = live("claude", AgentState::Idle, "/workspace/c");
+        remote.host = "host-b".into();
+        remote.session = "cclo-c".into();
+        let mut remote_dup = remote.clone();
+        remote_dup.pane = "%9".into();
+        let plan = attach_all_plan(&[local_b, remote, local_a, remote_dup]);
+        assert_eq!(
+            plan,
+            [
+                (
+                    "local".to_owned(),
+                    vec!["omlo-a".to_owned(), "pilo-b".to_owned()]
+                ),
+                ("host-b".to_owned(), vec!["cclo-c".to_owned()])
+            ]
+        );
+        assert_eq!(
+            session_attach_command("local", "omlo-a"),
+            [
+                "env",
+                "-u",
+                "TMUX",
+                "tmux",
+                "attach-session",
+                "-t",
+                "=omlo-a"
+            ]
+        );
+        let remote = session_attach_command("host-b", "cclo-c");
+        assert!(remote[0] == "mosh" || remote[0] == "ssh", "{remote:?}");
+        assert!(remote.contains(&"host-b".to_owned()), "{remote:?}");
+        assert!(remote.contains(&"=cclo-c".to_owned()), "{remote:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_all_creates_one_window_per_host_session() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tmux_dir = dir.path().join("tmux");
+        fs::create_dir_all(&tmux_dir).unwrap();
+        let _lock = MEMORY_LOCK.lock().unwrap();
+        unsafe {
+            env::set_var("TMUX_TMPDIR", &tmux_dir);
+            env::remove_var("TMUX");
+        }
+        let tmux = |args: &[&str]| {
+            Command::new("tmux")
+                .env("TMUX_TMPDIR", &tmux_dir)
+                .env_remove("TMUX")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let _ = tmux(&["kill-server"]);
+        assert!(
+            tmux(&["new-session", "-d", "-s", "omlo-a", "-n", "w"])
+                .status
+                .success()
+        );
+        assert!(
+            tmux(&["new-session", "-d", "-s", "pilo-b", "-n", "w"])
+                .status
+                .success()
+        );
+        create_host_aggregator("local", &["omlo-a".into(), "pilo-b".into()]).unwrap();
+        let listed = tmux(&["list-windows", "-t", "=local", "-F", "#W"]);
+        let names = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            listed.status.success(),
+            "{names} {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        assert!(names.contains("omlo-a"), "{names}");
+        assert!(names.contains("pilo-b"), "{names}");
+        let _ = tmux(&["kill-server"]);
+        unsafe {
+            env::remove_var("TMUX_TMPDIR");
+        }
     }
 
     static MEMORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

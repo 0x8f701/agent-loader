@@ -1627,20 +1627,8 @@ fn execute_remote(
     }
 
     let remote = remote_command_string(workdir, argv, true)?;
-    let ssh = CommandSpec::new(
-        "ssh",
-        vec![
-            os("-tt"),
-            os("-o"),
-            os("ConnectTimeout=10"),
-            os("-o"),
-            os("ConnectionAttempts=1"),
-            os("--"),
-            host.to_owned(),
-            os(remote),
-        ],
-    );
-    execute_code(&ssh)
+    let (program, args) = crate::remote::argv_os(host, os(remote), true);
+    execute_code(&CommandSpec::new(program, args))
 }
 
 fn execute_remote_worktree(
@@ -1667,24 +1655,13 @@ fn execute_remote_worktree(
         "fish -c {}",
         posix_quote(OsStr::new(&command), launcher.as_str(), repo_root)?
     );
-    let ssh = CommandSpec::new(
-        "ssh",
-        vec![
-            os("-o"),
-            os("ConnectTimeout=10"),
-            os("-o"),
-            os("ConnectionAttempts=1"),
-            os("--"),
-            host.to_owned(),
-            os(remote),
-        ],
-    );
-    let status = execute_code(&ssh)?;
+    let (program, args) = crate::remote::argv_os(host, os(remote), false);
+    let status = execute_code(&CommandSpec::new(program, args))?;
     if status == 0 {
         Ok(())
     } else {
         Err(LauncherError::Execute {
-            program: os("ssh"),
+            program: os(crate::remote::preferred_for(&host.to_string_lossy()).as_str()),
             source: io::Error::other(format!(
                 "{}: failed to create or verify worktree on remote host (exit {status})",
                 launcher.as_str()
@@ -2338,9 +2315,7 @@ mod tests {
             );
             let plan = match plan {
                 Ok(plan) => plan,
-                Err(LauncherError::MissingExecutable { .. }) if kind == LauncherKind::Rpi => {
-                    continue;
-                }
+                Err(LauncherError::MissingExecutable { .. }) => continue,
                 Err(error) => panic!("unexpected error for {kind:?}: {error}"),
             };
             let command = match plan {
@@ -2380,9 +2355,7 @@ mod tests {
             );
             let plan = match plan {
                 Ok(plan) => plan,
-                Err(LauncherError::MissingExecutable { .. }) if kind == LauncherKind::Rpi => {
-                    continue;
-                }
+                Err(LauncherError::MissingExecutable { .. }) => continue,
                 Err(error) => panic!("unexpected error for {kind:?}: {error}"),
             };
             let command = match plan {
