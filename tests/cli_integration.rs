@@ -568,11 +568,9 @@ fn session_hosts_continue_after_failure_return_one_and_hide_remote_stderr() {
     assert!(stderr.contains("host-c"));
     assert!(stderr.contains("mosh exited with exit status: 23"));
     assert!(!stderr.contains("private session body"));
-    assert!(
-        fs::read_to_string(invocations)
-            .unwrap()
-            .contains("<host-b>")
-    );
+    assert!(fs::read_to_string(invocations)
+        .unwrap()
+        .contains("<host-b>"));
 }
 
 #[cfg(unix)]
@@ -939,11 +937,9 @@ fn legacy_omp_open_and_fork_launch_new_native_copies_without_touching_source() {
         assert!(launched_path.is_file());
         assert_ne!(first_json_id(&launched_path, "/id"), original_id);
         assert_eq!(fs::read(&source).unwrap(), before);
-        assert!(
-            String::from_utf8(before)
-                .unwrap()
-                .contains("keep-on-original")
-        );
+        assert!(String::from_utf8(before)
+            .unwrap()
+            .contains("keep-on-original"));
     }
 }
 
@@ -991,11 +987,9 @@ esac
     assert_ne!(outputs[0], source);
     assert_eq!(first_json_id(&outputs[0], "/payload/id"), launched_id);
     assert_eq!(fs::read(&source).unwrap(), before);
-    assert!(
-        String::from_utf8(before)
-            .unwrap()
-            .contains("keep-on-original")
-    );
+    assert!(String::from_utf8(before)
+        .unwrap()
+        .contains("keep-on-original"));
 }
 
 #[cfg(unix)]
@@ -2319,10 +2313,11 @@ fn supervise_keep_pins_target_when_another_agent_has_goal() {
     let bin = home.path().join("bin");
     let agent_bin = bin.join("agent");
     let omp_bin = bin.join("omp");
+    let receipt = home.path().join("keep-receipt");
     write_fake_tool(
         &bin,
         "agent",
-        "#!/bin/sh\nprintf 'Ready\\n\\n→ Add a follow-up\\n'\nexec cat\n",
+        "#!/bin/sh\nprintf 'Ready\\n\\n→ Add a follow-up\\n'\nwhile IFS= read -r line; do\n  [ -n \"$line\" ] || continue\n  printf '%s\\n' \"$line\" >> \"$AL_KEEP_RECEIPT\"\n  case \"$line\" in\n    *KEEP-LOOP-TOKEN*) printf 'Working...\\nesc to interrupt\\n' ;;\n    *) printf '→ Add a follow-up\\n' ;;\n  esac\ndone\n",
     );
     write_fake_tool(
         &bin,
@@ -2355,6 +2350,7 @@ fn supervise_keep_pins_target_when_another_agent_has_goal() {
             ])
             .env("PATH", &path)
             .env("TMUX_TMPDIR", tmux_tmp)
+            .env("AL_KEEP_RECEIPT", &receipt)
             .env_remove("TMUX")
             .status()
             .unwrap()
@@ -2462,25 +2458,46 @@ fn supervise_keep_pins_target_when_another_agent_has_goal() {
     .env("PATH", &path)
     .env("AL_LIVE_STATE_DIR", state.path())
     .env("TMUX_TMPDIR", tmux_tmp)
+    .env("AL_SUPERVISE_MAX_TICKS", "2")
     .env_remove("TMUX")
     .env_remove("SESSIONS_HOME")
     .env_remove("GROK_HOME")
     .env_remove("NO_COLOR")
     .env_remove("AL_PROJECTS_HOME");
-    let mut child = keep.spawn().expect("spawn al supervise keep");
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    let _ = child.kill();
-    let _ = child.wait();
+    let status = keep.status().expect("run al supervise keep");
+    assert!(status.success(), "keep loop failed: {status}");
+    let received = wait_for_receipt(&receipt, "KEEP-LOOP-TOKEN");
     let goal_after_keep = tmux_capture(&goal_session, tmux_tmp);
     let keep_after_keep = tmux_capture(&keep_session, tmux_tmp);
+    assert!(
+        received.contains("KEEP-LOOP-TOKEN"),
+        "keep must submit so the agent process reads KEEP-LOOP-TOKEN, got {received:?} pane {keep_after_keep:?}"
+    );
     assert!(
         keep_after_keep.contains("KEEP-LOOP-TOKEN"),
         "keep loop should nudge pinned pane: {keep_after_keep:?}"
     );
     assert!(
+        keep_after_keep.contains("Working...") || keep_after_keep.contains("esc to interrupt"),
+        "keep submit should leave the pane working: {keep_after_keep:?}"
+    );
+    assert!(
         !goal_after_keep.contains("KEEP-LOOP-TOKEN"),
         "keep loop must not send to the other agent with /goal: {goal_after_keep:?}"
     );
+}
+
+#[cfg(unix)]
+fn wait_for_receipt(path: &Path, needle: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..20 {
+        last = fs::read_to_string(path).unwrap_or_default();
+        if last.contains(needle) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    last
 }
 
 #[cfg(unix)]

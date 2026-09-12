@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 use crate::launcher::{CommandSpec, LauncherKind};
 
@@ -320,7 +320,11 @@ fn git_destination(spec: &NewProject, remote: bool) -> Result<PathBuf> {
 }
 
 fn git_clone_folder_name(name: &str) -> &str {
-    if name == "wt" { "worktree" } else { name }
+    if name == "wt" {
+        "worktree"
+    } else {
+        name
+    }
 }
 
 fn ensure_local_clone(url: &str, dest: &Path) -> Result<()> {
@@ -874,8 +878,14 @@ fn tmux_target(session: &str, window: &str) -> String {
     format!("={session}:{window}")
 }
 
+fn tmux_cmd() -> Command {
+    let mut command = Command::new("tmux");
+    command.env_remove("TMUX");
+    command
+}
+
 fn tmux_session_exists(session: &str) -> bool {
-    Command::new("tmux")
+    tmux_cmd()
         .args(["has-session", "-t", &format!("={session}")])
         .output()
         .map(|output| output.status.success())
@@ -884,7 +894,7 @@ fn tmux_session_exists(session: &str) -> bool {
 
 fn tmux_send_literal(session: &str, window: &str, text: &str) -> Result<()> {
     let target = tmux_target(session, window);
-    let status = Command::new("tmux")
+    let status = tmux_cmd()
         .args(["send-keys", "-t", &target, "-l", "--", text])
         .status()
         .context("could not run tmux send-keys")?;
@@ -900,7 +910,7 @@ fn tmux_send_literal(session: &str, window: &str, text: &str) -> Result<()> {
 
 fn tmux_send_submit(session: &str, window: &str) -> Result<()> {
     let target = tmux_target(session, window);
-    let status = Command::new("tmux")
+    let status = tmux_cmd()
         .args(["send-keys", "-t", &target, "C-m"])
         .status()
         .context("could not run tmux send-keys")?;
@@ -916,7 +926,7 @@ fn tmux_send_submit(session: &str, window: &str) -> Result<()> {
 
 fn tmux_capture(session: &str, window: &str) -> Result<String> {
     let target = tmux_target(session, window);
-    let output = Command::new("tmux")
+    let output = tmux_cmd()
         .args(["capture-pane", "-p", "-t", &target])
         .output()
         .context("could not run tmux capture-pane")?;
@@ -1719,10 +1729,11 @@ mod tests {
         ))
         .unwrap();
         let session = session_name(&dest);
+        let _lock = crate::live::TMUX_TEST_LOCK.lock().unwrap();
         let _guard = TmuxSessionGuard {
             session: session.clone(),
         };
-        let status = Command::new("tmux")
+        let status = tmux_cmd()
             .args(["new-session", "-d", "-s", &session, "sleep", "30"])
             .status()
             .unwrap();
@@ -1753,10 +1764,11 @@ mod tests {
                 .as_nanos()
         );
         let window = "grolo-sample";
+        let _lock = crate::live::TMUX_TEST_LOCK.lock().unwrap();
         let _guard = TmuxSessionGuard {
             session: id.clone(),
         };
-        let status = Command::new("tmux")
+        let status = tmux_cmd()
             .args([
                 "new-session",
                 "-d",
@@ -1771,7 +1783,15 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "tmux new-session failed");
-        assert!(tmux_session_exists(&id));
+        let mut exists = false;
+        for _ in 0..20 {
+            exists = tmux_session_exists(&id);
+            if exists {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(exists, "tmux session {id} did not appear");
         assert!(
             !tmux_session_exists("altest-goal"),
             "prefix must not match {id}"
@@ -1801,7 +1821,7 @@ mod tests {
     #[cfg(unix)]
     impl Drop for TmuxSessionGuard {
         fn drop(&mut self) {
-            let _ = Command::new("tmux")
+            let _ = tmux_cmd()
                 .args(["kill-session", "-t", &self.session])
                 .status();
         }

@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 const SNIPPET_CHARS: usize = 56;
@@ -30,6 +30,10 @@ const SESSION_CHARS: usize = 16;
 const DEFAULT_INTERVAL: u64 = 3;
 const DUMP_VERSION: &str = "AL_LIVE_1";
 static PANE_MEMORY_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(all(test, unix))]
+pub(crate) static TMUX_TEST_LOCK: Mutex<()> = Mutex::new(());
+const KEEP_SUBMIT_RETRIES: u32 = 3;
+const KEEP_SUBMIT_WAIT_MS: u64 = 400;
 
 const AGENT_ALIASES: &[(&str, &str)] = &[
     ("agent", "agent"),
@@ -404,15 +408,23 @@ pub fn run_keep(options: &KeepOptions) -> Result<()> {
         );
     }
     let interval = options.interval.max(1);
+    let max_ticks = options.max_ticks.or_else(keep_max_ticks_from_env);
     let mut ticks = 0u64;
     loop {
         keep_once(options)?;
         ticks += 1;
-        if options.max_ticks.is_some_and(|max| ticks >= max) {
+        if max_ticks.is_some_and(|max| ticks >= max) {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_secs(interval));
     }
+}
+
+fn keep_max_ticks_from_env() -> Option<u64> {
+    env::var("AL_SUPERVISE_MAX_TICKS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|ticks: &u64| *ticks > 0)
 }
 
 fn keep_once(options: &KeepOptions) -> Result<()> {
@@ -436,17 +448,28 @@ fn keep_once(options: &KeepOptions) -> Result<()> {
     if action != KeepAction::Nudge {
         return Ok(());
     }
-    if composer_has_unknown_paste(&screen) {
+    if keep_composer_dirty(&screen, &options.message) {
         send_key(host, &agent.pane, "C-u")?;
     }
     deliver(host, &agent.pane, options.message.as_bytes(), true)?;
-    std::thread::sleep(std::time::Duration::from_millis(250));
-    let after = capture_on(host, &agent.pane);
-    if classify_screen(&after, "", false) == AgentState::Idle
-        && (after.contains(&options.message) || composer_has_unknown_paste(&after))
-    {
-        send_key(host, &agent.pane, "Enter")?;
+    for attempt in 1..=KEEP_SUBMIT_RETRIES {
+        std::thread::sleep(std::time::Duration::from_millis(KEEP_SUBMIT_WAIT_MS));
+        let after = capture_on(host, &agent.pane);
+        if keep_submit_landed(&after, &options.message) {
+            println!(
+                "al supervise  keep {}  {} submitted",
+                options.target, agent.pane
+            );
+            return Ok(());
+        }
+        if attempt < KEEP_SUBMIT_RETRIES {
+            send_key(host, &agent.pane, "C-m")?;
+        }
     }
+    println!(
+        "al supervise  keep {}  {} submit unconfirmed",
+        options.target, agent.pane
+    );
     Ok(())
 }
 
@@ -463,6 +486,30 @@ fn keep_action(state: AgentState, screen: &str) -> KeepAction {
 
 fn composer_has_unknown_paste(text: &str) -> bool {
     text.contains("[Pasted text")
+}
+
+fn looks_like_idle_followup(screen: &str) -> bool {
+    let last = last_nonempty(screen, STRUCT_LINES).to_ascii_lowercase();
+    last.contains("add a follow-up")
+        || last.contains("add a followup")
+        || composer_has_unknown_paste(screen)
+}
+
+fn keep_composer_dirty(screen: &str, message: &str) -> bool {
+    composer_has_unknown_paste(screen)
+        || (!message.is_empty() && looks_like_idle_followup(screen) && screen.contains(message))
+}
+
+fn keep_still_unsent(screen: &str, message: &str) -> bool {
+    composer_has_unknown_paste(screen)
+        || (looks_like_idle_followup(screen) && screen.contains(message))
+}
+
+fn keep_submit_landed(screen: &str, message: &str) -> bool {
+    match classify_screen(screen, "", false) {
+        AgentState::Working | AgentState::Asking | AgentState::Blocked => true,
+        AgentState::Idle | AgentState::Unknown => !keep_still_unsent(screen, message),
+    }
 }
 
 fn capture_on(host: &str, pane: &str) -> String {
@@ -1077,7 +1124,7 @@ fn deliver(host: &str, pane: &str, message: &[u8], submit: bool) -> Result<()> {
         );
     }
     if submit {
-        let sent = tmux_on(host, &["send-keys", "-t", pane, "Enter"])?;
+        let sent = tmux_on(host, &["send-keys", "-t", pane, "C-m", "C-m"])?;
         if !sent.status.success() {
             bail!(
                 "tmux send-keys failed: {}",
@@ -2276,7 +2323,11 @@ fn grouped_agents<'a>(agents: &'a [LiveAgent]) -> Vec<AgentGroup<'a>> {
 }
 
 fn host_rank(host: &str) -> u8 {
-    if host == "local" { 0 } else { 1 }
+    if host == "local" {
+        0
+    } else {
+        1
+    }
 }
 
 fn group_header(group: &AgentGroup<'_>, multi_host: bool, color: bool) -> String {
@@ -2773,6 +2824,34 @@ mod tests {
         );
         assert!(composer_has_unknown_paste("→ [Pasted text #236 +7 lines]"));
         assert!(!composer_has_unknown_paste("→ Add a follow-up"));
+        assert!(keep_composer_dirty(
+            "→ [Pasted text #236 +7 lines]",
+            "Continue from GOAL.md"
+        ));
+        assert!(keep_composer_dirty(
+            "→ Add a follow-up\nContinue from GOAL.md",
+            "Continue from GOAL.md"
+        ));
+        assert!(!keep_composer_dirty(
+            "→ Add a follow-up",
+            "Continue from GOAL.md"
+        ));
+        assert!(keep_still_unsent(
+            "→ Add a follow-up\nContinue from GOAL.md",
+            "Continue from GOAL.md"
+        ));
+        assert!(keep_submit_landed(
+            "Working...\nesc to interrupt",
+            "Continue from GOAL.md"
+        ));
+        assert!(keep_submit_landed(
+            "Which file should I edit?",
+            "Continue from GOAL.md"
+        ));
+        assert!(!keep_submit_landed(
+            "→ Add a follow-up\nContinue from GOAL.md",
+            "Continue from GOAL.md"
+        ));
     }
 
     #[test]
@@ -3071,12 +3150,10 @@ mod tests {
 
     #[test]
     fn attention_agent_reports_empty_and_idle_hosts_clearly() {
-        assert!(
-            attention_agent(&[])
-                .unwrap_err()
-                .to_string()
-                .contains("no live agents")
-        );
+        assert!(attention_agent(&[])
+            .unwrap_err()
+            .to_string()
+            .contains("no live agents"));
         let idle = live("omp", AgentState::Idle, "/workspace/demo");
         let working = live("pi", AgentState::Working, "/workspace/other");
         let err = attention_agent(&[idle, working]).unwrap_err().to_string();
@@ -3237,11 +3314,10 @@ mod tests {
             "{git:?}"
         );
         assert_eq!(git.untracked, 1);
-        assert!(
-            git.diff
-                .as_deref()
-                .is_some_and(|diff| diff.contains("README.md") && diff.contains("Untracked:"))
-        );
+        assert!(git
+            .diff
+            .as_deref()
+            .is_some_and(|diff| diff.contains("README.md") && diff.contains("Untracked:")));
     }
 
     #[test]
@@ -3441,7 +3517,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmux_dir = dir.path().join("tmux");
         fs::create_dir_all(&tmux_dir).unwrap();
-        let _lock = MEMORY_LOCK.lock().unwrap();
+        let _lock = super::TMUX_TEST_LOCK.lock().unwrap();
+        struct ClearTmuxTmp;
+        impl Drop for ClearTmuxTmp {
+            fn drop(&mut self) {
+                unsafe {
+                    env::remove_var("TMUX_TMPDIR");
+                }
+            }
+        }
+        let _clear = ClearTmuxTmp;
         unsafe {
             env::set_var("TMUX_TMPDIR", &tmux_dir);
             env::remove_var("TMUX");
@@ -3455,16 +3540,12 @@ mod tests {
                 .unwrap()
         };
         let _ = tmux(&["kill-server"]);
-        assert!(
-            tmux(&["new-session", "-d", "-s", "omlo-a", "-n", "w"])
-                .status
-                .success()
-        );
-        assert!(
-            tmux(&["new-session", "-d", "-s", "pilo-b", "-n", "w"])
-                .status
-                .success()
-        );
+        assert!(tmux(&["new-session", "-d", "-s", "omlo-a", "-n", "w"])
+            .status
+            .success());
+        assert!(tmux(&["new-session", "-d", "-s", "pilo-b", "-n", "w"])
+            .status
+            .success());
         create_host_aggregator("local", &["omlo-a".into(), "pilo-b".into()]).unwrap();
         let listed = tmux(&["list-windows", "-t", "=local", "-F", "#W"]);
         let names = String::from_utf8_lossy(&listed.stdout);
@@ -3476,9 +3557,6 @@ mod tests {
         assert!(names.contains("omlo-a"), "{names}");
         assert!(names.contains("pilo-b"), "{names}");
         let _ = tmux(&["kill-server"]);
-        unsafe {
-            env::remove_var("TMUX_TMPDIR");
-        }
     }
 
     static MEMORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
