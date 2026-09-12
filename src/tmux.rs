@@ -235,7 +235,7 @@ mod platform {
         request.window = Some(os(&windows[0].name));
         let environment = RunEnvironment {
             inside_tmux: inside_requested_tmux(&request),
-            executable: env::current_exe().context("locating al for tmux child")?,
+            executable: tmux_child_executable()?,
             shell: login_shell(),
             startup_timeout: startup_timeout()?,
             process_id: std::process::id(),
@@ -309,7 +309,7 @@ mod platform {
 
         let environment = RunEnvironment {
             inside_tmux: inside_requested_tmux(request),
-            executable: env::current_exe().context("locating al for tmux child")?,
+            executable: tmux_child_executable()?,
             shell: login_shell(),
             startup_timeout: startup_timeout()?,
             process_id: std::process::id(),
@@ -371,6 +371,42 @@ mod platform {
         shell: OsString,
         startup_timeout: Duration,
         process_id: u32,
+    }
+
+    fn tmux_child_executable() -> Result<PathBuf> {
+        let resolved = env::current_exe().context("locating al for tmux child")?;
+        if let Some(argv0) = env::args_os().next() {
+            let invoked = PathBuf::from(argv0);
+            if invoked.file_name() == Some(OsStr::new("al")) && invoked.exists() {
+                return Ok(invoked);
+            }
+        }
+        let installer =
+            env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent-loader/bin/al"));
+        Ok(prefer_installer_al(&resolved, installer.as_deref()))
+    }
+
+    fn prefer_installer_al(resolved: &Path, installer_al: Option<&Path>) -> PathBuf {
+        let Some(name) = resolved.file_name() else {
+            return resolved.to_owned();
+        };
+        if !is_versioned_download_name(name) {
+            return resolved.to_owned();
+        }
+        let Some(link) = installer_al else {
+            return resolved.to_owned();
+        };
+        match (fs::canonicalize(link), fs::canonicalize(resolved)) {
+            (Ok(left), Ok(right)) if left == right => link.to_owned(),
+            _ => resolved.to_owned(),
+        }
+    }
+
+    fn is_versioned_download_name(name: &OsStr) -> bool {
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        name.starts_with("al-") && name.contains("-sha256-")
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1989,6 +2025,46 @@ mod platform {
             let command = spec("agent", &["arg"]);
             let request = exact_request("agents", &command, None).unwrap();
             assert_eq!(request.cwd, env::current_dir().expect("current directory"));
+        }
+
+        #[test]
+        fn launcher_tmux_does_not_set_window_name() {
+            let request = request(&["--no-attach", "-s", "agentlo-sample", "--", "agent"]);
+            assert!(request.window.is_none());
+            let mut recorder = Recorder::default();
+            assert_eq!(
+                run_with(&request, &environment(false), &mut recorder).unwrap(),
+                0
+            );
+            let created = recorder
+                .tmux_records()
+                .map(|args| recorder.tmux_command(args).to_vec())
+                .find(|command| command.first() == Some(&os("new-session")))
+                .expect("new-session");
+            assert!(option_after(&created, "-n").is_none());
+            assert_eq!(
+                option_after(&created, "-s").as_deref(),
+                Some(OsStr::new("agentlo-sample"))
+            );
+        }
+
+        #[test]
+        fn prefer_installer_al_uses_bin_symlink_for_versioned_download() {
+            let root = tempfile::tempdir().unwrap();
+            let downloads = root.path().join("downloads");
+            let bin = root.path().join("bin");
+            fs::create_dir_all(&downloads).unwrap();
+            fs::create_dir_all(&bin).unwrap();
+            let versioned = downloads.join("al-0.7.0-linux-x86_64-sha256-deadbeef");
+            fs::write(&versioned, b"al").unwrap();
+            let link = bin.join("al");
+            std::os::unix::fs::symlink(&versioned, &link).unwrap();
+            assert_eq!(prefer_installer_al(&versioned, Some(&link)), link);
+            assert_eq!(prefer_installer_al(&versioned, None), versioned);
+            assert_eq!(
+                prefer_installer_al(Path::new("/tmp/target/debug/al"), Some(&link)),
+                PathBuf::from("/tmp/target/debug/al")
+            );
         }
 
         #[test]

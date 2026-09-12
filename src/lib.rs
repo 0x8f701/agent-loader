@@ -27,6 +27,8 @@ pub(crate) mod new;
 #[cfg(feature = "cli")]
 pub(crate) mod picker;
 #[cfg(feature = "cli")]
+pub(crate) mod remote;
+#[cfg(feature = "cli")]
 pub(crate) mod sync;
 #[cfg(feature = "cli")]
 pub(crate) mod tmux;

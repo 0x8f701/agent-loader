@@ -31,6 +31,7 @@ pub struct TreeNode<'a> {
     pub summary: Option<&'a str>,
     pub short_summary: Option<&'a str>,
     pub first_kept_entry_id: Option<&'a str>,
+    pub retained_tail: Option<&'a Value>,
 }
 
 /// Resolve the active branch as an ordered slice of nodes, root → leaf.
@@ -90,6 +91,32 @@ pub fn project_native_messages<'a>(path: &[&'a TreeNode<'a>]) -> Vec<Message> {
     else {
         return project_messages(path);
     };
+    if let Some(tail) = compaction
+        .retained_tail
+        .and_then(Value::as_array)
+        .filter(|tail| !tail.is_empty())
+    {
+        let mut messages: Vec<Message> = tail
+            .iter()
+            .filter_map(|item| {
+                let object = item.as_object()?;
+                parsed_message(
+                    object.get("role").and_then(Value::as_str),
+                    object.get("content"),
+                    object.get("timestamp").and_then(|value| match value {
+                        Value::String(text) => Some(text.as_str()),
+                        _ => None,
+                    }),
+                )
+            })
+            .collect();
+        messages.extend(
+            path[index + 1..]
+                .iter()
+                .filter_map(|node| parsed_message(node.role, node.content, node.timestamp)),
+        );
+        return messages;
+    }
     let start = compaction
         .first_kept_entry_id
         .and_then(|id| path[..index].iter().position(|node| node.id == id))
@@ -124,6 +151,7 @@ mod tests {
             summary: None,
             short_summary: None,
             first_kept_entry_id: None,
+            retained_tail: None,
         }
     }
 
@@ -324,6 +352,36 @@ mod tests {
                 .map(|message| message.text.as_str())
                 .collect::<Vec<_>>(),
             ["kept", "done"]
+        );
+    }
+
+    #[test]
+    fn native_projection_replays_retained_tail() {
+        let old = json!("old");
+        let final_answer = json!([{"type": "text", "text": "done"}]);
+        let tail = json!([{"role":"assistant","content":[{"type":"text","text":"kept tail"}]}]);
+        let mut nodes = [
+            node("u0", None, Some("user"), Some(&old), Some("t0")),
+            node("c1", Some("u0"), None, None, Some("t2")),
+            node(
+                "a2",
+                Some("c1"),
+                Some("assistant"),
+                Some(&final_answer),
+                Some("t3"),
+            ),
+        ];
+        nodes[1].entry_type = Some("compaction");
+        nodes[1].first_kept_entry_id = Some("u0");
+        nodes[1].retained_tail = Some(&tail);
+        let path = active_path(&nodes);
+        let messages = project_native_messages(&path);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            ["kept tail", "done"]
         );
     }
 

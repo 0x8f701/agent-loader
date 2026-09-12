@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 use crate::launcher::{CommandSpec, LauncherKind};
 
@@ -204,18 +204,9 @@ fn apply_local(spec: &NewProject) -> Result<PathBuf> {
 fn apply_remote(spec: &NewProject, host: &str) -> Result<PathBuf> {
     let destination = project_destination(spec, true)?;
     let script = remote_script(spec)?;
-    let status = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ConnectionAttempts=1",
-            "--",
-            host,
-        ])
-        .arg(format!("fish -c {}", posix_quote(&script)))
-        .status()
-        .context("could not run ssh")?;
+    let status =
+        crate::remote::status(host, &[&format!("fish -c {}", posix_quote(&script))], false)
+            .context("could not reach remote host")?;
     if !status.success() {
         bail!(
             "failed to apply project on host {host:?} (exit {})",
@@ -329,7 +320,11 @@ fn git_destination(spec: &NewProject, remote: bool) -> Result<PathBuf> {
 }
 
 fn git_clone_folder_name(name: &str) -> &str {
-    if name == "wt" { "worktree" } else { name }
+    if name == "wt" {
+        "worktree"
+    } else {
+        name
+    }
 }
 
 fn ensure_local_clone(url: &str, dest: &Path) -> Result<()> {
@@ -528,19 +523,8 @@ fn open_remote(
     let remote_al = push_self(host)?;
     let inner = remote_open_inner(spec, &dest, &remote_al);
     let remote = format!("fish -lic {}", posix_quote(&inner));
-    let status = Command::new("ssh")
-        .args([
-            "-tt",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ConnectionAttempts=1",
-            "--",
-            host,
-        ])
-        .arg(remote)
-        .status()
-        .context("could not run ssh")?;
+    let status =
+        crate::remote::status(host, &[&remote], true).context("could not reach remote host")?;
     if status.success() {
         Ok(())
     } else {
@@ -602,18 +586,12 @@ fn push_self(host: &str) -> Result<String> {
             status.code().unwrap_or(1)
         );
     }
-    let chmod = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ConnectionAttempts=1",
-            "--",
-            host,
-        ])
-        .arg(format!("chmod 755 {}", posix_quote(&remote)))
-        .status()
-        .context("could not chmod remote al")?;
+    let chmod = crate::remote::status(
+        host,
+        &[&format!("chmod 755 {}", posix_quote(&remote))],
+        false,
+    )
+    .context("could not chmod remote al")?;
     if !chmod.success() {
         bail!(
             "failed to chmod al on host {host:?} (exit {})",
@@ -624,17 +602,11 @@ fn push_self(host: &str) -> Result<String> {
 }
 
 fn remote_self_matches(host: &str, remote: &str) -> bool {
-    let output = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ConnectionAttempts=1",
-            "--",
-            host,
-        ])
-        .arg(format!("{} --version", posix_quote(remote)))
-        .output();
+    let output = crate::remote::output(
+        host,
+        &[&format!("{} --version", posix_quote(remote))],
+        false,
+    );
     match output {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION"))
@@ -906,8 +878,14 @@ fn tmux_target(session: &str, window: &str) -> String {
     format!("={session}:{window}")
 }
 
+fn tmux_cmd() -> Command {
+    let mut command = Command::new("tmux");
+    command.env_remove("TMUX");
+    command
+}
+
 fn tmux_session_exists(session: &str) -> bool {
-    Command::new("tmux")
+    tmux_cmd()
         .args(["has-session", "-t", &format!("={session}")])
         .output()
         .map(|output| output.status.success())
@@ -916,7 +894,7 @@ fn tmux_session_exists(session: &str) -> bool {
 
 fn tmux_send_literal(session: &str, window: &str, text: &str) -> Result<()> {
     let target = tmux_target(session, window);
-    let status = Command::new("tmux")
+    let status = tmux_cmd()
         .args(["send-keys", "-t", &target, "-l", "--", text])
         .status()
         .context("could not run tmux send-keys")?;
@@ -932,7 +910,7 @@ fn tmux_send_literal(session: &str, window: &str, text: &str) -> Result<()> {
 
 fn tmux_send_submit(session: &str, window: &str) -> Result<()> {
     let target = tmux_target(session, window);
-    let status = Command::new("tmux")
+    let status = tmux_cmd()
         .args(["send-keys", "-t", &target, "C-m"])
         .status()
         .context("could not run tmux send-keys")?;
@@ -948,7 +926,7 @@ fn tmux_send_submit(session: &str, window: &str) -> Result<()> {
 
 fn tmux_capture(session: &str, window: &str) -> Result<String> {
     let target = tmux_target(session, window);
-    let output = Command::new("tmux")
+    let output = tmux_cmd()
         .args(["capture-pane", "-p", "-t", &target])
         .output()
         .context("could not run tmux capture-pane")?;
@@ -1199,8 +1177,13 @@ fn print_plan(spec: &NewProject) -> Result<()> {
     }
     if let Some(host) = spec.host.as_deref() {
         println!(
-            "bootstrap\tssh -- {host} fish -c {}",
-            posix_quote(&remote_script(spec)?)
+            "bootstrap\t{}",
+            crate::remote::argv_preview(
+                host,
+                &[&format!("fish -c {}", posix_quote(&remote_script(spec)?))],
+                false
+            )
+            .join(" ")
         );
     } else if spec.gits.is_empty() {
         println!("bootstrap\tcreate-or-update GOAL.md && commit");
@@ -1746,10 +1729,11 @@ mod tests {
         ))
         .unwrap();
         let session = session_name(&dest);
+        let _lock = crate::live::TMUX_TEST_LOCK.lock().unwrap();
         let _guard = TmuxSessionGuard {
             session: session.clone(),
         };
-        let status = Command::new("tmux")
+        let status = tmux_cmd()
             .args(["new-session", "-d", "-s", &session, "sleep", "30"])
             .status()
             .unwrap();
@@ -1780,10 +1764,11 @@ mod tests {
                 .as_nanos()
         );
         let window = "grolo-sample";
+        let _lock = crate::live::TMUX_TEST_LOCK.lock().unwrap();
         let _guard = TmuxSessionGuard {
             session: id.clone(),
         };
-        let status = Command::new("tmux")
+        let status = tmux_cmd()
             .args([
                 "new-session",
                 "-d",
@@ -1798,7 +1783,15 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "tmux new-session failed");
-        assert!(tmux_session_exists(&id));
+        let mut exists = false;
+        for _ in 0..20 {
+            exists = tmux_session_exists(&id);
+            if exists {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(exists, "tmux session {id} did not appear");
         assert!(
             !tmux_session_exists("altest-goal"),
             "prefix must not match {id}"
@@ -1828,7 +1821,7 @@ mod tests {
     #[cfg(unix)]
     impl Drop for TmuxSessionGuard {
         fn drop(&mut self) {
-            let _ = Command::new("tmux")
+            let _ = tmux_cmd()
                 .args(["kill-session", "-t", &self.session])
                 .status();
         }

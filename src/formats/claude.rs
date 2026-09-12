@@ -2,7 +2,7 @@
 //!
 //! Claude stores a session as an append-only JSONL graph at
 //! `~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl`. This adapter
-//! follows the native 2.1.226 loader's active-leaf, compaction, parent recovery,
+//! follows the native 2.1.263 loader's active-leaf, compaction, parent recovery,
 //! and parallel-response rules before projecting the intentionally lossy
 //! user/assistant text contract.
 

@@ -1,10 +1,10 @@
 //! OpenAI Codex (`codex-rs`) rollout JSONL adapter.
 //!
-//! Source baseline: `openai/codex` commit `35aaa5d9` (2026-05-01). Each rollout
-//! file is a JSONL of `RolloutLine` records: a top-level `timestamp` plus a
-//! flattened `RolloutItem` tagged as `{"type": ..., "payload": ...}`. The five
-//! on-disk item kinds are `session_meta`, `response_item`, `compacted`,
-//! `turn_context`, and `event_msg` (`protocol/src/protocol.rs:2775-2781`).
+//! Source baseline: Codex CLI 0.153.4. Each rollout file is a JSONL of
+//! `RolloutLine` records: a top-level `timestamp` plus a flattened
+//! `RolloutItem` tagged as `{"type": ..., "payload": ...}`. Known kinds include
+//! `session_meta`, `response_item`, `compacted`, `turn_context`, and
+//! `event_msg`. Newer kinds such as `world_state` degrade to opaque unknowns.
 //!
 //! The adapter is intentionally **forward-compatible**: known item kinds and
 //! the few event/response sub-variants it cares about are strongly typed, while
@@ -198,7 +198,9 @@ pub fn parse(path: &Path) -> Result<Session> {
             }
             CodexItem::ResponseMessage(record) => {
                 if let Some(message) = project_message(&record, timestamp.as_deref()) {
-                    messages.push(message);
+                    if !duplicate_assistant_text(&messages, &message) {
+                        messages.push(message);
+                    }
                 }
             }
             CodexItem::FunctionCall {
@@ -333,12 +335,7 @@ fn classify_line(record: Value) -> CodexItem {
         Some("response_item") => classify_response_item(payload, type_tag, record),
         Some("event_msg") => classify_event_msg(payload, type_tag, record),
         Some("compacted") => CodexItem::Compacted {
-            text: ["message", "summary", "text"]
-                .into_iter()
-                .find_map(|key| payload.get(key).and_then(Value::as_str))
-                .filter(|text| !text.is_empty())
-                .unwrap_or("")
-                .to_owned(),
+            text: compacted_text(&payload),
         },
         _ => CodexItem::Unknown {
             type_tag,
@@ -372,7 +369,27 @@ fn classify_response_item(payload: Value, type_tag: Option<String>, record: Valu
                 .unwrap_or("")
                 .to_owned(),
             arguments: crate::formats::object_or_json(
-                payload.get("arguments").cloned().unwrap_or(Value::Null),
+                payload
+                    .get("arguments")
+                    .or_else(|| payload.get("input"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+        },
+        Some("web_search_call") => CodexItem::FunctionCall {
+            call_id: payload
+                .get("id")
+                .or_else(|| payload.get("call_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            name: "web_search".to_owned(),
+            arguments: crate::formats::object_or_json(
+                payload
+                    .get("action")
+                    .or_else(|| payload.get("query"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
             ),
         },
         Some("function_call_output" | "custom_tool_call_output") => CodexItem::FunctionCallOutput {
@@ -417,6 +434,28 @@ fn classify_event_msg(payload: Value, type_tag: Option<String>, record: Value) -
                     raw: record,
                 })
         }
+        Some("agent_message" | "agent_reasoning") => {
+            let text = payload
+                .get("message")
+                .or_else(|| payload.get("text"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            match (inner_type.as_deref(), text) {
+                (Some("agent_reasoning"), Some(text)) => CodexItem::Reasoning { text },
+                (Some("agent_message"), Some(text)) => {
+                    CodexItem::ResponseMessage(CodexResponseMessage {
+                        role: "assistant".to_owned(),
+                        content: Value::String(text),
+                        extra: Map::new(),
+                    })
+                }
+                _ => CodexItem::Unknown {
+                    type_tag,
+                    raw: record,
+                },
+            }
+        }
         _ => CodexItem::Unknown {
             type_tag,
             raw: record,
@@ -426,9 +465,52 @@ fn classify_event_msg(payload: Value, type_tag: Option<String>, record: Value) -
 
 /// Project a typed response-item message into the lossy `Message` contract via
 /// the shared first-text helper. Non-user/assistant roles and content without a
-/// text block yield `None`.
+/// text block yield `None`. Developer instructions become a note.
 fn project_message(record: &CodexResponseMessage, timestamp: Option<&str>) -> Option<Message> {
+    if record.role == "developer" {
+        let text = crate::domain::joined_text(&content_parts(&record.content));
+        if text.is_empty() {
+            return None;
+        }
+        return Some(Message::from_parts(
+            Role::Assistant,
+            vec![ContentPart::Note {
+                kind: "developer".to_owned(),
+                text,
+            }],
+            timestamp.map(str::to_owned),
+        ));
+    }
     parsed_message(Some(&record.role), Some(&record.content), timestamp)
+}
+
+fn duplicate_assistant_text(messages: &[Message], incoming: &Message) -> bool {
+    incoming.role == Role::Assistant
+        && !incoming.text.is_empty()
+        && messages.last().is_some_and(|previous| {
+            previous.role == Role::Assistant && previous.text == incoming.text
+        })
+}
+
+fn compacted_text(payload: &Value) -> String {
+    if let Some(text) = ["message", "summary", "text"]
+        .into_iter()
+        .find_map(|key| payload.get(key).and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+    {
+        return text.to_owned();
+    }
+    payload
+        .get("replacement_history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|item| {
+            first_text_from_content(item.get("content").unwrap_or(item))
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
 }
 
 fn apply_codex_hints(hints: &mut crate::domain::SessionHints, extra: &Map<String, Value>) {
@@ -856,6 +938,60 @@ mod tests {
             top,
             CodexItem::Unknown { type_tag, .. } if type_tag.as_deref() == Some("brand_new")
         ));
+    }
+
+    #[test]
+    fn custom_tool_call_reads_input_and_web_search_is_a_tool() {
+        let patch = r#"{"timestamp":"2026-07-29T06:04:40.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-1","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}"#;
+        let search = r#"{"timestamp":"2026-07-29T06:04:41.000Z","type":"response_item","payload":{"type":"web_search_call","id":"ws_1","action":{"type":"search","query":"capybaras"}}}"#;
+        let file = session_file(&[META, patch, search]);
+        let session = parse(file.path()).expect("parse");
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolUse { name, input, .. }
+                        if name == "apply_patch"
+                            && input.as_str() == Some("*** Begin Patch\n*** End Patch\n")
+                )
+            })
+        }));
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolUse { name, input, .. }
+                        if name == "web_search"
+                            && input.get("query").and_then(Value::as_str) == Some("capybaras")
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn agent_message_event_fills_missing_assistant_text() {
+        let event = r#"{"timestamp":"2026-07-29T06:04:39.000Z","type":"event_msg","payload":{"type":"agent_message","message":"checking the driver"}}"#;
+        let duplicate = r#"{"timestamp":"2026-07-29T06:04:39.100Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking the driver"}]}}"#;
+        let file = session_file(&[META, event, duplicate]);
+        let session = parse(file.path()).expect("parse");
+        let assistant: Vec<&str> = session
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(assistant, ["checking the driver"]);
+    }
+
+    #[test]
+    fn compacted_replacement_history_is_used_when_message_is_empty() {
+        let compacted = r#"{"timestamp":"2026-07-29T06:04:37.500Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"prior context"}]}]}}"#;
+        let file = session_file(&[META, compacted, USER_RESPONSE]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(
+            session.hints.compaction_summary.as_deref(),
+            Some("prior context")
+        );
     }
 
     #[test]

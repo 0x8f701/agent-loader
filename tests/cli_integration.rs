@@ -90,7 +90,8 @@ fn run_with_env(home: &Path, args: &[&str], variables: &[(&str, &OsStr)]) -> Out
         .env_remove("SESSIONS_HOME")
         .env_remove("GROK_HOME")
         .env_remove("NO_COLOR")
-        .env_remove("AL_PROJECTS_HOME");
+        .env_remove("AL_PROJECTS_HOME")
+        .env_remove("TMUX");
     for (name, value) in variables {
         command.env(name, value);
     }
@@ -118,19 +119,29 @@ fn write_fake_tool(bin: &Path, name: &str, script: &str) {
 
 #[cfg(unix)]
 fn write_ssh_stub(bin: &Path) -> PathBuf {
+    write_remote_stub(bin, "mosh")
+}
+
+#[cfg(unix)]
+fn write_remote_stub(bin: &Path, name: &str) -> PathBuf {
     let invocations = bin
         .parent()
         .expect("stub bin parent")
         .join("ssh-invocations");
     write_fake_tool(
         bin,
-        "ssh",
+        name,
         r#"#!/bin/sh
 printf '%s\n' "$#" >> "$SSH_INVOCATIONS"
+host=""
+prev=""
 for argument in "$@"; do
   printf '<%s>\n' "$argument" >> "$SSH_INVOCATIONS"
+  if [ "$prev" = "--" ] && [ -z "$host" ]; then
+    host=$argument
+  fi
+  prev=$argument
 done
-host=$6
 case "$host" in
   host-a) printf 'remote-a\n' ;;
   host-b) printf 'remote-b\n' ;;
@@ -484,6 +495,7 @@ fn explicit_session_hosts_preserve_order_local_and_forward_only_list_flags() {
         &[
             ("PATH", path.as_os_str()),
             ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("AL_REMOTE", OsStr::new("mosh")),
         ],
     );
     assert!(
@@ -497,7 +509,7 @@ fn explicit_session_hosts_preserve_order_local_and_forward_only_list_flags() {
     );
     assert_eq!(
         fs::read_to_string(invocations).unwrap(),
-        "7\n<-o>\n<ConnectTimeout=10>\n<-o>\n<ConnectionAttempts=1>\n<-->\n<host-a>\n<exec 'al' 'sessions' 'list' '4' '--all' '--dedupe'>\n7\n<-o>\n<ConnectTimeout=10>\n<-o>\n<ConnectionAttempts=1>\n<-->\n<host-b>\n<exec 'al' 'sessions' 'list' '4' '--all' '--dedupe'>\n"
+        "3\n<-->\n<host-a>\n<exec 'al' 'sessions' 'list' '4' '--all' '--dedupe'>\n3\n<-->\n<host-b>\n<exec 'al' 'sessions' 'list' '4' '--all' '--dedupe'>\n"
     );
 }
 
@@ -516,6 +528,7 @@ fn session_host_metacharacters_are_one_literal_ssh_argument() {
         &[
             ("PATH", path.as_os_str()),
             ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("AL_REMOTE", OsStr::new("mosh")),
         ],
     );
     assert!(output.status.success());
@@ -525,7 +538,7 @@ fn session_host_metacharacters_are_one_literal_ssh_argument() {
     );
     assert_eq!(
         fs::read_to_string(invocations).unwrap(),
-        "7\n<-o>\n<ConnectTimeout=10>\n<-o>\n<ConnectionAttempts=1>\n<-->\n<host-a;printf-injected>\n<exec 'al' 'sessions' 'list'>\n"
+        "3\n<-->\n<host-a;printf-injected>\n<exec 'al' 'sessions' 'list'>\n"
     );
 }
 
@@ -543,6 +556,7 @@ fn session_hosts_continue_after_failure_return_one_and_hide_remote_stderr() {
         &[
             ("PATH", path.as_os_str()),
             ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("AL_REMOTE", OsStr::new("mosh")),
         ],
     );
     assert_eq!(output.status.code(), Some(1));
@@ -552,13 +566,11 @@ fn session_hosts_continue_after_failure_return_one_and_hide_remote_stderr() {
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("host-c"));
-    assert!(stderr.contains("ssh exited with exit status: 23"));
+    assert!(stderr.contains("mosh exited with exit status: 23"));
     assert!(!stderr.contains("private session body"));
-    assert!(
-        fs::read_to_string(invocations)
-            .unwrap()
-            .contains("<host-b>")
-    );
+    assert!(fs::read_to_string(invocations)
+        .unwrap()
+        .contains("<host-b>"));
 }
 
 #[cfg(unix)]
@@ -585,6 +597,183 @@ fn session_host_forbidden_combinations_fail_before_ssh() {
         }
     }
     assert!(!invocations.exists(), "ssh must not run on parser errors");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_host_can_force_ssh_instead_of_mosh() {
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let invocations = write_remote_stub(&bin, "ssh");
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "list", "--host", "host-a"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("AL_REMOTE", OsStr::new("ssh")),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "ssh host list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "== host-a ==\nremote-a\n"
+    );
+    let logged = fs::read_to_string(invocations).unwrap();
+    assert!(logged.contains("<host-a>"), "{logged}");
+    assert!(logged.contains("<-o>"), "{logged}");
+    assert!(logged.contains("<ConnectTimeout=10>"), "{logged}");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_host_forced_mosh_does_not_fall_back_to_ssh() {
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let invocations = write_remote_stub(&bin, "ssh");
+    let path = std::env::join_paths([bin.as_path()]).unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "list", "--host", "host-a"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("AL_REMOTE", OsStr::new("mosh")),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "forced mosh must not silently use ssh"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("mosh"), "{stderr}");
+    assert!(
+        !invocations.exists()
+            || !fs::read_to_string(&invocations)
+                .unwrap()
+                .contains("<host-a>"),
+        "ssh stub must not run when AL_REMOTE=mosh"
+    );
+}
+
+#[cfg(unix)]
+fn write_ssh_probe_stub(bin: &Path) -> PathBuf {
+    let invocations = bin
+        .parent()
+        .expect("stub bin parent")
+        .join("ssh-invocations");
+    write_fake_tool(
+        bin,
+        "ssh",
+        r#"#!/bin/sh
+printf '%s\n' "$#" >> "$SSH_INVOCATIONS"
+host=""
+prev=""
+probe=0
+for argument in "$@"; do
+  printf '<%s>\n' "$argument" >> "$SSH_INVOCATIONS"
+  if [ "$prev" = "--" ] && [ -z "$host" ]; then
+    host=$argument
+  fi
+  if [ "$argument" = "mosh-server" ]; then
+    probe=1
+  fi
+  prev=$argument
+done
+if [ "$probe" = 1 ]; then
+  exit "${MOSH_SERVER_STATUS:-1}"
+fi
+case "$host" in
+  host-a) printf 'remote-a\n' ;;
+  *) printf 'literal:%s\n' "$host" ;;
+esac
+"#,
+    );
+    invocations
+}
+
+#[cfg(unix)]
+#[test]
+fn session_host_uses_mosh_when_remote_has_mosh_server() {
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let invocations = write_ssh_probe_stub(&bin);
+    write_remote_stub(&bin, "mosh");
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "list", "--host", "host-a"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("MOSH_SERVER_STATUS", OsStr::new("0")),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "mosh host list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "== host-a ==\nremote-a\n"
+    );
+    let logged = fs::read_to_string(&invocations).unwrap();
+    assert!(logged.contains("<BatchMode=yes>"), "{logged}");
+    assert!(logged.contains("<mosh-server>"), "{logged}");
+    assert!(
+        logged.contains("3\n<-->\n<host-a>\n<exec 'al' 'sessions' 'list'>\n"),
+        "{logged}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_host_uses_ssh_when_remote_has_no_mosh_server() {
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let invocations = write_ssh_probe_stub(&bin);
+    write_fake_tool(
+        &bin,
+        "mosh",
+        r#"#!/bin/sh
+printf 'mosh-should-not-run\n' >> "$SSH_INVOCATIONS"
+exit 99
+"#,
+    );
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let output = run_with_env(
+        home.path(),
+        &["sessions", "list", "--host", "host-a"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("SSH_INVOCATIONS", invocations.as_os_str()),
+            ("MOSH_SERVER_STATUS", OsStr::new("1")),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "ssh fallback list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "== host-a ==\nremote-a\n"
+    );
+    let logged = fs::read_to_string(&invocations).unwrap();
+    assert!(logged.contains("<mosh-server>"), "{logged}");
+    assert!(logged.contains("<-o>"), "{logged}");
+    assert!(logged.contains("<ConnectTimeout=10>"), "{logged}");
+    assert!(logged.contains("<exec 'al' 'sessions' 'list'>"), "{logged}");
+    assert!(!logged.contains("mosh-should-not-run"), "{logged}");
 }
 
 #[test]
@@ -748,11 +937,9 @@ fn legacy_omp_open_and_fork_launch_new_native_copies_without_touching_source() {
         assert!(launched_path.is_file());
         assert_ne!(first_json_id(&launched_path, "/id"), original_id);
         assert_eq!(fs::read(&source).unwrap(), before);
-        assert!(
-            String::from_utf8(before)
-                .unwrap()
-                .contains("keep-on-original")
-        );
+        assert!(String::from_utf8(before)
+            .unwrap()
+            .contains("keep-on-original"));
     }
 }
 
@@ -800,11 +987,9 @@ esac
     assert_ne!(outputs[0], source);
     assert_eq!(first_json_id(&outputs[0], "/payload/id"), launched_id);
     assert_eq!(fs::read(&source).unwrap(), before);
-    assert!(
-        String::from_utf8(before)
-            .unwrap()
-            .contains("keep-on-original")
-    );
+    assert!(String::from_utf8(before)
+        .unwrap()
+        .contains("keep-on-original"));
 }
 
 #[cfg(unix)]
@@ -1941,23 +2126,30 @@ fn new_project_sends_native_goal_via_tmux() {
 fn scopeguard_kill(session: &str) -> TmuxKillOnDrop {
     TmuxKillOnDrop {
         session: session.to_owned(),
+        tmpdir: None,
     }
 }
 
 #[cfg(unix)]
 struct TmuxKillOnDrop {
     session: String,
+    tmpdir: Option<PathBuf>,
 }
 
 #[cfg(unix)]
 impl Drop for TmuxKillOnDrop {
     fn drop(&mut self) {
-        kill_tmux_session(&self.session);
+        let mut command = Command::new("tmux");
+        command.args(["kill-session", "-t", &self.session]);
+        if let Some(tmpdir) = &self.tmpdir {
+            command.env("TMUX_TMPDIR", tmpdir).env_remove("TMUX");
+        }
+        let _ = command.status();
     }
 }
 
 #[test]
-fn live_list_is_not_the_session_catalog_and_emits_json_rows() {
+fn live_list_attach_watch_and_supervise_surface() {
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     let help = run(home.path(), &["list", "--help"]);
@@ -1972,8 +2164,34 @@ fn live_list_is_not_the_session_catalog_and_emits_json_rows() {
         "list help should distinguish live panes from the catalog: {help_text}"
     );
     assert!(
-        help_text.contains("--fzf"),
-        "list help should mention fzf attach: {help_text}"
+        !help_text.contains("--fzf"),
+        "list help should not mention fzf after the move to attach: {help_text}"
+    );
+
+    let attach_help = run(home.path(), &["attach", "--help"]);
+    assert!(
+        attach_help.status.success(),
+        "attach --help failed: {}",
+        String::from_utf8_lossy(&attach_help.stderr)
+    );
+    let attach_text = String::from_utf8_lossy(&attach_help.stdout);
+    assert!(
+        attach_text.contains("--target")
+            && attach_text.contains("fzf")
+            && attach_text.contains("--all"),
+        "{attach_text}"
+    );
+
+    let watch_help = run(home.path(), &["watch", "--help"]);
+    assert!(
+        watch_help.status.success(),
+        "watch --help failed: {}",
+        String::from_utf8_lossy(&watch_help.stderr)
+    );
+    let watch_text = String::from_utf8_lossy(&watch_help.stdout);
+    assert!(
+        watch_text.contains("Seconds between table refreshes") && watch_text.contains("--no-git"),
+        "{watch_text}"
     );
 
     let sessions = run(home.path(), &["sessions", "list", "--help"]);
@@ -2009,16 +2227,40 @@ fn live_list_is_not_the_session_catalog_and_emits_json_rows() {
         assert!(row.get("pane").and_then(Value::as_str).is_some());
     }
 
-    let watch_help = run(home.path(), &["supervise", "--help"]);
-    assert!(
-        watch_help.status.success(),
-        "supervise --help failed: {}",
-        String::from_utf8_lossy(&watch_help.stderr)
+    let plain = run_with_env(
+        home.path(),
+        &["list"],
+        &[("AL_LIVE_STATE_DIR", state.path().as_os_str())],
     );
-    let watch_text = String::from_utf8_lossy(&watch_help.stdout);
     assert!(
-        watch_text.contains("Seconds between table refreshes"),
-        "{watch_text}"
+        plain.status.success(),
+        "al list failed: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain_out = String::from_utf8_lossy(&plain.stdout);
+    if plain_out.trim().is_empty() {
+        panic!("al list should print a table or 'no live agents'");
+    }
+    assert!(
+        plain_out.contains("no live agents")
+            || plain_out.contains("asking")
+            || plain_out.contains("working")
+            || plain_out.contains("idle")
+            || plain_out.contains("blocked"),
+        "unexpected list output: {plain_out}"
+    );
+
+    let supervise_help = run(home.path(), &["supervise", "--help"]);
+    assert!(
+        supervise_help.status.success(),
+        "supervise --help failed: {}",
+        String::from_utf8_lossy(&supervise_help.stderr)
+    );
+    let supervise_text = String::from_utf8_lossy(&supervise_help.stdout);
+    assert!(
+        supervise_text.contains("Seconds between table refreshes")
+            && supervise_text.contains("[TARGET]"),
+        "{supervise_text}"
     );
     let send_help = run(home.path(), &["supervise", "send", "--help"]);
     assert!(
@@ -2031,4 +2273,280 @@ fn live_list_is_not_the_session_catalog_and_emits_json_rows() {
         !missing_message.status.success(),
         "supervise send without --message must fail"
     );
+
+    let attach_missing = run_with_env(
+        home.path(),
+        &["attach", "--target", "%999"],
+        &[("AL_LIVE_STATE_DIR", state.path().as_os_str())],
+    );
+    assert!(
+        !attach_missing.status.success(),
+        "attach --target with no matching pane must fail: {}",
+        String::from_utf8_lossy(&attach_missing.stderr)
+    );
+
+    let keep_needs_target = run(home.path(), &["supervise", "--message", "continue"]);
+    assert!(
+        !keep_needs_target.status.success(),
+        "supervise --message without TARGET must fail"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn supervise_keep_pins_target_when_another_agent_has_goal() {
+    if !tmux_available() {
+        eprintln!(
+            "skipping supervise_keep_pins_target_when_another_agent_has_goal: tmux not on PATH"
+        );
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let keep_session = format!("agentlo-keep-{}-{stamp}", std::process::id());
+    let goal_session = format!("omlo-goal-{}-{stamp}", std::process::id());
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let tmux_dir = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let agent_bin = bin.join("agent");
+    let omp_bin = bin.join("omp");
+    let receipt = home.path().join("keep-receipt");
+    write_fake_tool(
+        &bin,
+        "agent",
+        "#!/bin/sh\nprintf 'Ready\\n\\n→ Add a follow-up\\n'\nwhile IFS= read -r line; do\n  [ -n \"$line\" ] || continue\n  printf '%s\\n' \"$line\" >> \"$AL_KEEP_RECEIPT\"\n  case \"$line\" in\n    *KEEP-LOOP-TOKEN*) printf 'Working...\\nesc to interrupt\\n' ;;\n    *) printf '→ Add a follow-up\\n' ;;\n  esac\ndone\n",
+    );
+    write_fake_tool(
+        &bin,
+        "omp",
+        "#!/bin/sh\nprintf '/goal ship it\\nWhich file should I edit?\\n'\nwhile IFS= read -r line; do\n  :\ndone\n",
+    );
+    let mut path = bin.as_os_str().to_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let tmux_tmp = tmux_dir.path();
+    let _keep_guard = TmuxKillOnDrop {
+        session: keep_session.clone(),
+        tmpdir: Some(tmux_tmp.to_path_buf()),
+    };
+    let _goal_guard = TmuxKillOnDrop {
+        session: goal_session.clone(),
+        tmpdir: Some(tmux_tmp.to_path_buf()),
+    };
+    assert!(
+        Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &keep_session,
+                "-n",
+                &keep_session,
+                "--",
+                agent_bin.to_str().unwrap(),
+            ])
+            .env("PATH", &path)
+            .env("TMUX_TMPDIR", tmux_tmp)
+            .env("AL_KEEP_RECEIPT", &receipt)
+            .env_remove("TMUX")
+            .status()
+            .unwrap()
+            .success(),
+        "failed to start keep session"
+    );
+    assert!(
+        Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &goal_session,
+                "-n",
+                &goal_session,
+                "--",
+                omp_bin.to_str().unwrap(),
+            ])
+            .env("PATH", &path)
+            .env("TMUX_TMPDIR", tmux_tmp)
+            .env_remove("TMUX")
+            .status()
+            .unwrap()
+            .success(),
+        "failed to start goal session"
+    );
+    let listed_text = wait_for_live_table(
+        home.path(),
+        &path,
+        state.path(),
+        tmux_tmp,
+        &["agentlo-keep-", "omlo-goal-", "asking"],
+    );
+    assert!(
+        listed_text.contains("asking"),
+        "goal fixture must stay asking: {listed_text}"
+    );
+
+    let stolen = run_with_env(
+        home.path(),
+        &["supervise", "send", "--message", "STEAL-TOKEN"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("AL_LIVE_STATE_DIR", state.path().as_os_str()),
+            ("TMUX_TMPDIR", tmux_tmp.as_os_str()),
+        ],
+    );
+    assert!(
+        stolen.status.success(),
+        "untargeted send failed: {}",
+        String::from_utf8_lossy(&stolen.stderr)
+    );
+    let goal_after_steal = tmux_capture(&goal_session, tmux_tmp);
+    let keep_after_steal = tmux_capture(&keep_session, tmux_tmp);
+    assert!(
+        goal_after_steal.contains("STEAL-TOKEN"),
+        "untargeted send should hit asking goal pane: {goal_after_steal:?}"
+    );
+    assert!(
+        !keep_after_steal.contains("STEAL-TOKEN"),
+        "untargeted send must not hit idle keep pane: {keep_after_steal:?}"
+    );
+
+    let pinned = run_with_env(
+        home.path(),
+        &[
+            "supervise",
+            "send",
+            &keep_session,
+            "--message",
+            "PINNED-TOKEN",
+        ],
+        &[
+            ("PATH", path.as_os_str()),
+            ("AL_LIVE_STATE_DIR", state.path().as_os_str()),
+            ("TMUX_TMPDIR", tmux_tmp.as_os_str()),
+        ],
+    );
+    assert!(
+        pinned.status.success(),
+        "targeted send failed: {}",
+        String::from_utf8_lossy(&pinned.stderr)
+    );
+    let goal_after_pin = tmux_capture(&goal_session, tmux_tmp);
+    let keep_after_pin = tmux_capture(&keep_session, tmux_tmp);
+    assert!(
+        keep_after_pin.contains("PINNED-TOKEN"),
+        "targeted send should hit keep pane: {keep_after_pin:?}"
+    );
+    assert!(
+        !goal_after_pin.contains("PINNED-TOKEN"),
+        "targeted send must not hit goal pane: {goal_after_pin:?}"
+    );
+
+    let mut keep = Command::new(AL);
+    keep.args([
+        "supervise",
+        &keep_session,
+        "--message",
+        "KEEP-LOOP-TOKEN",
+        "--interval",
+        "1",
+    ])
+    .env("HOME", home.path())
+    .env("PATH", &path)
+    .env("AL_LIVE_STATE_DIR", state.path())
+    .env("TMUX_TMPDIR", tmux_tmp)
+    .env("AL_SUPERVISE_MAX_TICKS", "2")
+    .env_remove("TMUX")
+    .env_remove("SESSIONS_HOME")
+    .env_remove("GROK_HOME")
+    .env_remove("NO_COLOR")
+    .env_remove("AL_PROJECTS_HOME");
+    let status = keep.status().expect("run al supervise keep");
+    assert!(status.success(), "keep loop failed: {status}");
+    let received = wait_for_receipt(&receipt, "KEEP-LOOP-TOKEN");
+    let goal_after_keep = tmux_capture(&goal_session, tmux_tmp);
+    let keep_after_keep = tmux_capture(&keep_session, tmux_tmp);
+    assert!(
+        received.contains("KEEP-LOOP-TOKEN"),
+        "keep must submit so the agent process reads KEEP-LOOP-TOKEN, got {received:?} pane {keep_after_keep:?}"
+    );
+    assert!(
+        keep_after_keep.contains("KEEP-LOOP-TOKEN"),
+        "keep loop should nudge pinned pane: {keep_after_keep:?}"
+    );
+    assert!(
+        keep_after_keep.contains("Working...") || keep_after_keep.contains("esc to interrupt"),
+        "keep submit should leave the pane working: {keep_after_keep:?}"
+    );
+    assert!(
+        !goal_after_keep.contains("KEEP-LOOP-TOKEN"),
+        "keep loop must not send to the other agent with /goal: {goal_after_keep:?}"
+    );
+}
+
+#[cfg(unix)]
+fn wait_for_receipt(path: &Path, needle: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..20 {
+        last = fs::read_to_string(path).unwrap_or_default();
+        if last.contains(needle) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    last
+}
+
+#[cfg(unix)]
+fn wait_for_live_table(
+    home: &Path,
+    path: &OsStr,
+    state: &Path,
+    tmux_tmp: &Path,
+    needles: &[&str],
+) -> String {
+    let mut last = String::new();
+    for _ in 0..20 {
+        let listed = run_with_env(
+            home,
+            &["list"],
+            &[
+                ("PATH", path),
+                ("AL_LIVE_STATE_DIR", state.as_os_str()),
+                ("TMUX_TMPDIR", tmux_tmp.as_os_str()),
+            ],
+        );
+        last = String::from_utf8_lossy(&listed.stdout).into_owned();
+        if listed.status.success() && needles.iter().all(|needle| last.contains(needle)) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let panes = Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{session_name}\t#{pane_id}"])
+        .env("TMUX_TMPDIR", tmux_tmp)
+        .env_remove("TMUX")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    panic!("live table never showed {needles:?}: {last}\npanes:\n{panes}");
+}
+
+#[cfg(unix)]
+fn tmux_capture(session: &str, tmpdir: &Path) -> String {
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-p", "-J", "-t", session])
+        .env("TMUX_TMPDIR", tmpdir)
+        .env_remove("TMUX")
+        .output()
+        .expect("tmux capture");
+    assert!(
+        output.status.success(),
+        "tmux capture {session} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
