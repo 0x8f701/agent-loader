@@ -2,11 +2,11 @@
 //!
 //! `al list` prints a one-shot snapshot. `al attach` picks a pane with fzf
 //! (or a direct `--target`) and attaches. `al watch` refreshes the table in
-//! place across local and remote hosts. `al supervise` keeps send/diff and
-//! still accepts a bare watch for compatibility.
-//! Identification prefers the pane process tree, then `al` session/window
-//! names. State comes from the captured screen, not a hash-only idle timer
-//! and not an automatic reply.
+//! place across local and remote hosts. `al supervise TARGET` pins one pane
+//! and nudges it when idle; other agents (even with `/goal` started) are
+//! never sent to. Bare `al supervise` is still a watch. `send`/`diff` stay
+//! one-shot. Identification prefers the pane process tree, then `al`
+//! session/window names. State comes from the captured screen.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -251,6 +251,36 @@ pub struct SendOptions {
     pub submit: bool,
 }
 
+pub const DEFAULT_KEEP_MESSAGE: &str = "Continue from GOAL.md. Do not idle-wait.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeepOptions {
+    pub hosts: Vec<String>,
+    pub target: String,
+    pub message: String,
+    pub interval: u64,
+    pub max_ticks: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepAction {
+    Nudge,
+    SkipWorking,
+    SkipAsking,
+    SkipPicker,
+}
+
+impl KeepAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Nudge => "nudged",
+            Self::SkipWorking => "skip working",
+            Self::SkipAsking => "skip asking",
+            Self::SkipPicker => "skip picker",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffOptions {
     pub host: Option<String>,
@@ -361,6 +391,111 @@ pub fn run_send(options: &SendOptions) -> Result<()> {
         options.message.as_bytes(),
         options.submit,
     )
+}
+
+pub fn run_keep(options: &KeepOptions) -> Result<()> {
+    if options.target.trim().is_empty() {
+        bail!("al supervise keep requires TARGET");
+    }
+    if options.hosts.len() > 1 {
+        bail!(
+            "al supervise TARGET uses one --host (got {})",
+            options.hosts.len()
+        );
+    }
+    let interval = options.interval.max(1);
+    let mut ticks = 0u64;
+    loop {
+        keep_once(options)?;
+        ticks += 1;
+        if options.max_ticks.is_some_and(|max| ticks >= max) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+    }
+}
+
+fn keep_once(options: &KeepOptions) -> Result<()> {
+    let host = options
+        .hosts
+        .first()
+        .map(String::as_str)
+        .filter(|host| *host != "local")
+        .unwrap_or("local");
+    let agents = scan_host(host, GitMode::Off)?;
+    let agent = resolve_agent(&agents, Some(options.target.as_str()))?;
+    let screen = capture_on(host, &agent.pane);
+    let action = keep_action(agent.state, &screen);
+    println!(
+        "al supervise  keep {}  {} {}  {}",
+        options.target,
+        agent.pane,
+        agent.state.as_str(),
+        action.as_str()
+    );
+    if action != KeepAction::Nudge {
+        return Ok(());
+    }
+    if composer_has_unknown_paste(&screen) {
+        send_key(host, &agent.pane, "C-u")?;
+    }
+    deliver(host, &agent.pane, options.message.as_bytes(), true)?;
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let after = capture_on(host, &agent.pane);
+    if classify_screen(&after, "", false) == AgentState::Idle
+        && (after.contains(&options.message) || composer_has_unknown_paste(&after))
+    {
+        send_key(host, &agent.pane, "Enter")?;
+    }
+    Ok(())
+}
+
+fn keep_action(state: AgentState, screen: &str) -> KeepAction {
+    if is_picker(&last_nonempty(screen, STRUCT_LINES)) {
+        return KeepAction::SkipPicker;
+    }
+    match state {
+        AgentState::Working => KeepAction::SkipWorking,
+        AgentState::Asking => KeepAction::SkipAsking,
+        AgentState::Idle | AgentState::Blocked | AgentState::Unknown => KeepAction::Nudge,
+    }
+}
+
+fn composer_has_unknown_paste(text: &str) -> bool {
+    text.contains("[Pasted text")
+}
+
+fn capture_on(host: &str, pane: &str) -> String {
+    match tmux_on(
+        host,
+        &[
+            "capture-pane",
+            "-p",
+            "-J",
+            "-S",
+            "-30",
+            "-E",
+            "-",
+            "-t",
+            pane,
+        ],
+    ) {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        _ => String::new(),
+    }
+}
+
+fn send_key(host: &str, pane: &str, key: &str) -> Result<()> {
+    let sent = tmux_on(host, &["send-keys", "-t", pane, key])?;
+    if !sent.status.success() {
+        bail!(
+            "tmux send-keys {key} failed: {}",
+            String::from_utf8_lossy(&sent.stderr)
+        );
+    }
+    Ok(())
 }
 
 pub fn run_diff(options: &DiffOptions) -> Result<()> {
@@ -2612,6 +2747,32 @@ mod tests {
         cwds.insert(8, "/workspace/pane".to_owned());
         cwds.insert(9, "/workspace/agent-cwd".to_owned());
         assert_eq!(agent_cwd(&pane, &job, &cwds), "/workspace/agent-cwd");
+    }
+
+    #[test]
+    fn keep_action_nudges_idle_and_skips_working_asking_picker() {
+        assert_eq!(
+            keep_action(AgentState::Idle, "→ Add a follow-up"),
+            KeepAction::Nudge
+        );
+        assert_eq!(
+            keep_action(AgentState::Blocked, "FAILED no device"),
+            KeepAction::Nudge
+        );
+        assert_eq!(
+            keep_action(AgentState::Working, "ctrl+c to stop"),
+            KeepAction::SkipWorking
+        );
+        assert_eq!(
+            keep_action(AgentState::Asking, "Which file should I edit?"),
+            KeepAction::SkipAsking
+        );
+        assert_eq!(
+            keep_action(AgentState::Asking, "❯ accept\n❯ reject"),
+            KeepAction::SkipPicker
+        );
+        assert!(composer_has_unknown_paste("→ [Pasted text #236 +7 lines]"));
+        assert!(!composer_has_unknown_paste("→ Add a follow-up"));
     }
 
     #[test]

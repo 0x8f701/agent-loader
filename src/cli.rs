@@ -84,7 +84,7 @@ pub enum Command {
     Attach(AttachArgs),
     /// Refresh live tmux coding-agent panes across local and remote hosts.
     Watch(WatchArgs),
-    /// Send a message or print a diff for a live pane; bare form watches like `al watch`.
+    /// Keep one live pane running, or send/diff. Bare form without TARGET watches like `al watch`.
     Supervise(SuperviseCli),
     #[command(name = "tmux-run")]
     TmuxRun(RawTail),
@@ -266,6 +266,13 @@ pub struct WatchArgs {
 pub struct SuperviseCli {
     #[command(subcommand)]
     pub command: Option<SuperviseCommand>,
+    /// Pin keep-alive to this pane, session, unique agent, or cwd.
+    /// Other agents (even with `/goal` started) are never sent to.
+    #[arg(value_name = "TARGET")]
+    pub target: Option<String>,
+    /// Nudge text when the pinned TARGET is idle. Used only with TARGET.
+    #[arg(long)]
+    pub message: Option<String>,
     #[command(flatten)]
     pub watch: WatchArgs,
 }
@@ -1008,6 +1015,18 @@ fn dispatch_watch(args: WatchArgs, label: &str) -> anyhow::Result<()> {
 fn dispatch_supervise(args: SuperviseCli) -> anyhow::Result<()> {
     require_unix_live("supervise")?;
     match args.command {
+        None if args.target.is_some() => crate::live::run_keep(&crate::live::KeepOptions {
+            hosts: args.watch.hosts,
+            target: args.target.expect("keep target"),
+            message: args
+                .message
+                .unwrap_or_else(|| crate::live::DEFAULT_KEEP_MESSAGE.to_owned()),
+            interval: args.watch.interval,
+            max_ticks: None,
+        }),
+        None if args.message.is_some() => anyhow::bail!(
+            "al supervise --message requires TARGET (example: al supervise agentlo-demo --message TEXT)"
+        ),
         None => dispatch_watch(args.watch, "supervise"),
         Some(SuperviseCommand::Send(send)) => crate::live::run_send(&crate::live::SendOptions {
             host: send.host,
@@ -1147,9 +1166,32 @@ mod tests {
             panic!("expected supervise command");
         };
         assert!(supervise.command.is_none());
+        assert!(supervise.target.is_none());
+        assert!(supervise.message.is_none());
         assert_eq!(supervise.watch.interval, 4);
         assert_eq!(supervise.watch.hosts, ["host-b"]);
         assert!(!supervise.watch.no_git);
+
+        let keep = Cli::try_parse_from([
+            "al",
+            "supervise",
+            "agentlo-demo",
+            "--host",
+            "host-a",
+            "--interval",
+            "5",
+            "--message",
+            "continue",
+        ])
+        .unwrap();
+        let Some(Command::Supervise(keep)) = keep.command else {
+            panic!("expected supervise command");
+        };
+        assert!(keep.command.is_none());
+        assert_eq!(keep.target.as_deref(), Some("agentlo-demo"));
+        assert_eq!(keep.message.as_deref(), Some("continue"));
+        assert_eq!(keep.watch.hosts, ["host-a"]);
+        assert_eq!(keep.watch.interval, 5);
 
         let send = Cli::try_parse_from([
             "al",

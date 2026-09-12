@@ -90,7 +90,8 @@ fn run_with_env(home: &Path, args: &[&str], variables: &[(&str, &OsStr)]) -> Out
         .env_remove("SESSIONS_HOME")
         .env_remove("GROK_HOME")
         .env_remove("NO_COLOR")
-        .env_remove("AL_PROJECTS_HOME");
+        .env_remove("AL_PROJECTS_HOME")
+        .env_remove("TMUX");
     for (name, value) in variables {
         command.env(name, value);
     }
@@ -2131,18 +2132,25 @@ fn new_project_sends_native_goal_via_tmux() {
 fn scopeguard_kill(session: &str) -> TmuxKillOnDrop {
     TmuxKillOnDrop {
         session: session.to_owned(),
+        tmpdir: None,
     }
 }
 
 #[cfg(unix)]
 struct TmuxKillOnDrop {
     session: String,
+    tmpdir: Option<PathBuf>,
 }
 
 #[cfg(unix)]
 impl Drop for TmuxKillOnDrop {
     fn drop(&mut self) {
-        kill_tmux_session(&self.session);
+        let mut command = Command::new("tmux");
+        command.args(["kill-session", "-t", &self.session]);
+        if let Some(tmpdir) = &self.tmpdir {
+            command.env("TMUX_TMPDIR", tmpdir).env_remove("TMUX");
+        }
+        let _ = command.status();
     }
 }
 
@@ -2256,7 +2264,8 @@ fn live_list_attach_watch_and_supervise_surface() {
     );
     let supervise_text = String::from_utf8_lossy(&supervise_help.stdout);
     assert!(
-        supervise_text.contains("Seconds between table refreshes"),
+        supervise_text.contains("Seconds between table refreshes")
+            && supervise_text.contains("[TARGET]"),
         "{supervise_text}"
     );
     let send_help = run(home.path(), &["supervise", "send", "--help"]);
@@ -2281,4 +2290,246 @@ fn live_list_attach_watch_and_supervise_surface() {
         "attach --target with no matching pane must fail: {}",
         String::from_utf8_lossy(&attach_missing.stderr)
     );
+
+    let keep_needs_target = run(home.path(), &["supervise", "--message", "continue"]);
+    assert!(
+        !keep_needs_target.status.success(),
+        "supervise --message without TARGET must fail"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn supervise_keep_pins_target_when_another_agent_has_goal() {
+    if !tmux_available() {
+        eprintln!(
+            "skipping supervise_keep_pins_target_when_another_agent_has_goal: tmux not on PATH"
+        );
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let keep_session = format!("agentlo-keep-{}-{stamp}", std::process::id());
+    let goal_session = format!("omlo-goal-{}-{stamp}", std::process::id());
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let tmux_dir = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let agent_bin = bin.join("agent");
+    let omp_bin = bin.join("omp");
+    write_fake_tool(
+        &bin,
+        "agent",
+        "#!/bin/sh\nprintf 'Ready\\n\\n→ Add a follow-up\\n'\nexec cat\n",
+    );
+    write_fake_tool(
+        &bin,
+        "omp",
+        "#!/bin/sh\nprintf '/goal ship it\\nWhich file should I edit?\\n'\nexec cat\n",
+    );
+    let mut path = bin.as_os_str().to_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let tmux_tmp = tmux_dir.path();
+    let _keep_guard = TmuxKillOnDrop {
+        session: keep_session.clone(),
+        tmpdir: Some(tmux_tmp.to_path_buf()),
+    };
+    let _goal_guard = TmuxKillOnDrop {
+        session: goal_session.clone(),
+        tmpdir: Some(tmux_tmp.to_path_buf()),
+    };
+    assert!(
+        Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &keep_session,
+                "-n",
+                &keep_session,
+                "--",
+                agent_bin.to_str().unwrap(),
+            ])
+            .env("PATH", &path)
+            .env("TMUX_TMPDIR", tmux_tmp)
+            .env_remove("TMUX")
+            .status()
+            .unwrap()
+            .success(),
+        "failed to start keep session"
+    );
+    assert!(
+        Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &goal_session,
+                "-n",
+                &goal_session,
+                "--",
+                omp_bin.to_str().unwrap(),
+            ])
+            .env("PATH", &path)
+            .env("TMUX_TMPDIR", tmux_tmp)
+            .env_remove("TMUX")
+            .status()
+            .unwrap()
+            .success(),
+        "failed to start goal session"
+    );
+    let listed_text = wait_for_live_table(
+        home.path(),
+        &path,
+        state.path(),
+        tmux_tmp,
+        &["agentlo-keep-", "omlo-goal-", "asking"],
+    );
+    assert!(
+        listed_text.contains("asking"),
+        "goal fixture must stay asking: {listed_text}"
+    );
+
+    let stolen = run_with_env(
+        home.path(),
+        &["supervise", "send", "--message", "STEAL-TOKEN"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("AL_LIVE_STATE_DIR", state.path().as_os_str()),
+            ("TMUX_TMPDIR", tmux_tmp.as_os_str()),
+        ],
+    );
+    assert!(
+        stolen.status.success(),
+        "untargeted send failed: {}",
+        String::from_utf8_lossy(&stolen.stderr)
+    );
+    let goal_after_steal = tmux_capture(&goal_session, tmux_tmp);
+    let keep_after_steal = tmux_capture(&keep_session, tmux_tmp);
+    assert!(
+        goal_after_steal.contains("STEAL-TOKEN"),
+        "untargeted send should hit asking goal pane: {goal_after_steal:?}"
+    );
+    assert!(
+        !keep_after_steal.contains("STEAL-TOKEN"),
+        "untargeted send must not hit idle keep pane: {keep_after_steal:?}"
+    );
+
+    let pinned = run_with_env(
+        home.path(),
+        &[
+            "supervise",
+            "send",
+            &keep_session,
+            "--message",
+            "PINNED-TOKEN",
+        ],
+        &[
+            ("PATH", path.as_os_str()),
+            ("AL_LIVE_STATE_DIR", state.path().as_os_str()),
+            ("TMUX_TMPDIR", tmux_tmp.as_os_str()),
+        ],
+    );
+    assert!(
+        pinned.status.success(),
+        "targeted send failed: {}",
+        String::from_utf8_lossy(&pinned.stderr)
+    );
+    let goal_after_pin = tmux_capture(&goal_session, tmux_tmp);
+    let keep_after_pin = tmux_capture(&keep_session, tmux_tmp);
+    assert!(
+        keep_after_pin.contains("PINNED-TOKEN"),
+        "targeted send should hit keep pane: {keep_after_pin:?}"
+    );
+    assert!(
+        !goal_after_pin.contains("PINNED-TOKEN"),
+        "targeted send must not hit goal pane: {goal_after_pin:?}"
+    );
+
+    let mut keep = Command::new(AL);
+    keep.args([
+        "supervise",
+        &keep_session,
+        "--message",
+        "KEEP-LOOP-TOKEN",
+        "--interval",
+        "1",
+    ])
+    .env("HOME", home.path())
+    .env("PATH", &path)
+    .env("AL_LIVE_STATE_DIR", state.path())
+    .env("TMUX_TMPDIR", tmux_tmp)
+    .env_remove("TMUX")
+    .env_remove("SESSIONS_HOME")
+    .env_remove("GROK_HOME")
+    .env_remove("NO_COLOR")
+    .env_remove("AL_PROJECTS_HOME");
+    let mut child = keep.spawn().expect("spawn al supervise keep");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let _ = child.kill();
+    let _ = child.wait();
+    let goal_after_keep = tmux_capture(&goal_session, tmux_tmp);
+    let keep_after_keep = tmux_capture(&keep_session, tmux_tmp);
+    assert!(
+        keep_after_keep.contains("KEEP-LOOP-TOKEN"),
+        "keep loop should nudge pinned pane: {keep_after_keep:?}"
+    );
+    assert!(
+        !goal_after_keep.contains("KEEP-LOOP-TOKEN"),
+        "keep loop must not send to the other agent with /goal: {goal_after_keep:?}"
+    );
+}
+
+#[cfg(unix)]
+fn wait_for_live_table(
+    home: &Path,
+    path: &OsStr,
+    state: &Path,
+    tmux_tmp: &Path,
+    needles: &[&str],
+) -> String {
+    let mut last = String::new();
+    for _ in 0..20 {
+        let listed = run_with_env(
+            home,
+            &["list"],
+            &[
+                ("PATH", path),
+                ("AL_LIVE_STATE_DIR", state.as_os_str()),
+                ("TMUX_TMPDIR", tmux_tmp.as_os_str()),
+            ],
+        );
+        last = String::from_utf8_lossy(&listed.stdout).into_owned();
+        if listed.status.success() && needles.iter().all(|needle| last.contains(needle)) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let panes = Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{session_name}\t#{pane_id}"])
+        .env("TMUX_TMPDIR", tmux_tmp)
+        .env_remove("TMUX")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    panic!("live table never showed {needles:?}: {last}\npanes:\n{panes}");
+}
+
+#[cfg(unix)]
+fn tmux_capture(session: &str, tmpdir: &Path) -> String {
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-p", "-J", "-t", session])
+        .env("TMUX_TMPDIR", tmpdir)
+        .env_remove("TMUX")
+        .output()
+        .expect("tmux capture");
+    assert!(
+        output.status.success(),
+        "tmux capture {session} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
