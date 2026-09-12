@@ -2322,7 +2322,7 @@ fn supervise_keep_pins_target_when_another_agent_has_goal() {
     write_fake_tool(
         &bin,
         "omp",
-        "#!/bin/sh\nprintf '/goal ship it\\nWhich file should I edit?\\n'\nexec cat\n",
+        "#!/bin/sh\nprintf '/goal ship it\\nWhich file should I edit?\\n'\nwhile IFS= read -r line; do\n  :\ndone\n",
     );
     let mut path = bin.as_os_str().to_os_string();
     path.push(":");
