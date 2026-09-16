@@ -73,7 +73,6 @@ pub enum LauncherKind {
     Pi,
     Rpi,
     Grok,
-    Hyper,
     Droid,
     Codex,
     Claude,
@@ -87,7 +86,6 @@ impl LauncherKind {
             Self::Pi => "pilo",
             Self::Rpi => "rpilo",
             Self::Grok => "grolo",
-            Self::Hyper => "hyperlo",
             Self::Droid => "dolo",
             Self::Codex => "colo",
             Self::Claude => "cclo",
@@ -97,7 +95,7 @@ impl LauncherKind {
 
     const fn argument_error_code(self) -> i32 {
         match self {
-            Self::Grok | Self::Hyper | Self::Claude => 2,
+            Self::Grok | Self::Claude => 2,
             Self::Omp | Self::Pi | Self::Rpi | Self::Droid | Self::Codex | Self::Agent => 1,
         }
     }
@@ -213,8 +211,6 @@ pub enum LauncherError {
         path: PathBuf,
         code: i32,
     },
-    #[error("hyperlo --fork --worktree only supports the interactive TUI")]
-    HyperWorktreeHeadless,
     #[error("agentlo: Agent sessions are read-only and cannot be forked")]
     AgentForkRejected,
     #[error("failed to execute {program:?}: {source}")]
@@ -240,7 +236,7 @@ impl LauncherError {
             | Self::InvalidRemotePathMapsJson { code, .. }
             | Self::InvalidRemotePathMapPath { code, .. } => *code,
             Self::MissingExecutable { .. } => 127,
-            Self::HyperWorktreeHeadless | Self::AgentForkRejected => 2,
+            Self::AgentForkRejected => 2,
             Self::Execute { source, .. } => match source.kind() {
                 io::ErrorKind::NotFound => 127,
                 io::ErrorKind::PermissionDenied => 126,
@@ -255,9 +251,8 @@ pub type Result<T, E = LauncherError> = std::result::Result<T, E>;
 /// Build the raw, native argv for resuming an exact session.
 ///
 /// `session_path` is authoritative for Pi, Rpi, and OMP. The remaining tools
-/// resume by `session_id`. `home` is used to prefer Hyper's managed executable
-/// at `~/.hyper/bin/hyper` and Rpi's managed executable at `~/.rpi/bin/rpi`
-/// without consulting a shell.
+/// resume by `session_id`. `home` is used to prefer Rpi's managed executable
+/// at `~/.rpi/bin/rpi` without consulting a shell.
 pub fn native_resume(
     target: TargetTool,
     session_path: &Path,
@@ -275,10 +270,6 @@ pub fn native_resume(
         TargetTool::Codex => command("codex", [os("resume"), os(session_id)]),
         TargetTool::Claude => command("claude", [os("--resume"), os(session_id)]),
         TargetTool::Grok => command("grok", [os("--resume"), os(session_id)]),
-        TargetTool::Hyper => command(
-            preferred_hyper_executable(home),
-            [os("--resume"), os(session_id)],
-        ),
         TargetTool::Agent => command(
             "agent",
             [
@@ -316,10 +307,6 @@ pub fn native_fork(
             "grok",
             [os("--fork-session"), os("--resume"), os(session_id)],
         ),
-        TargetTool::Hyper => command(
-            preferred_hyper_executable(home),
-            [os("--fork-session"), os("--resume"), os(session_id)],
-        ),
         TargetTool::Agent => unreachable!("Agent fork is rejected before launcher dispatch"),
     }
 }
@@ -334,7 +321,6 @@ pub fn resolve_tool_executable(target: TargetTool, home: &Path) -> Result<OsStri
         TargetTool::Codex => OsString::from("codex"),
         TargetTool::Claude => OsString::from("claude"),
         TargetTool::Grok => OsString::from("grok"),
-        TargetTool::Hyper => preferred_hyper_executable(home),
         TargetTool::Agent => OsString::from("agent"),
     };
     resolve_executable(&program)
@@ -715,7 +701,6 @@ fn build_local(
         LauncherKind::Pi => build_pi(args, home),
         LauncherKind::Rpi => build_rpi(args, home),
         LauncherKind::Grok => build_grok(args, home, repo_root),
-        LauncherKind::Hyper => build_hyper(args, home, repo_root),
         LauncherKind::Droid => build_droid(args, home, repo_root),
         LauncherKind::Codex => build_codex(args),
         LauncherKind::Claude => build_claude(args),
@@ -875,68 +860,6 @@ fn build_grok(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Resul
         command("grok", args.iter().cloned())
     };
     apply_grok_environment(&mut command);
-    Ok(LaunchPlan::Command(command))
-}
-
-fn build_hyper(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Result<LaunchPlan> {
-    let hyper = resolve_hyper_launcher_executable(home)?;
-    let mut command = if args.is_empty() {
-        let has_latest = match repo_root {
-            Some(repo) => latest_grok_session(home, repo, LauncherKind::Hyper)?.is_some(),
-            None => false,
-        };
-        if has_latest {
-            command(hyper, [os("--continue")])
-        } else {
-            command(hyper, [])
-        }
-    } else if args[0] == "--session" {
-        let id = required_selector(LauncherKind::Hyper, args, "--session")?;
-        let remaining = &args[2..];
-        if remaining
-            .first()
-            .is_some_and(|arg| arg == "--fork" || arg == "fork")
-        {
-            command_with_tail(
-                hyper,
-                [os("--fork-session"), os("--resume"), id.clone()],
-                &remaining[1..],
-            )
-        } else {
-            command_with_tail(hyper, [os("--resume"), id.clone()], remaining)
-        }
-    } else if args[0] == "--fork" {
-        let explicit_session = args.get(1).filter(|value| is_uuid(value));
-        let (session, fork_args) = if let Some(session) = explicit_session {
-            (session.clone(), &args[2..])
-        } else {
-            (
-                latest_required_grok(home, repo_root, LauncherKind::Hyper)?,
-                &args[1..],
-            )
-        };
-        let (fork_args, worktree, headless) = normalize_hyper_fork_args(fork_args);
-        if worktree && headless {
-            return Err(LauncherError::HyperWorktreeHeadless);
-        }
-        if worktree {
-            command_with_tail(hyper, [os("--resume"), session], &fork_args)
-        } else {
-            command_with_tail(
-                hyper,
-                [os("--fork-session"), os("--resume"), session],
-                &fork_args,
-            )
-        }
-    } else if starts_with_hyphen(&args[0]) {
-        command(hyper, args.iter().cloned())
-    } else if is_uuid(&args[0]) {
-        command_with_tail(hyper, [os("--resume"), args[0].clone()], &args[1..])
-    } else {
-        command(hyper, args.iter().cloned())
-    };
-    command.env_remove.push(os("NO_COLOR"));
-    command.env_set.push((os("COLORTERM"), os("truecolor")));
     Ok(LaunchPlan::Command(command))
 }
 
@@ -1154,28 +1077,6 @@ fn apply_grok_environment(command: &mut CommandSpec) {
     ]);
 }
 
-fn normalize_hyper_fork_args(args: &[OsString]) -> (Vec<OsString>, bool, bool) {
-    let mut normalized = Vec::with_capacity(args.len());
-    let mut worktree = false;
-    let mut headless = false;
-    for arg in args {
-        if arg == "-w" || arg == "--worktree" {
-            worktree = true;
-            normalized.push(os("--worktree="));
-        } else if utf8_option_value(arg, "--worktree=").is_some() {
-            worktree = true;
-            normalized.push(arg.clone());
-        } else {
-            if arg == "-p" || arg == "--single" || arg == "--prompt-file" || arg == "--prompt-json"
-            {
-                headless = true;
-            }
-            normalized.push(arg.clone());
-        }
-    }
-    (normalized, worktree, headless)
-}
-
 fn latest_required_grok(
     home: &Path,
     repo_root: Option<&Path>,
@@ -1270,15 +1171,8 @@ fn grok_session_root(home: &Path, repo_root: &Path, kind: LauncherKind) -> Resul
             path: repo_root.to_owned(),
             code: 1,
         })?;
-    let base = if kind == LauncherKind::Hyper {
-        env::var_os("GROK_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".grok"))
-    } else {
-        home.join(".grok")
-    };
-    Ok(base
+    Ok(home
+        .join(".grok")
         .join("sessions")
         .join(utf8_percent_encode(text, URL_PATH_ENCODE_SET).to_string()))
 }
@@ -1396,32 +1290,6 @@ fn pi_session_root_in(home: &Path, agent_dir: Option<&OsStr>) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".pi/agent"))
         .join("sessions")
-}
-
-fn preferred_hyper_executable(home: &Path) -> OsString {
-    preferred_hyper_executable_in(home, env::var_os("HYPER_HOME").as_deref())
-}
-
-fn preferred_hyper_executable_in(home: &Path, hyper_home: Option<&OsStr>) -> OsString {
-    let hyper_home = hyper_home
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".hyper"));
-    let managed = hyper_home.join("bin/hyper");
-    if managed.is_file() {
-        managed.into_os_string()
-    } else {
-        os("hyper")
-    }
-}
-
-fn resolve_hyper_launcher_executable(home: &Path) -> Result<OsString> {
-    let preferred = preferred_hyper_executable(home);
-    resolve_executable(&preferred)
-        .map(PathBuf::into_os_string)
-        .ok_or(LauncherError::MissingExecutable {
-            executable: preferred,
-        })
 }
 
 fn preferred_rpi_executable(home: &Path) -> OsString {
@@ -1608,7 +1476,7 @@ fn execute_code_with_stderr(spec: &CommandSpec, stderr: Stdio) -> Result<i32> {
 fn execute_tmux(session: &str, spec: &CommandSpec, fallback: Option<&CommandSpec>) -> Result<i32> {
     crate::tmux::run_exact_fallback(session, spec, fallback).map_err(|error| {
         LauncherError::Execute {
-            program: os("al tmux-run"),
+            program: os("tmux"),
             source: io::Error::other(error),
         }
     })
@@ -1824,18 +1692,6 @@ mod tests {
         assert_eq!(
             native_fork(TargetTool::Rpi, path, "ignored", home),
             command("rpi", strings(&["--fork", "/tmp/session.jsonl"]))
-        );
-    }
-
-    #[test]
-    fn native_hyper_prefers_managed_binary() {
-        let temp = TempDir::new().unwrap();
-        let binary = temp.path().join(".hyper/bin/hyper");
-        fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        fs::write(&binary, "").unwrap();
-        assert_eq!(
-            preferred_hyper_executable_in(temp.path(), None),
-            binary.into_os_string()
         );
     }
 
@@ -2341,7 +2197,6 @@ mod tests {
             LauncherKind::Pi,
             LauncherKind::Rpi,
             LauncherKind::Grok,
-            LauncherKind::Hyper,
             LauncherKind::Droid,
             LauncherKind::Codex,
             LauncherKind::Claude,
@@ -2880,242 +2735,6 @@ mod tests {
         assert!(command.cwd.is_none());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn hyperlo_session_fork_forks_the_session() {
-        use std::os::unix::fs::PermissionsExt;
-        let _lock = HYPER_ENV_LOCK.lock();
-
-        let temp = TempDir::new().unwrap();
-        let hyper = temp.path().join(".hyper/bin/hyper");
-        fs::create_dir_all(hyper.parent().unwrap()).unwrap();
-        fs::write(&hyper, b"#!/bin/sh\n").unwrap();
-        fs::set_permissions(&hyper, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let command = assert_command(
-            build_hyper(&strings(&["--session", "sid", "--fork"]), temp.path(), None).unwrap(),
-        );
-        assert_eq!(command.program, preferred_hyper_executable(temp.path()));
-        assert_eq!(
-            command.args,
-            strings(&["--fork-session", "--resume", "sid"])
-        );
-        assert!(command.cwd.is_none());
-    }
-    // `build_hyper` reads GROK_HOME/HYPER_HOME from the process environment,
-    // so tests that pin those variables for hermetic fixtures must not run
-    // concurrently with other hyper tests that read them. Serialize the whole
-    // env-sensitive hyper test population behind one mutex.
-    #[cfg(unix)]
-    static HYPER_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-    #[cfg(unix)]
-    struct ScopedEnvGuard {
-        grok_home: Option<OsString>,
-        hyper_home: Option<OsString>,
-        _lock: parking_lot::MutexGuard<'static, ()>,
-    }
-
-    #[cfg(unix)]
-    impl ScopedEnvGuard {
-        fn neutralize_hyper_home_vars() -> Self {
-            let _lock = HYPER_ENV_LOCK.lock();
-            let grok_home = env::var_os("GROK_HOME");
-            let hyper_home = env::var_os("HYPER_HOME");
-            unsafe {
-                env::remove_var("GROK_HOME");
-                env::remove_var("HYPER_HOME");
-            }
-            Self {
-                grok_home,
-                hyper_home,
-                _lock,
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for ScopedEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(value) = &self.grok_home {
-                    env::set_var("GROK_HOME", value);
-                }
-                if let Some(value) = &self.hyper_home {
-                    env::set_var("HYPER_HOME", value);
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    fn hyper_fixture() -> (TempDir, ScopedEnvGuard) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = TempDir::new().unwrap();
-        let hyper = temp.path().join(".hyper/bin/hyper");
-        fs::create_dir_all(hyper.parent().unwrap()).unwrap();
-        fs::write(&hyper, b"#!/bin/sh\n").unwrap();
-        fs::set_permissions(&hyper, fs::Permissions::from_mode(0o755)).unwrap();
-        (temp, ScopedEnvGuard::neutralize_hyper_home_vars())
-    }
-
-    #[cfg(unix)]
-    fn hyper_session_fixture(home: &Path, repo: &Path) -> OsString {
-        let root = grok_session_root(home, repo, LauncherKind::Hyper).unwrap();
-        let older_id = "11111111-1111-4111-8111-111111111111";
-        let newer_id = "22222222-2222-4222-8222-222222222222";
-        for (id, updated, active) in [
-            (older_id, "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z"),
-            (newer_id, "2026-01-04T00:00:00Z", "2026-01-05T00:00:00Z"),
-        ] {
-            let directory = root.join(id);
-            fs::create_dir_all(&directory).unwrap();
-            fs::write(
-                directory.join("summary.json"),
-                serde_json::json!({
-                    "info": {"id": id, "cwd": repo.to_string_lossy()},
-                    "updated_at": updated,
-                    "last_active_at": active,
-                })
-                .to_string(),
-            )
-            .unwrap();
-        }
-        os(newer_id)
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hyperlo_fork_with_explicit_uuid_uses_fork_session_resume() {
-        let (temp, _guard) = hyper_fixture();
-        let session_id = "12345678-1234-4234-8234-123456789abc";
-        let command = assert_command(
-            build_hyper(
-                &strings(&["--fork", session_id, "prompt"]),
-                temp.path(),
-                None,
-            )
-            .unwrap(),
-        );
-        assert_eq!(command.program, preferred_hyper_executable(temp.path()));
-        assert_eq!(
-            command.args,
-            strings(&["--fork-session", "--resume", session_id, "prompt"])
-        );
-        assert!(command.cwd.is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hyperlo_fork_without_uuid_uses_latest_session() {
-        let (temp, _guard) = hyper_fixture();
-        let repo = temp.path().join("repo");
-        fs::create_dir(&repo).unwrap();
-        let latest = hyper_session_fixture(temp.path(), &repo);
-        let command =
-            assert_command(build_hyper(&strings(&["--fork"]), temp.path(), Some(&repo)).unwrap());
-        assert_eq!(command.program, preferred_hyper_executable(temp.path()));
-        assert_eq!(
-            command.args,
-            vec![os("--fork-session"), os("--resume"), latest]
-        );
-    }
-
-    #[test]
-    fn normalize_hyper_fork_args_rewrites_worktree_flags() {
-        for flag in ["-w", "--worktree"] {
-            let (normalized, worktree, headless) =
-                normalize_hyper_fork_args(&strings(&[flag, "plain"]));
-            assert_eq!(normalized, strings(&["--worktree=", "plain"]));
-            assert!(worktree);
-            assert!(!headless);
-        }
-        let (normalized, worktree, headless) =
-            normalize_hyper_fork_args(&strings(&["--worktree=feature/x"]));
-        assert_eq!(normalized, strings(&["--worktree=feature/x"]));
-        assert!(worktree);
-        assert!(!headless);
-    }
-
-    #[test]
-    fn normalize_hyper_fork_args_detects_headless_flags() {
-        for flag in ["-p", "--single", "--prompt-file", "--prompt-json"] {
-            let (normalized, worktree, headless) =
-                normalize_hyper_fork_args(&strings(&[flag, "prompt.txt"]));
-            assert_eq!(normalized, strings(&[flag, "prompt.txt"]));
-            assert!(!worktree);
-            assert!(headless);
-        }
-        let (normalized, worktree, headless) = normalize_hyper_fork_args(&strings(&["prompt"]));
-        assert_eq!(normalized, strings(&["prompt"]));
-        assert!(!worktree);
-        assert!(!headless);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hyperlo_worktree_fork_rejects_headless() {
-        let (temp, _guard) = hyper_fixture();
-        let session_id = "12345678-1234-4234-8234-123456789abc";
-        let error = build_hyper(
-            &strings(&["--fork", session_id, "-w", "-p"]),
-            temp.path(),
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(error.exit_code(), 2);
-        assert_eq!(
-            error.to_string(),
-            "hyperlo --fork --worktree only supports the interactive TUI"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hyperlo_worktree_fork_rewrites_to_resume() {
-        let (temp, _guard) = hyper_fixture();
-        let session_id = "12345678-1234-4234-8234-123456789abc";
-        let command = assert_command(
-            build_hyper(&strings(&["--fork", session_id, "-w"]), temp.path(), None).unwrap(),
-        );
-        assert_eq!(
-            command.args,
-            strings(&["--resume", session_id, "--worktree="])
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hyperlo_empty_args_continue_when_latest_session_exists() {
-        let (temp, _guard) = hyper_fixture();
-        let repo = temp.path().join("repo");
-        fs::create_dir(&repo).unwrap();
-        hyper_session_fixture(temp.path(), &repo);
-        let command = assert_command(build_hyper(&[], temp.path(), Some(&repo)).unwrap());
-        assert_eq!(command.args, strings(&["--continue"]));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hyperlo_positional_uuid_resumes_session() {
-        let (temp, _guard) = hyper_fixture();
-        let session_id = "12345678-1234-4234-8234-123456789abc";
-        let command = assert_command(
-            build_hyper(&strings(&[session_id, "prompt"]), temp.path(), None).unwrap(),
-        );
-        assert_eq!(command.args, strings(&["--resume", session_id, "prompt"]));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hyperlo_sets_color_environment() {
-        let (temp, _guard) = hyper_fixture();
-        let command = assert_command(build_hyper(&strings(&["hello"]), temp.path(), None).unwrap());
-        assert_eq!(command.env_remove, strings(&["NO_COLOR"]));
-        assert_eq!(command.env_set, vec![(os("COLORTERM"), os("truecolor"))]);
-    }
-
     #[test]
     fn dolo_resume_fork_forks_the_session() {
         let home = test_home();
@@ -3346,7 +2965,7 @@ mod tests {
     #[test]
     fn resolve_tool_executable_maps_each_target_to_its_own_program() {
         // Child branch: this test was re-executed with controlled PATH and
-        // HYPER_HOME/PI_HOME; the temp home arrives via the environment.
+        // PI_HOME; the temp home arrives via the environment.
         if let Some(home) = env::var_os("AL_RESOLVE_TOOL_HOME") {
             let home = PathBuf::from(home);
             let results: Vec<_> = TargetTool::ALL
@@ -3363,15 +2982,7 @@ mod tests {
                     | TargetTool::Claude
                     | TargetTool::Grok
                     | TargetTool::Agent => home.join("bin").join(target.as_str()).into_os_string(),
-                    // Hyper and Rpi resolve to their managed home binaries,
-                    // not a PATH name.
-                    TargetTool::Hyper | TargetTool::Rpi => home
-                        .join(if *target == TargetTool::Hyper {
-                            ".hyper/bin/hyper"
-                        } else {
-                            ".rpi/bin/rpi"
-                        })
-                        .into_os_string(),
+                    TargetTool::Rpi => home.join(".rpi/bin/rpi").into_os_string(),
                 };
                 assert_eq!(
                     result.unwrap(),
@@ -3393,16 +3004,13 @@ mod tests {
             fs::write(&executable, b"#!/bin/sh\n").unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        // Hyper and Rpi resolve to their managed home binaries rather than a
-        // PATH name, so those managed binaries must exist in the temp home.
-        for managed in [home.join(".hyper/bin/hyper"), home.join(".rpi/bin/rpi")] {
-            fs::create_dir_all(managed.parent().unwrap()).unwrap();
-            fs::write(&managed, b"#!/bin/sh\n").unwrap();
-            fs::set_permissions(&managed, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let managed = home.join(".rpi/bin/rpi");
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&managed, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o755)).unwrap();
 
         // Parent branch: re-run this test in a child process with controlled
-        // PATH and HYPER_HOME/PI_HOME, so this thread never mutates the
+        // PATH and PI_HOME, so this thread never mutates the
         // process environment and the test cannot race with other tests.
         let output = Command::new(env::current_exe().unwrap())
             .args([
@@ -3411,7 +3019,6 @@ mod tests {
             ])
             .env("AL_RESOLVE_TOOL_HOME", home)
             .env("PATH", &bin)
-            .env("HYPER_HOME", "")
             .env("PI_HOME", "")
             .output()
             .unwrap();

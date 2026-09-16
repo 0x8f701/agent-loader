@@ -2285,10 +2285,18 @@ fn live_list_attach_watch_and_supervise_surface() {
         String::from_utf8_lossy(&attach_missing.stderr)
     );
 
-    let keep_needs_target = run(home.path(), &["supervise", "--message", "continue"]);
+    let keep_all = run_with_env(
+        home.path(),
+        &["supervise", "--message", "continue"],
+        &[
+            ("AL_SUPERVISE_MAX_TICKS", OsStr::new("1")),
+            ("AL_LIVE_STATE_DIR", state.path().as_os_str()),
+        ],
+    );
+    let keep_all_err = String::from_utf8_lossy(&keep_all.stderr);
     assert!(
-        !keep_needs_target.status.success(),
-        "supervise --message without TARGET must fail"
+        !keep_all_err.contains("requires TARGET"),
+        "bare supervise --message should keep all: {keep_all_err}"
     );
 }
 

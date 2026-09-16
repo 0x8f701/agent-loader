@@ -431,7 +431,7 @@ pub fn emit_with_defaults<D: EmitDefaults>(
             let records = emit_claude(session, cwd, &session_id, start, defaults);
             write_jsonl(&output, &records)?;
         }
-        TargetTool::Grok | TargetTool::Hyper => {
+        TargetTool::Grok => {
             let model = session
                 .hints
                 .model
@@ -1170,7 +1170,7 @@ fn target_path(
             .claude
             .join(encode_single_dash_cwd(cwd))
             .join(format!("{session_id}.jsonl")),
-        TargetTool::Grok | TargetTool::Hyper => context
+        TargetTool::Grok => context
             .roots
             .grok
             .join(grok_cwd.expect("Grok cwd computed before target path"))
@@ -2943,40 +2943,35 @@ mod tests {
     }
 
     #[test]
-    fn grok_and_hyper_emit_shared_native_summary() {
+    fn grok_emit_shared_native_summary() {
         let temporary = TempDir::new().unwrap();
         let home = temporary.path();
         let session = fixture(home);
-        for (target, id) in [
-            (TargetTool::Grok, "grok-session"),
-            (TargetTool::Hyper, "hyper-session"),
-        ] {
-            let emitted = emit_with_defaults(
-                &session,
-                target,
-                &EmitContext::new(home)
-                    .with_session_id(id)
-                    .with_grok_model("grok-runtime-model"),
-                &mut FixedDefaults::new(),
-            )
-            .unwrap();
-            assert!(emitted.path.starts_with(home.join(".grok/sessions")));
-            let summary: Value =
-                serde_json::from_str(&fs::read_to_string(&emitted.path).unwrap()).unwrap();
-            assert!(summary.get("agent_name").is_none());
-            assert_eq!(summary["current_model_id"], "grok-runtime-model");
-            let chat = read_jsonl(&emitted.path.with_file_name("chat_history.jsonl"));
-            assert!(chat[0]["content"].is_array());
-            assert!(chat[1]["content"].is_string());
-            assert_eq!(chat[0]["prompt_index"], 0);
-            let updates = read_jsonl(&emitted.path.with_file_name("updates.jsonl"));
-            assert_eq!(updates[0]["params"]["update"]["_meta"]["promptIndex"], 0);
-            assert!(
-                updates[1]["params"]["update"]["_meta"]
-                    .get("promptIndex")
-                    .is_none()
-            );
-        }
+        let emitted = emit_with_defaults(
+            &session,
+            TargetTool::Grok,
+            &EmitContext::new(home)
+                .with_session_id("grok-session")
+                .with_grok_model("grok-runtime-model"),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        assert!(emitted.path.starts_with(home.join(".grok/sessions")));
+        let summary: Value =
+            serde_json::from_str(&fs::read_to_string(&emitted.path).unwrap()).unwrap();
+        assert!(summary.get("agent_name").is_none());
+        assert_eq!(summary["current_model_id"], "grok-runtime-model");
+        let chat = read_jsonl(&emitted.path.with_file_name("chat_history.jsonl"));
+        assert!(chat[0]["content"].is_array());
+        assert!(chat[1]["content"].is_string());
+        assert_eq!(chat[0]["prompt_index"], 0);
+        let updates = read_jsonl(&emitted.path.with_file_name("updates.jsonl"));
+        assert_eq!(updates[0]["params"]["update"]["_meta"]["promptIndex"], 0);
+        assert!(
+            updates[1]["params"]["update"]["_meta"]
+                .get("promptIndex")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3001,9 +2996,9 @@ mod tests {
         let grok_output_dir = home.join("chosen/grok/custom");
         let emitted = emit_with_defaults(
             &session,
-            TargetTool::Hyper,
+            TargetTool::Grok,
             &EmitContext::new(home)
-                .with_session_id("custom-hyper")
+                .with_session_id("custom-grok")
                 .with_grok_model("model")
                 .with_output(&grok_output_dir),
             &mut FixedDefaults::new(),

@@ -4,7 +4,7 @@
 //! (or a direct `--target`) and attaches. `al watch` refreshes the table in
 //! place across local and remote hosts. `al supervise TARGET` pins one pane
 //! and nudges it when idle; other agents (even with `/goal` started) are
-//! never sent to. Bare `al supervise` is still a watch. `send`/`diff` stay
+//! never sent to. Bare `al supervise` keeps every live pane. `send`/`diff` stay
 //! one-shot. Identification prefers the pane process tree, then `al`
 //! session/window names. State comes from the captured screen.
 
@@ -34,6 +34,7 @@ static PANE_MEMORY_LOCK: Mutex<()> = Mutex::new(());
 pub(crate) static TMUX_TEST_LOCK: Mutex<()> = Mutex::new(());
 const KEEP_SUBMIT_RETRIES: u32 = 3;
 const KEEP_SUBMIT_WAIT_MS: u64 = 400;
+const KEEP_FOOTER_LINES: usize = 6;
 
 const AGENT_ALIASES: &[(&str, &str)] = &[
     ("agent", "agent"),
@@ -48,8 +49,6 @@ const AGENT_ALIASES: &[(&str, &str)] = &[
     ("grok", "grok"),
     ("grok-build", "grok"),
     ("grolo", "grok"),
-    ("hyper", "hyper"),
-    ("hyperlo", "hyper"),
     ("omp", "omp"),
     ("omlo", "omp"),
     ("open-code", "opencode"),
@@ -67,7 +66,6 @@ const NAME_PREFIXES: &[(&str, &str)] = &[
     ("colo-", "codex"),
     ("dolo-", "droid"),
     ("grolo-", "grok"),
-    ("hyperlo-", "hyper"),
     ("omlo-", "omp"),
     ("pilo-", "pi"),
     ("rpilo-", "rpi"),
@@ -251,6 +249,7 @@ pub struct WatchOptions {
 pub struct SendOptions {
     pub host: Option<String>,
     pub target: Option<String>,
+    pub session: Option<String>,
     pub message: String,
     pub submit: bool,
 }
@@ -260,7 +259,8 @@ pub const DEFAULT_KEEP_MESSAGE: &str = "Continue from GOAL.md. Do not idle-wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeepOptions {
     pub hosts: Vec<String>,
-    pub target: String,
+    pub target: Option<String>,
+    pub session: Option<String>,
     pub message: String,
     pub interval: u64,
     pub max_ticks: Option<u64>,
@@ -289,6 +289,7 @@ impl KeepAction {
 pub struct DiffOptions {
     pub host: Option<String>,
     pub target: Option<String>,
+    pub session: Option<String>,
 }
 
 pub fn run_list(options: &ListOptions) -> Result<()> {
@@ -328,7 +329,7 @@ pub fn run_attach(options: &AttachOptions) -> Result<()> {
         return attach_all(&scan.agents);
     }
     if let Some(target) = options.target.as_deref() {
-        let agent = resolve_agent(&scan.agents, Some(target))?;
+        let agent = resolve_agent(&scan.agents, Some(target), None)?;
         attach_agent(agent)
     } else {
         pick_and_attach(&scan.agents, &options.query)
@@ -388,7 +389,7 @@ pub fn run_send(options: &SendOptions) -> Result<()> {
         .filter(|host| *host != "local")
         .unwrap_or("local");
     let agents = scan_host(host, GitMode::Off)?;
-    let agent = resolve_agent(&agents, options.target.as_deref())?;
+    let agent = resolve_agent(&agents, options.target.as_deref(), options.session.as_deref())?;
     deliver(
         host,
         &agent.pane,
@@ -398,15 +399,6 @@ pub fn run_send(options: &SendOptions) -> Result<()> {
 }
 
 pub fn run_keep(options: &KeepOptions) -> Result<()> {
-    if options.target.trim().is_empty() {
-        bail!("al supervise keep requires TARGET");
-    }
-    if options.hosts.len() > 1 {
-        bail!(
-            "al supervise TARGET uses one --host (got {})",
-            options.hosts.len()
-        );
-    }
     let interval = options.interval.max(1);
     let max_ticks = options.max_ticks.or_else(keep_max_ticks_from_env);
     let mut ticks = 0u64;
@@ -427,20 +419,75 @@ fn keep_max_ticks_from_env() -> Option<u64> {
         .filter(|ticks: &u64| *ticks > 0)
 }
 
+fn nonempty_selector(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn has_keep_selector(options: &KeepOptions) -> bool {
+    nonempty_selector(options.target.as_deref()).is_some()
+        || nonempty_selector(options.session.as_deref()).is_some()
+}
+
 fn keep_once(options: &KeepOptions) -> Result<()> {
-    let host = options
-        .hosts
-        .first()
-        .map(String::as_str)
-        .filter(|host| *host != "local")
-        .unwrap_or("local");
-    let agents = scan_host(host, GitMode::Off)?;
-    let agent = resolve_agent(&agents, Some(options.target.as_str()))?;
+    let hosts = if options.hosts.is_empty() {
+        vec!["local".to_owned()]
+    } else {
+        options.hosts.clone()
+    };
+    let mut scanned = false;
+    let mut any = false;
+    for host in &hosts {
+        let host = if host == "local" { "local" } else { host.as_str() };
+        let agents = match scan_host(host, GitMode::Off) {
+            Ok(agents) => agents,
+            Err(error) => {
+                println!("al supervise  keep  scan {host}  {error}");
+                continue;
+            }
+        };
+        scanned = true;
+        let selected = match resolve_keep_agents(
+            &agents,
+            options.target.as_deref(),
+            options.session.as_deref(),
+        ) {
+            Ok(selected) => selected,
+            Err(error) => {
+                println!("al supervise  keep  {host}  {error}");
+                continue;
+            }
+        };
+        any |= !selected.is_empty();
+        for agent in selected {
+            if let Err(error) = keep_agent(host, agent, &options.message) {
+                println!(
+                    "al supervise  keep {}  {} error  {error}",
+                    agent.session, agent.pane
+                );
+            }
+        }
+    }
+    if scanned && !any {
+        println!("al supervise  keep  no live agents");
+    }
+    Ok(())
+}
+
+fn keep_agent(host: &str, agent: &LiveAgent, message: &str) -> Result<()> {
     let screen = capture_on(host, &agent.pane);
+    if screen.trim().is_empty() {
+        println!(
+            "al supervise  keep {}  {} {}  skip empty capture",
+            agent.session,
+            agent.pane,
+            agent.state.as_str()
+        );
+        return Ok(());
+    }
     let action = keep_action(agent.state, &screen);
     println!(
         "al supervise  keep {}  {} {}  {}",
-        options.target,
+        agent.session,
         agent.pane,
         agent.state.as_str(),
         action.as_str()
@@ -448,17 +495,18 @@ fn keep_once(options: &KeepOptions) -> Result<()> {
     if action != KeepAction::Nudge {
         return Ok(());
     }
-    if keep_composer_dirty(&screen, &options.message) {
+    leave_copy_mode(host, &agent.pane);
+    if keep_composer_dirty(&screen, message) {
         send_key(host, &agent.pane, "C-u")?;
     }
-    deliver(host, &agent.pane, options.message.as_bytes(), true)?;
+    deliver(host, &agent.pane, message.as_bytes(), true)?;
     for attempt in 1..=KEEP_SUBMIT_RETRIES {
         std::thread::sleep(std::time::Duration::from_millis(KEEP_SUBMIT_WAIT_MS));
         let after = capture_on(host, &agent.pane);
-        if keep_submit_landed(&after, &options.message) {
+        if keep_submit_landed(&after, message) {
             println!(
                 "al supervise  keep {}  {} submitted",
-                options.target, agent.pane
+                agent.session, agent.pane
             );
             return Ok(());
         }
@@ -468,48 +516,59 @@ fn keep_once(options: &KeepOptions) -> Result<()> {
     }
     println!(
         "al supervise  keep {}  {} submit unconfirmed",
-        options.target, agent.pane
+        agent.session, agent.pane
     );
     Ok(())
 }
 
-fn keep_action(state: AgentState, screen: &str) -> KeepAction {
+fn keep_action(_state: AgentState, screen: &str) -> KeepAction {
     if is_picker(&last_nonempty(screen, STRUCT_LINES)) {
         return KeepAction::SkipPicker;
     }
-    match state {
-        AgentState::Working => KeepAction::SkipWorking,
-        AgentState::Asking => KeepAction::SkipAsking,
-        AgentState::Idle | AgentState::Blocked | AgentState::Unknown => KeepAction::Nudge,
+    let footer = last_nonempty(screen, KEEP_FOOTER_LINES);
+    let words = last_nonempty(screen, WORD_LINES);
+    if is_working_now(&footer, &words) {
+        return KeepAction::SkipWorking;
     }
+    if is_asking(screen) {
+        return KeepAction::SkipAsking;
+    }
+    KeepAction::Nudge
 }
 
 fn composer_has_unknown_paste(text: &str) -> bool {
     text.contains("[Pasted text")
 }
 
-fn looks_like_idle_followup(screen: &str) -> bool {
-    let last = last_nonempty(screen, STRUCT_LINES).to_ascii_lowercase();
-    last.contains("add a follow-up")
-        || last.contains("add a followup")
-        || composer_has_unknown_paste(screen)
+fn is_composer_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let folded = trimmed.to_ascii_lowercase();
+    trimmed.starts_with('→')
+        || trimmed.contains("[Pasted text")
+        || folded.contains("add a follow-up")
+        || folded.contains("add a followup")
+}
+
+fn composer_text(screen: &str) -> String {
+    last_nonempty_lines(screen, STRUCT_LINES)
+        .into_iter()
+        .skip_while(|line| !is_composer_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn keep_composer_dirty(screen: &str, message: &str) -> bool {
-    composer_has_unknown_paste(screen)
-        || (!message.is_empty() && looks_like_idle_followup(screen) && screen.contains(message))
+    let composer = composer_text(screen);
+    composer_has_unknown_paste(&composer)
+        || (!message.is_empty() && composer.contains(message))
 }
 
 fn keep_still_unsent(screen: &str, message: &str) -> bool {
-    composer_has_unknown_paste(screen)
-        || (looks_like_idle_followup(screen) && screen.contains(message))
+    keep_composer_dirty(screen, message)
 }
 
 fn keep_submit_landed(screen: &str, message: &str) -> bool {
-    match classify_screen(screen, "", false) {
-        AgentState::Working | AgentState::Asking | AgentState::Blocked => true,
-        AgentState::Idle | AgentState::Unknown => !keep_still_unsent(screen, message),
-    }
+    !keep_still_unsent(screen, message)
 }
 
 fn capture_on(host: &str, pane: &str) -> String {
@@ -534,15 +593,35 @@ fn capture_on(host: &str, pane: &str) -> String {
     }
 }
 
+fn leave_copy_mode(host: &str, pane: &str) {
+    let _ = tmux_on(host, &["send-keys", "-t", pane, "-X", "cancel"]);
+}
+
 fn send_key(host: &str, pane: &str, key: &str) -> Result<()> {
-    let sent = tmux_on(host, &["send-keys", "-t", pane, key])?;
-    if !sent.status.success() {
+    send_keys(host, pane, &[key])
+}
+
+fn send_keys(host: &str, pane: &str, keys: &[&str]) -> Result<()> {
+    let mut args = vec!["send-keys", "-t", pane];
+    args.extend(keys.iter().copied());
+    let sent = tmux_on(host, &args)?;
+    if sent.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&sent.stderr);
+    if stderr.contains("not in a mode") {
+        leave_copy_mode(host, pane);
+        let retry = tmux_on(host, &args)?;
+        if retry.status.success() {
+            return Ok(());
+        }
         bail!(
-            "tmux send-keys {key} failed: {}",
-            String::from_utf8_lossy(&sent.stderr)
+            "tmux send-keys {} failed: {}",
+            keys.join(" "),
+            String::from_utf8_lossy(&retry.stderr)
         );
     }
-    Ok(())
+    bail!("tmux send-keys {} failed: {}", keys.join(" "), stderr.trim());
 }
 
 pub fn run_diff(options: &DiffOptions) -> Result<()> {
@@ -552,7 +631,7 @@ pub fn run_diff(options: &DiffOptions) -> Result<()> {
         .filter(|host| *host != "local")
         .unwrap_or("local");
     let agents = scan_host(host, GitMode::Diff)?;
-    let agent = resolve_agent(&agents, options.target.as_deref())?;
+    let agent = resolve_agent(&agents, options.target.as_deref(), options.session.as_deref())?;
     let cwd = if agent.cwd.is_empty() {
         "-"
     } else {
@@ -1023,15 +1102,29 @@ fn parse_shortstat(text: &str) -> (u32, u32, u32) {
     (files, insertions, deletions)
 }
 
-fn resolve_agent<'a>(agents: &'a [LiveAgent], target: Option<&str>) -> Result<&'a LiveAgent> {
-    let Some(target) = target.map(str::trim).filter(|value| !value.is_empty()) else {
-        return attention_agent(agents);
-    };
-    if target == "attention" {
-        return attention_agent(agents);
+fn scoped_agents<'a>(
+    agents: &'a [LiveAgent],
+    session: Option<&str>,
+) -> Result<Vec<&'a LiveAgent>> {
+    match nonempty_selector(session) {
+        Some(session) => {
+            let scoped: Vec<&LiveAgent> = agents
+                .iter()
+                .filter(|agent| agent.session == session)
+                .collect();
+            if scoped.is_empty() {
+                bail!("no live agent in tmux session {session:?}");
+            }
+            Ok(scoped)
+        }
+        None => Ok(agents.iter().collect()),
     }
-    let matches: Vec<&LiveAgent> = agents
+}
+
+fn matching_agents<'a>(agents: &[&'a LiveAgent], target: &str) -> Vec<&'a LiveAgent> {
+    agents
         .iter()
+        .copied()
         .filter(|agent| {
             agent.pane == target
                 || agent.target == target
@@ -1041,9 +1134,16 @@ fn resolve_agent<'a>(agents: &'a [LiveAgent], target: Option<&str>) -> Result<&'
                 || agent.cwd == target
                 || short_cwd(&agent.cwd) == target
         })
-        .collect();
+        .collect()
+}
+
+fn names_tmux_session(matches: &[&LiveAgent], target: &str) -> bool {
+    !matches.is_empty() && matches.iter().all(|agent| agent.session == target)
+}
+
+fn unique_agent<'a>(matches: Vec<&'a LiveAgent>, target: &str) -> Result<&'a LiveAgent> {
     match matches.as_slice() {
-        [agent] => Ok(agent),
+        [agent] => Ok(*agent),
         [] => bail!("no live agent matches {target:?}"),
         _ => bail!(
             "ambiguous target {target:?}: {}",
@@ -1056,16 +1156,61 @@ fn resolve_agent<'a>(agents: &'a [LiveAgent], target: Option<&str>) -> Result<&'
     }
 }
 
-fn attention_agent(agents: &[LiveAgent]) -> Result<&LiveAgent> {
+fn resolve_agent<'a>(
+    agents: &'a [LiveAgent],
+    target: Option<&str>,
+    session: Option<&str>,
+) -> Result<&'a LiveAgent> {
+    let scoped = scoped_agents(agents, session)?;
+    let Some(target) = nonempty_selector(target) else {
+        return attention_agent(&scoped);
+    };
+    if target == "attention" {
+        return attention_agent(&scoped);
+    }
+    let matches = matching_agents(&scoped, target);
+    if names_tmux_session(&matches, target) {
+        return attention_agent(&matches).or_else(|_| {
+            matches
+                .first()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("no live agent matches {target:?}"))
+        });
+    }
+    unique_agent(matches, target)
+}
+
+fn resolve_keep_agents<'a>(
+    agents: &'a [LiveAgent],
+    target: Option<&str>,
+    session: Option<&str>,
+) -> Result<Vec<&'a LiveAgent>> {
+    let scoped = scoped_agents(agents, session)?;
+    let Some(target) = nonempty_selector(target) else {
+        return Ok(scoped);
+    };
+    if target == "attention" {
+        return Ok(vec![attention_agent(&scoped)?]);
+    }
+    let matches = matching_agents(&scoped, target);
+    if names_tmux_session(&matches, target) {
+        return Ok(matches);
+    }
+    Ok(vec![unique_agent(matches, target)?])
+}
+
+fn attention_agent<'a>(agents: &[&'a LiveAgent]) -> Result<&'a LiveAgent> {
     if agents.is_empty() {
         bail!("no live agents on this host");
     }
     agents
         .iter()
+        .copied()
         .find(|agent| agent.state == AgentState::Blocked)
         .or_else(|| {
             agents
                 .iter()
+                .copied()
                 .find(|agent| agent.state == AgentState::Asking)
         })
         .ok_or_else(|| {
@@ -1124,13 +1269,7 @@ fn deliver(host: &str, pane: &str, message: &[u8], submit: bool) -> Result<()> {
         );
     }
     if submit {
-        let sent = tmux_on(host, &["send-keys", "-t", pane, "C-m", "C-m"])?;
-        if !sent.status.success() {
-            bail!(
-                "tmux send-keys failed: {}",
-                String::from_utf8_lossy(&sent.stderr)
-            );
-        }
+        send_keys(host, pane, &["C-m", "C-m"])?;
     }
     Ok(())
 }
@@ -2147,7 +2286,22 @@ fn attach_argv(agent: &LiveAgent, inside_tmux: bool) -> Vec<String> {
 }
 
 fn pane_activity_key(capture: &str, title: &str) -> String {
-    format!("{title}\n{}", last_nonempty(capture, STRUCT_LINES))
+    let title = clean_visible(title);
+    let title = if is_chrome_line(&title) {
+        String::new()
+    } else {
+        title
+    };
+    format!("{title}\n{}", activity_body(capture))
+}
+
+fn activity_body(capture: &str) -> String {
+    last_nonempty_lines(capture, STRUCT_LINES)
+        .into_iter()
+        .map(|line| clean_visible(&line))
+        .filter(|line| !is_chrome_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn content_hash(text: &str) -> u64 {
@@ -2815,6 +2969,10 @@ mod tests {
             KeepAction::SkipWorking
         );
         assert_eq!(
+            keep_action(AgentState::Working, "→ Add a follow-up"),
+            KeepAction::Nudge
+        );
+        assert_eq!(
             keep_action(AgentState::Asking, "Which file should I edit?"),
             KeepAction::SkipAsking
         );
@@ -2852,6 +3010,40 @@ mod tests {
             "→ Add a follow-up\nContinue from GOAL.md",
             "Continue from GOAL.md"
         ));
+        let sitting = "\
+Markdown table cells no longer split short ASCII tokens like P0.\n\
+  →\n\
+    Continue from GOAL.md. Do not idle-wait.\n\
+  Cursor Grok 4.6 High · 24.3% · 8 files edited\n\
+  ~/Projects/pi-rs · master\n";
+        assert!(keep_composer_dirty(sitting, "Continue from GOAL.md"));
+        assert!(keep_still_unsent(sitting, "Continue from GOAL.md"));
+        assert!(!keep_submit_landed(sitting, "Continue from GOAL.md"));
+        assert_eq!(keep_action(AgentState::Working, sitting), KeepAction::Nudge);
+        let history_only = "\
+Continue from GOAL.md. Do not idle-wait.\n\
+                                                                                                   Goal active (1h)\n\
+  → Add a follow-up\n\
+  Cursor Grok 4.6 High · 24.3% · 8 files edited\n\
+  ~/Projects/pi-rs · master\n";
+        assert!(!keep_composer_dirty(history_only, "Continue from GOAL.md"));
+        assert!(!keep_still_unsent(history_only, "Continue from GOAL.md"));
+        assert!(keep_submit_landed(history_only, "Continue from GOAL.md"));
+        let leftover_working = "\
+⠀⠞ Working\n\
+old assistant text\n\
+more text\n\
+still more\n\
+and more\n\
+last body\n\
+Goal active (1h)\n\
+  → Add a follow-up\n\
+  Cursor Grok 4.6 High · 24.3%\n\
+  ~/Projects/pi-rs · master\n";
+        assert_eq!(
+            keep_action(AgentState::Working, leftover_working),
+            KeepAction::Nudge
+        );
     }
 
     #[test]
@@ -2860,18 +3052,11 @@ mod tests {
         let asking = live("asking", AgentState::Asking, "/workspace/b");
         let idle = live("idle", AgentState::Idle, "/workspace/c");
         assert_eq!(
-            attention_agent(&[idle.clone(), asking.clone(), blocked.clone()])
-                .unwrap()
-                .agent,
+            attention_agent(&[&idle, &asking, &blocked]).unwrap().agent,
             "blocked"
         );
-        assert_eq!(
-            attention_agent(&[idle.clone(), asking.clone()])
-                .unwrap()
-                .agent,
-            "asking"
-        );
-        assert!(attention_agent(&[idle]).is_err());
+        assert_eq!(attention_agent(&[&idle, &asking]).unwrap().agent, "asking");
+        assert!(attention_agent(&[&idle]).is_err());
     }
 
     #[test]
@@ -2931,6 +3116,35 @@ mod tests {
             "ready"
         );
         assert_eq!(snippet("done\nResume this session with:\n"), "done");
+    }
+
+    #[test]
+    fn ticking_cursor_chrome_does_not_count_as_activity() {
+        let idle = "\
+Markdown table cells no longer split short ASCII tokens like P0.\n\
+\n\
+                                                                                                   Goal active (36m 48s)\n\
+\n\
+  → Add a follow-up\n\
+\n\
+  Cursor Grok 4.6 High · 24.3% · 8 files edited                                                          Run Everything\n\
+  ~/Projects/pi-rs · master\n";
+        let later = idle
+            .replace("Goal active (36m 48s)", "Goal active (36m 51s)")
+            .replace("24.3%", "24.4%");
+        assert_eq!(
+            pane_activity_key(idle, "al"),
+            pane_activity_key(&later, "al")
+        );
+        assert_eq!(keep_action(AgentState::Idle, idle), KeepAction::Nudge);
+        assert_eq!(keep_action(AgentState::Working, idle), KeepAction::Nudge);
+        assert_eq!(
+            keep_action(
+                AgentState::Working,
+                "Working...\nesc to interrupt\nGoal active (36m 51s)\nAdd a follow-up                          ctrl+c to stop\n"
+            ),
+            KeepAction::SkipWorking
+        );
     }
 
     #[test]
@@ -3156,7 +3370,7 @@ mod tests {
             .contains("no live agents"));
         let idle = live("omp", AgentState::Idle, "/workspace/demo");
         let working = live("pi", AgentState::Working, "/workspace/other");
-        let err = attention_agent(&[idle, working]).unwrap_err().to_string();
+        let err = attention_agent(&[&idle, &working]).unwrap_err().to_string();
         assert!(err.contains("no blocked or asking"), "{err}");
         assert!(err.contains("omp:idle"), "{err}");
         assert!(err.contains("pi:working"), "{err}");
@@ -3346,27 +3560,109 @@ mod tests {
         let asking = live("pi", AgentState::Asking, "/workspace/b");
         let idle = live("agent", AgentState::Idle, "/workspace/demo");
         assert_eq!(
-            resolve_agent(&[idle.clone(), asking.clone(), blocked.clone()], None)
+            resolve_agent(&[idle.clone(), asking.clone(), blocked.clone()], None, None)
                 .unwrap()
                 .agent,
             "omp"
         );
         assert_eq!(
-            resolve_agent(std::slice::from_ref(&idle), Some("%1"))
+            resolve_agent(std::slice::from_ref(&idle), Some("%1"), None)
                 .unwrap()
                 .cwd,
             "/workspace/demo"
         );
         assert_eq!(
-            resolve_agent(std::slice::from_ref(&idle), Some("workspace/demo"))
+            resolve_agent(std::slice::from_ref(&idle), Some("workspace/demo"), None)
                 .unwrap()
                 .agent,
             "agent"
         );
-        assert!(resolve_agent(std::slice::from_ref(&idle), Some("s")).is_ok());
-        assert!(resolve_agent(&[idle.clone(), asking], Some("pi")).is_ok());
-        assert!(resolve_agent(&[blocked.clone(), blocked], Some("omp")).is_err());
-        assert!(resolve_agent(&[idle], Some("missing")).is_err());
+        assert!(resolve_agent(std::slice::from_ref(&idle), Some("s"), None).is_ok());
+        assert!(resolve_agent(&[idle.clone(), asking.clone()], Some("pi"), None).is_ok());
+        assert!(resolve_agent(&[blocked.clone(), blocked.clone()], Some("omp"), None).is_err());
+        assert!(resolve_agent(&[idle.clone()], Some("missing"), None).is_err());
+
+        let mut other = idle.clone();
+        other.session = "other".into();
+        other.pane = "%2".into();
+        other.agent = "omp".into();
+        assert_eq!(
+            resolve_agent(&[idle.clone(), other.clone()], Some("s"), None)
+                .unwrap()
+                .agent,
+            "agent"
+        );
+        assert_eq!(
+            resolve_agent(&[idle.clone(), other.clone()], Some("omp"), Some("other"))
+                .unwrap()
+                .pane,
+            "%2"
+        );
+        assert!(resolve_agent(&[idle.clone(), other], Some("omp"), Some("s")).is_err());
+        assert!(resolve_agent(std::slice::from_ref(&idle), None, Some("missing")).is_err());
+    }
+
+    #[test]
+    fn keep_selects_every_agent_in_a_tmux_session() {
+        let mut executor = live("omp", AgentState::Idle, "/workspace/demo");
+        executor.session = "demo-app".into();
+        executor.pane = "%1".into();
+        let mut reviewer = live("grok", AgentState::Working, "/workspace/demo");
+        reviewer.session = "demo-app".into();
+        reviewer.pane = "%2".into();
+        reviewer.agent = "grok".into();
+        let mut other = live("pi", AgentState::Idle, "/workspace/other");
+        other.session = "other".into();
+        other.pane = "%3".into();
+
+        let in_session = [executor.clone(), reviewer.clone(), other.clone()];
+        let session_only = resolve_keep_agents(&in_session, None, Some("demo-app")).unwrap();
+        assert_eq!(
+            session_only
+                .iter()
+                .map(|agent| agent.pane.as_str())
+                .collect::<Vec<_>>(),
+            ["%1", "%2"]
+        );
+
+        let named = resolve_keep_agents(&in_session, Some("demo-app"), None).unwrap();
+        assert_eq!(
+            named
+                .iter()
+                .map(|agent| agent.pane.as_str())
+                .collect::<Vec<_>>(),
+            ["%1", "%2"]
+        );
+
+        let pinned = resolve_keep_agents(&in_session, Some("omp"), Some("demo-app")).unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].pane, "%1");
+
+        assert_eq!(
+            resolve_agent(&[executor, reviewer], Some("demo-app"), None)
+                .unwrap()
+                .pane,
+            "%1"
+        );
+        let everyone = resolve_keep_agents(&in_session, None, None).unwrap();
+        assert_eq!(everyone.len(), 3);
+
+        assert!(has_keep_selector(&KeepOptions {
+            hosts: Vec::new(),
+            target: None,
+            session: Some("demo-app".to_owned()),
+            message: String::new(),
+            interval: 5,
+            max_ticks: None,
+        }));
+        assert!(!has_keep_selector(&KeepOptions {
+            hosts: Vec::new(),
+            target: Some("  ".to_owned()),
+            session: Some(String::new()),
+            message: String::new(),
+            interval: 5,
+            max_ticks: None,
+        }));
     }
 
     #[test]

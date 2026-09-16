@@ -83,20 +83,18 @@ pub enum TargetTool {
     Codex,
     Claude,
     Grok,
-    Hyper,
     Rpi,
     Agent,
 }
 
 impl TargetTool {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 8] = [
         Self::Pi,
         Self::Omp,
         Self::Droid,
         Self::Codex,
         Self::Claude,
         Self::Grok,
-        Self::Hyper,
         Self::Rpi,
         Self::Agent,
     ];
@@ -109,7 +107,6 @@ impl TargetTool {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Grok => "grok",
-            Self::Hyper => "hyper",
             Self::Rpi => "rpi",
             Self::Agent => "agent",
         }
@@ -124,13 +121,12 @@ impl TargetTool {
             Self::Claude => Some(SourceTool::Claude),
             Self::Grok => Some(SourceTool::Grok),
             Self::Agent => Some(SourceTool::Agent),
-            Self::Hyper => None,
             Self::Rpi => Some(SourceTool::Rpi),
         }
     }
 
     pub const fn uses_grok_storage(self) -> bool {
-        matches!(self, Self::Grok | Self::Hyper)
+        matches!(self, Self::Grok)
     }
 
     pub const fn uses_pi_storage(self) -> bool {
@@ -155,7 +151,6 @@ impl FromStr for TargetTool {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
             "grok" => Ok(Self::Grok),
-            "hyper" => Ok(Self::Hyper),
             "rpi" => Ok(Self::Rpi),
             "agent" => Ok(Self::Agent),
             _ => Err(ToolParseError(value.to_owned())),
@@ -452,8 +447,8 @@ mod tests {
             let parsed: TargetTool = tool.as_str().parse().expect("valid spelling");
             assert_eq!(parsed, tool);
         }
-        let error = "hyperx".parse::<TargetTool>().expect_err("invalid tool");
-        assert_eq!(error.to_string(), "unsupported tool: hyperx");
+        let error = "hyper".parse::<TargetTool>().expect_err("invalid tool");
+        assert_eq!(error.to_string(), "unsupported tool: hyper");
     }
 
     #[test]
@@ -529,16 +524,15 @@ mod tests {
         assert_eq!(TargetTool::Claude.source(), Some(SourceTool::Claude));
         assert_eq!(TargetTool::Grok.source(), Some(SourceTool::Grok));
         assert_eq!(TargetTool::Agent.source(), Some(SourceTool::Agent));
-        assert_eq!(TargetTool::Hyper.source(), None);
         assert_eq!(TargetTool::Rpi.source(), Some(SourceTool::Rpi));
     }
 
     #[test]
-    fn target_tool_uses_grok_storage_only_for_grok_and_hyper() {
+    fn target_tool_uses_grok_storage_only_for_grok() {
         for tool in TargetTool::ALL {
             assert_eq!(
                 tool.uses_grok_storage(),
-                matches!(tool, TargetTool::Grok | TargetTool::Hyper),
+                matches!(tool, TargetTool::Grok),
                 "{tool}"
             );
         }

@@ -54,13 +54,12 @@ pub fn parse_launcher_tool(value: &str) -> Result<LauncherKind, String> {
         "pilo" | "pi" => Ok(LauncherKind::Pi),
         "rpilo" | "rpi" => Ok(LauncherKind::Rpi),
         "grolo" | "grok" => Ok(LauncherKind::Grok),
-        "hyperlo" | "hyper" => Ok(LauncherKind::Hyper),
         "dolo" | "droid" => Ok(LauncherKind::Droid),
         "colo" | "codex" => Ok(LauncherKind::Codex),
         "cclo" | "claude" => Ok(LauncherKind::Claude),
         "agentlo" | "agent" => Ok(LauncherKind::Agent),
         _ => Err(format!(
-            "unsupported tool {value:?}; expected omlo, pilo, rpilo, grolo, hyperlo, dolo, colo, cclo, or agentlo"
+            "unsupported tool {value:?}; expected omlo, pilo, rpilo, grolo, dolo, colo, cclo, or agentlo"
         )),
     }
 }
@@ -478,7 +477,7 @@ fn open_local(destination: &Path, use_tmux: bool, launches: &[RoleLaunch]) -> Re
         let windows = tmux_windows(destination, launches)?;
         let code = crate::tmux::run_named_windows(&session, &windows, false)?;
         if code != 0 {
-            bail!("tmux-run exited {code}");
+            bail!("tmux exited {code}");
         }
         apply_native_goals(&session, launches)?;
         if !std::io::stdout().is_terminal() {
@@ -704,9 +703,6 @@ fn launch_argv(tool: Option<LauncherKind>) -> Vec<OsString> {
         Some(LauncherKind::Grok) => {
             vec![OsString::from("grok"), OsString::from("--always-approve")]
         }
-        Some(LauncherKind::Hyper) => {
-            vec![OsString::from("hyper"), OsString::from("--always-approve")]
-        }
         Some(LauncherKind::Droid) => {
             vec![
                 OsString::from("droid"),
@@ -797,7 +793,7 @@ fn write_role_files(spec: &NewProject, destination: &Path) -> Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GoalRecipe {
-    /// `/goal <objective>` then submit (grok, hyper, claude).
+    /// `/goal <objective>` then submit (grok, claude).
     Inline,
     /// `/goal` submit, then type the objective and submit (pi, omp).
     PromptThen,
@@ -805,7 +801,7 @@ enum GoalRecipe {
 
 fn goal_recipe(tool: LauncherKind) -> Option<GoalRecipe> {
     match tool {
-        LauncherKind::Grok | LauncherKind::Hyper | LauncherKind::Claude => Some(GoalRecipe::Inline),
+        LauncherKind::Grok | LauncherKind::Claude => Some(GoalRecipe::Inline),
         LauncherKind::Pi | LauncherKind::Rpi | LauncherKind::Omp => Some(GoalRecipe::PromptThen),
         LauncherKind::Droid | LauncherKind::Codex | LauncherKind::Agent => None,
     }
@@ -1344,6 +1340,8 @@ mod tests {
         assert_eq!(parse_launcher_tool("pilo").unwrap(), LauncherKind::Pi);
         assert_eq!(parse_launcher_tool("pi").unwrap(), LauncherKind::Pi);
         assert_eq!(parse_launcher_tool("grolo").unwrap(), LauncherKind::Grok);
+        assert!(parse_launcher_tool("hyper").is_err());
+        assert!(parse_launcher_tool("hyperlo").is_err());
         assert!(parse_launcher_tool("sks").is_err());
     }
 
@@ -1672,7 +1670,6 @@ mod tests {
             vec![OsString::from("omp"), OsString::from("--auto-approve")]
         );
         assert_eq!(goal_recipe(LauncherKind::Grok), Some(GoalRecipe::Inline));
-        assert_eq!(goal_recipe(LauncherKind::Hyper), Some(GoalRecipe::Inline));
         assert_eq!(goal_recipe(LauncherKind::Claude), Some(GoalRecipe::Inline));
         assert_eq!(goal_recipe(LauncherKind::Omp), Some(GoalRecipe::PromptThen));
         assert_eq!(goal_recipe(LauncherKind::Pi), Some(GoalRecipe::PromptThen));

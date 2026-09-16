@@ -25,14 +25,9 @@ const RESET: &str = "\x1b[0m";
 
 // ── Display helpers ───────────────────────────────────────────────────── //
 
-/// Human label for a session source without changing its machine
-/// identity. Grok sessions are shared with Hyper, so the display says
-/// "grok/hyper" while the raw TSV tool field stays "grok".
+/// Human label for a session source without changing its machine identity.
 pub fn display_tool_name(tool: SourceTool) -> &'static str {
-    match tool {
-        SourceTool::Grok => "grok/hyper",
-        _ => tool.as_str(),
-    }
+    tool.as_str()
 }
 
 /// Size-based ANSI color for list rows (gray / green / yellow / red).
@@ -242,14 +237,13 @@ pub fn format_picker_line(row: &SessionRow, use_color: bool) -> Option<Vec<u8>> 
 /// Agent sessions and is not offered for other sources.
 pub fn target_tools_for_source(source: SourceTool) -> Vec<TargetTool> {
     let mut tools = match source {
-        SourceTool::Grok => vec![TargetTool::Hyper, TargetTool::Grok],
+        SourceTool::Grok => vec![TargetTool::Grok],
         SourceTool::Pi => vec![TargetTool::Rpi, TargetTool::Pi],
         SourceTool::Rpi => vec![TargetTool::Rpi],
         SourceTool::Agent => return vec![TargetTool::Agent],
         _ => vec![source_to_target(source)],
     };
     for candidate in [
-        TargetTool::Hyper,
         TargetTool::Rpi,
         TargetTool::Omp,
         TargetTool::Codex,
@@ -751,8 +745,8 @@ mod tests {
     // -- display_tool_name --
 
     #[test]
-    fn display_name_grok_shows_grok_hyper() {
-        assert_eq!(display_tool_name(SourceTool::Grok), "grok/hyper");
+    fn display_name_grok_is_plain() {
+        assert_eq!(display_tool_name(SourceTool::Grok), "grok");
     }
 
     #[test]
@@ -860,7 +854,7 @@ mod tests {
     fn format_row_grok_uses_display_name() {
         let r = row("sid", SourceTool::Grok, "Hello", "/tmp", 1.0);
         let line = format_row(&r, false);
-        assert!(line.starts_with("grok/hyper"));
+        assert!(line.starts_with("grok"));
     }
 
     // -- format_paths_line --
@@ -934,16 +928,12 @@ mod tests {
     }
 
     #[test]
-    fn picker_line_grok_display_is_grok_hyper_raw_is_grok() {
+    fn picker_line_grok_display_and_raw_are_grok() {
         let r = row("sid", SourceTool::Grok, "Hello", "/tmp", 1.0);
         let line = format_picker_line(&r, false).unwrap();
         let fields: Vec<&[u8]> = line.split(|byte| *byte == b'\t').collect();
-        assert!(
-            fields[0]
-                .windows(b"grok/hyper".len())
-                .any(|part| part == b"grok/hyper")
-        );
-        assert_eq!(fields[1], b"grok"); // raw tool unchanged
+        assert!(fields[0].windows(b"grok".len()).any(|part| part == b"grok"));
+        assert_eq!(fields[1], b"grok");
     }
 
     #[test]
@@ -1072,11 +1062,10 @@ mod tests {
     // -- target_tools_for_source --
 
     #[test]
-    fn target_tools_grok_prefers_hyper_first() {
+    fn target_tools_grok_prefers_native_first() {
         let tools = target_tools_for_source(SourceTool::Grok);
-        assert_eq!(tools[0], TargetTool::Hyper);
-        assert_eq!(tools[1], TargetTool::Grok);
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools[0], TargetTool::Grok);
+        assert_eq!(tools.len(), 7);
     }
 
     #[test]
@@ -1084,7 +1073,7 @@ mod tests {
         let tools = target_tools_for_source(SourceTool::Pi);
         assert_eq!(tools[0], TargetTool::Rpi);
         assert_eq!(tools[1], TargetTool::Pi);
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 7);
     }
 
     #[test]
@@ -1113,7 +1102,7 @@ mod tests {
 
     #[test]
     fn parse_picker_selection_grok_raw_tool_stays_grok() {
-        let line = b"grok/hyper display\tgrok\t2024-01-15 10:30:00\tsid\tHello\t/tmp/grok.jsonl";
+        let line = b"grok display\tgrok\t2024-01-15 10:30:00\tsid\tHello\t/tmp/grok.jsonl";
         let (source, path) = parse_picker_selection(line).unwrap();
         assert_eq!(source, SourceTool::Grok);
         assert_eq!(path, PathBuf::from("/tmp/grok.jsonl"));
@@ -1146,7 +1135,6 @@ mod tests {
             tools,
             vec![
                 TargetTool::Omp,
-                TargetTool::Hyper,
                 TargetTool::Rpi,
                 TargetTool::Codex,
                 TargetTool::Claude,
@@ -1163,7 +1151,6 @@ mod tests {
         assert_eq!(
             tools,
             vec![
-                TargetTool::Hyper,
                 TargetTool::Grok,
                 TargetTool::Rpi,
                 TargetTool::Omp,
@@ -1182,7 +1169,7 @@ mod tests {
             .filter(|source| *source != SourceTool::Agent)
         {
             let tools = target_tools_for_source(source);
-            assert_eq!(tools.len(), 8, "wrong count for {source:?}");
+            assert_eq!(tools.len(), 7, "wrong count for {source:?}");
             let set: HashSet<TargetTool> = tools.iter().copied().collect();
             assert!(set.contains(&TargetTool::Pi));
             assert!(set.contains(&TargetTool::Rpi));
@@ -1191,7 +1178,6 @@ mod tests {
             assert!(set.contains(&TargetTool::Codex));
             assert!(set.contains(&TargetTool::Claude));
             assert!(set.contains(&TargetTool::Grok));
-            assert!(set.contains(&TargetTool::Hyper));
             assert!(!set.contains(&TargetTool::Agent));
         }
     }

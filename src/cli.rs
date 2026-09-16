@@ -39,12 +39,10 @@ fn restore_raw_tail(cli: &mut Cli, arguments: &[OsString]) {
             | "pilo"
             | "rpilo"
             | "grolo"
-            | "hyperlo"
             | "dolo"
             | "colo"
             | "cclo"
             | "agentlo"
-            | "tmux-run"
     ) {
         return;
     }
@@ -53,12 +51,10 @@ fn restore_raw_tail(cli: &mut Cli, arguments: &[OsString]) {
         | Some(Command::Pilo(tail))
         | Some(Command::Rpilo(tail))
         | Some(Command::Grolo(tail))
-        | Some(Command::Hyperlo(tail))
         | Some(Command::Dolo(tail))
         | Some(Command::Colo(tail))
         | Some(Command::Cclo(tail))
-        | Some(Command::Agentlo(tail))
-        | Some(Command::TmuxRun(tail)) => tail,
+        | Some(Command::Agentlo(tail)) => tail,
         _ => return,
     };
     tail.argv = arguments[2..].to_vec();
@@ -70,7 +66,6 @@ pub enum Command {
     Pilo(RawTail),
     Rpilo(RawTail),
     Grolo(RawTail),
-    Hyperlo(RawTail),
     Dolo(RawTail),
     Colo(RawTail),
     Cclo(RawTail),
@@ -84,10 +79,8 @@ pub enum Command {
     Attach(AttachArgs),
     /// Refresh live tmux coding-agent panes across local and remote hosts.
     Watch(WatchArgs),
-    /// Keep one live pane running, or send/diff. Bare form without TARGET watches like `al watch`.
+    /// Keep live panes running, or send/diff. Bare form keeps every live pane.
     Supervise(SuperviseCli),
-    #[command(name = "tmux-run")]
-    TmuxRun(RawTail),
     #[command(name = "__tmux-child", hide = true)]
     TmuxChild(TmuxChildArgs),
 }
@@ -266,11 +259,14 @@ pub struct WatchArgs {
 pub struct SuperviseCli {
     #[command(subcommand)]
     pub command: Option<SuperviseCommand>,
-    /// Pin keep-alive to this pane, session, unique agent, or cwd.
-    /// Other agents (even with `/goal` started) are never sent to.
+    /// Pin keep-alive to this pane, unique agent, window, or cwd.
+    /// A tmux session name keeps every live pane in that session.
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
-    /// Nudge text when the pinned TARGET is idle. Used only with TARGET.
+    /// Limit keep-alive to this tmux session. Omit to keep every live pane.
+    #[arg(long, value_name = "NAME", value_parser = nonempty_session)]
+    pub session: Option<String>,
+    /// Nudge text when a pinned pane is idle.
     #[arg(long)]
     pub message: Option<String>,
     #[command(flatten)]
@@ -287,8 +283,11 @@ pub enum SuperviseCommand {
 
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct SuperviseSendArgs {
-    /// Pane (`%12`), unique agent name, session, or cwd. Omit for the first blocked/asking pane.
+    /// Pane (`%12`), unique agent name, window, or cwd. Omit for the first blocked/asking pane.
     pub target: Option<String>,
+    /// Scope the send to this tmux session name.
+    #[arg(long, value_name = "NAME", value_parser = nonempty_session)]
+    pub session: Option<String>,
     /// Text to paste into the pane.
     #[arg(long, required = true)]
     pub message: String,
@@ -302,8 +301,11 @@ pub struct SuperviseSendArgs {
 
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct SuperviseDiffArgs {
-    /// Pane (`%12`), unique agent name, session, or cwd. Omit for the first blocked/asking pane.
+    /// Pane (`%12`), unique agent name, window, or cwd. Omit for the first blocked/asking pane.
     pub target: Option<String>,
+    /// Scope the diff to this tmux session name.
+    #[arg(long, value_name = "NAME", value_parser = nonempty_session)]
+    pub session: Option<String>,
     /// Machine to read. Omit for this machine.
     #[arg(long = "host", value_parser = nonempty_host)]
     pub host: Option<String>,
@@ -401,6 +403,17 @@ fn nonempty_query(value: &str) -> Result<String, String> {
     }
 }
 
+fn nonempty_session(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err("session must not be empty".to_owned())
+    } else if trimmed != value {
+        Err("session must not contain surrounding whitespace".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
 fn nonempty_host(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -439,9 +452,6 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Pilo(args) => dispatch_launcher(crate::launcher::LauncherKind::Pi, args.argv),
         Command::Rpilo(args) => dispatch_launcher(crate::launcher::LauncherKind::Rpi, args.argv),
         Command::Grolo(args) => dispatch_launcher(crate::launcher::LauncherKind::Grok, args.argv),
-        Command::Hyperlo(args) => {
-            dispatch_launcher(crate::launcher::LauncherKind::Hyper, args.argv)
-        }
         Command::Dolo(args) => dispatch_launcher(crate::launcher::LauncherKind::Droid, args.argv),
         Command::Colo(args) => dispatch_launcher(crate::launcher::LauncherKind::Codex, args.argv),
         Command::Cclo(args) => dispatch_launcher(crate::launcher::LauncherKind::Claude, args.argv),
@@ -453,7 +463,6 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Attach(args) => dispatch_attach(args),
         Command::Watch(args) => dispatch_watch(args, "watch"),
         Command::Supervise(args) => dispatch_supervise(args),
-        Command::TmuxRun(args) => dispatch_tmux_run(args.argv),
         Command::TmuxChild(args) => dispatch_tmux_child(args),
     }
 }
@@ -804,7 +813,6 @@ fn dispatch_session_launch(
         return exit_with(2);
     }
     let same_format = target.source() == Some(session.tool)
-        || (session.tool == SourceTool::Grok && target == TargetTool::Hyper)
         || (session.tool.uses_pi_jsonl() && target.uses_pi_storage());
 
     let (path, session_id, created_output) =
@@ -825,7 +833,7 @@ fn dispatch_session_launch(
                 TargetTool::Pi | TargetTool::Rpi | TargetTool::Omp => {
                     vec![OsString::from("--session"), path.as_os_str().to_owned()]
                 }
-                TargetTool::Codex | TargetTool::Grok | TargetTool::Hyper => {
+                TargetTool::Codex | TargetTool::Grok => {
                     vec![OsString::from("--session"), OsString::from(&session_id)]
                 }
                 TargetTool::Claude => unreachable!(),
@@ -936,7 +944,6 @@ fn launcher_kind_for_target(target: TargetTool) -> crate::launcher::LauncherKind
         TargetTool::Codex => crate::launcher::LauncherKind::Codex,
         TargetTool::Claude => crate::launcher::LauncherKind::Claude,
         TargetTool::Grok => crate::launcher::LauncherKind::Grok,
-        TargetTool::Hyper => crate::launcher::LauncherKind::Hyper,
         TargetTool::Agent => crate::launcher::LauncherKind::Agent,
     }
 }
@@ -1015,28 +1022,27 @@ fn dispatch_watch(args: WatchArgs, label: &str) -> anyhow::Result<()> {
 fn dispatch_supervise(args: SuperviseCli) -> anyhow::Result<()> {
     require_unix_live("supervise")?;
     match args.command {
-        None if args.target.is_some() => crate::live::run_keep(&crate::live::KeepOptions {
+        None => crate::live::run_keep(&crate::live::KeepOptions {
             hosts: args.watch.hosts,
-            target: args.target.expect("keep target"),
+            target: args.target,
+            session: args.session,
             message: args
                 .message
                 .unwrap_or_else(|| crate::live::DEFAULT_KEEP_MESSAGE.to_owned()),
             interval: args.watch.interval,
             max_ticks: None,
         }),
-        None if args.message.is_some() => anyhow::bail!(
-            "al supervise --message requires TARGET (example: al supervise agentlo-demo --message TEXT)"
-        ),
-        None => dispatch_watch(args.watch, "supervise"),
         Some(SuperviseCommand::Send(send)) => crate::live::run_send(&crate::live::SendOptions {
             host: send.host,
             target: send.target,
+            session: send.session,
             message: send.message,
             submit: !send.no_submit,
         }),
         Some(SuperviseCommand::Diff(diff)) => crate::live::run_diff(&crate::live::DiffOptions {
             host: diff.host,
             target: diff.target,
+            session: diff.session,
         }),
     }
 }
@@ -1053,26 +1059,8 @@ fn require_unix_live(command: &str) -> anyhow::Result<()> {
     )
 }
 
-fn dispatch_tmux_run(argv: Vec<OsString>) -> anyhow::Result<()> {
-    match crate::tmux::run_argv(&argv) {
-        Ok(code) => exit_with(code),
-        Err(error) if tmux_usage_error(&error) => {
-            eprintln!("al: {error:#}");
-            exit_with(2)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 fn dispatch_tmux_child(args: TmuxChildArgs) -> anyhow::Result<()> {
     exit_with(crate::tmux::run_child(&args.payload, &args.ready)?)
-}
-
-fn tmux_usage_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("requires a value")
-        || message.contains("mutually exclusive")
-        || message.contains("--fresh cannot be combined with --no-attach")
 }
 
 #[cfg(test)]
@@ -1167,6 +1155,7 @@ mod tests {
         };
         assert!(supervise.command.is_none());
         assert!(supervise.target.is_none());
+        assert!(supervise.session.is_none());
         assert!(supervise.message.is_none());
         assert_eq!(supervise.watch.interval, 4);
         assert_eq!(supervise.watch.hosts, ["host-b"]);
@@ -1189,9 +1178,35 @@ mod tests {
         };
         assert!(keep.command.is_none());
         assert_eq!(keep.target.as_deref(), Some("agentlo-demo"));
+        assert!(keep.session.is_none());
         assert_eq!(keep.message.as_deref(), Some("continue"));
         assert_eq!(keep.watch.hosts, ["host-a"]);
         assert_eq!(keep.watch.interval, 5);
+
+        let session = Cli::try_parse_from([
+            "al",
+            "supervise",
+            "--session",
+            "demo-app",
+            "omp",
+            "--message",
+            "continue",
+        ])
+        .unwrap();
+        let Some(Command::Supervise(session)) = session.command else {
+            panic!("expected supervise command");
+        };
+        assert_eq!(session.target.as_deref(), Some("omp"));
+        assert_eq!(session.session.as_deref(), Some("demo-app"));
+        assert_eq!(session.message.as_deref(), Some("continue"));
+        let delimited = Cli::try_parse_from(["al", "supervise", "--", "demo-app"]).unwrap();
+        let Some(Command::Supervise(delimited)) = delimited.command else {
+            panic!("expected supervise command");
+        };
+        assert_eq!(delimited.target.as_deref(), Some("demo-app"));
+        assert!(delimited.session.is_none());
+        assert!(Cli::try_parse_from(["al", "supervise", "--session", ""]).is_err());
+        assert!(Cli::try_parse_from(["al", "supervise", "--session", "  demo"]).is_err());
 
         let send = Cli::try_parse_from([
             "al",
@@ -1210,8 +1225,28 @@ mod tests {
             panic!("expected send subcommand");
         };
         assert_eq!(send.target.as_deref(), Some("%12"));
+        assert!(send.session.is_none());
         assert_eq!(send.message, "continue");
         assert!(send.no_submit);
+
+        let send_session = Cli::try_parse_from([
+            "al",
+            "supervise",
+            "send",
+            "--session",
+            "demo-app",
+            "--message",
+            "continue",
+        ])
+        .unwrap();
+        let Some(Command::Supervise(send_session)) = send_session.command else {
+            panic!("expected supervise command");
+        };
+        let Some(SuperviseCommand::Send(send_session)) = send_session.command else {
+            panic!("expected send subcommand");
+        };
+        assert!(send_session.target.is_none());
+        assert_eq!(send_session.session.as_deref(), Some("demo-app"));
 
         let attention = Cli::try_parse_from([
             "al",
@@ -1241,6 +1276,7 @@ mod tests {
             panic!("expected diff subcommand");
         };
         assert_eq!(diff.target, None);
+        assert!(diff.session.is_none());
         assert_eq!(diff.host.as_deref(), Some("host-a"));
     }
 
@@ -1414,7 +1450,7 @@ mod tests {
                 "sessions",
                 spelling,
                 "omp",
-                "hyper",
+                "grok",
                 "session.jsonl",
                 "output.jsonl",
             ])
@@ -1426,7 +1462,7 @@ mod tests {
                 panic!("expected convert command");
             };
             assert_eq!(convert.source_tool, SourceTool::Omp);
-            assert_eq!(convert.target_tool, TargetTool::Hyper);
+            assert_eq!(convert.target_tool, TargetTool::Grok);
             assert_eq!(convert.input, OsString::from("session.jsonl"));
             assert_eq!(
                 convert.output.unwrap(),
@@ -1567,8 +1603,7 @@ mod tests {
     #[test]
     fn compatibility_command_spellings_parse() {
         let cases = [
-            "omlo", "pilo", "rpilo", "grolo", "hyperlo", "dolo", "colo", "cclo", "agentlo",
-            "tmux-run",
+            "omlo", "pilo", "rpilo", "grolo", "dolo", "colo", "cclo", "agentlo",
         ];
         for spelling in cases {
             let parsed = Cli::try_parse_from(["al", spelling, "--unknown", "value"]).unwrap();
@@ -1577,16 +1612,29 @@ mod tests {
                 | Command::Pilo(tail)
                 | Command::Rpilo(tail)
                 | Command::Grolo(tail)
-                | Command::Hyperlo(tail)
                 | Command::Dolo(tail)
                 | Command::Colo(tail)
                 | Command::Cclo(tail)
-                | Command::Agentlo(tail)
-                | Command::TmuxRun(tail) => tail.argv,
+                | Command::Agentlo(tail) => tail.argv,
                 other => panic!("unexpected command: {other:?}"),
             };
             assert_eq!(argv, [OsString::from("--unknown"), OsString::from("value")]);
         }
+    }
+
+    #[test]
+    fn tmux_run_is_rejected_and_hidden_from_help() {
+        assert!(Cli::try_parse_from(["al", "tmux-run", "--fresh"]).is_err());
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("tmux-run"));
+    }
+
+    #[test]
+    fn hyperlo_is_rejected_and_hidden_from_help() {
+        assert!(Cli::try_parse_from(["al", "hyperlo"]).is_err());
+        assert!(Cli::try_parse_from(["al", "sessions", "convert", "grok", "hyper", "in"]).is_err());
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("hyperlo"));
     }
 
     #[test]

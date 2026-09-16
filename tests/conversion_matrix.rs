@@ -167,7 +167,7 @@ fn parse_emitted(catalog: &Catalog, target: TargetTool, path: &Path) -> Session 
         TargetTool::Droid => SourceTool::Droid,
         TargetTool::Codex => SourceTool::Codex,
         TargetTool::Claude => SourceTool::Claude,
-        TargetTool::Grok | TargetTool::Hyper => SourceTool::Grok,
+        TargetTool::Grok => SourceTool::Grok,
         TargetTool::Agent => panic!("agent is not a conversion target"),
     };
     catalog
