@@ -5,6 +5,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -336,8 +337,11 @@ impl Session {
     }
 
     /// Scratch sessions whose cwd is a generated directory directly under a
-    /// temporary root. A durable project that merely lives in `/tmp`, or that
-    /// contains a `.tmp…` component deeper in the path, stays in the catalog.
+    /// temporary root: `.tmp…` siblings, or the Pi scratch names
+    /// `pi-session-persist-now-<uuid>`, `pi-session-custom-omit-<uuid>`, and
+    /// `pi-session-custom-<uuid>` with a canonical UUID suffix. A durable
+    /// project that merely lives in `/tmp`, or that contains a generated-name
+    /// component deeper in the path, stays in the catalog.
     pub fn is_catalog_temporary(&self) -> bool {
         is_generated_temporary_cwd(&self.cwd)
     }
@@ -352,8 +356,12 @@ pub fn is_internal_session_kind(kind: Option<&str>) -> bool {
 }
 
 /// True when `cwd`'s first component under `/tmp`, `/private/tmp`, or `/var/tmp`
-/// is `.tmp` followed by at least six ASCII alphanumeric characters, and the
-/// rest of that component is alphanumeric too.
+/// is a generated temporary directory name: `.tmp` followed by at least six
+/// ASCII alphanumeric characters, or a Pi scratch name whose whole component
+/// is one of the `PI_SESSION_SCRATCH_PREFIXES` plus a canonical UUID. Those
+/// names are the scratch-directory shapes observed in live Pi sessions; the
+/// rule is an explicit name allowlist, not a verified claim about Pi's
+/// generator source.
 fn is_generated_temporary_cwd(cwd: &Path) -> bool {
     if cwd.components().any(|component| component == Component::ParentDir) {
         return false;
@@ -386,11 +394,38 @@ fn next_normal<'a>(components: &mut Components<'a>) -> Option<&'a str> {
     }
 }
 
+/// Pi scratch session directory names observed under temporary roots. The
+/// whole directory component must be the prefix plus a canonical UUID
+/// (8-4-4-4-12 hex, upper or lower case); nothing else matches.
+const PI_SESSION_SCRATCH_PREFIXES: [&str; 3] = [
+    "pi-session-persist-now-",
+    "pi-session-custom-omit-",
+    "pi-session-custom-",
+];
+
 fn is_generated_temporary_name(name: &str) -> bool {
-    let Some(suffix) = name.strip_prefix(".tmp") else {
+    if let Some(suffix) = name.strip_prefix(".tmp") {
+        return suffix.len() >= 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric());
+    }
+    PI_SESSION_SCRATCH_PREFIXES
+        .iter()
+        .any(|prefix| name.strip_prefix(prefix).is_some_and(is_canonical_uuid))
+}
+
+/// Canonical UUID text: exactly 8-4-4-4-12 hexadecimal digits separated by
+/// hyphens. Hex case is insensitive, so upper and lower case both match. The
+/// canonical form is rendered into a stack buffer and compared without heap
+/// allocation.
+fn is_canonical_uuid(text: &str) -> bool {
+    if text.len() != 36 {
+        return false;
+    }
+    let Ok(uuid) = Uuid::parse_str(text) else {
         return false;
     };
-    suffix.len() >= 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    let mut encoded = [0_u8; 36];
+    uuid.hyphenated().encode_lower(&mut encoded);
+    encoded.eq_ignore_ascii_case(text.as_bytes())
 }
 
 #[derive(Debug, Clone)]
@@ -708,6 +743,58 @@ mod tests {
         ];
         for cwd in durable {
             session.cwd = PathBuf::from(cwd);
+            assert!(!session.is_catalog_temporary(), "{cwd}");
+        }
+    }
+
+    #[test]
+    fn catalog_temporary_matches_pi_session_scratch_names_only() {
+        let mut session = Session {
+            tool: SourceTool::Pi,
+            session_id: "s".to_owned(),
+            cwd: PathBuf::from("/workspace/project"),
+            start_timestamp: None,
+            summary: String::new(),
+            messages: Vec::new(),
+            path: PathBuf::from("/tmp/s.jsonl"),
+            modified_epoch: None,
+            hints: SessionHints::default(),
+        };
+        let uuid = "6f9619ff-8b86-d011-b42d-00c04fc964ff";
+        let temporary = [
+            format!("/tmp/pi-session-persist-now-{uuid}"),
+            format!("/tmp/pi-session-custom-omit-{uuid}"),
+            format!("/tmp/pi-session-custom-{uuid}"),
+            format!("/tmp/pi-session-custom-{uuid}/nested"),
+            format!("/private/tmp/pi-session-custom-{uuid}"),
+            format!("/var/tmp/pi-session-persist-now-{uuid}/work"),
+            // Hex digits match case-insensitively: uppercase UUID accepted.
+            "/tmp/pi-session-custom-6F9619FF-8B86-D011-B42D-00C04FC964FF".to_owned(),
+        ];
+        for cwd in temporary {
+            session.cwd = PathBuf::from(&cwd);
+            assert!(session.is_catalog_temporary(), "{cwd}");
+        }
+        let durable = [
+            // Wrong suffix: not a UUID, including extra characters after one.
+            "/tmp/pi-session-custom".to_owned(),
+            "/tmp/pi-session-custom-not-a-uuid".to_owned(),
+            "/tmp/pi-session-custom-omit-".to_owned(),
+            format!("/tmp/pi-session-custom-{uuid}0"),
+            format!("/tmp/pi-session-custom-{uuid}-x"),
+            // UUID present but not canonical: unhypenated, misplaced hyphen,
+            // non-hex digit.
+            "/tmp/pi-session-custom-6f9619ff8b86d011b42d00c04fc964ff".to_owned(),
+            "/tmp/pi-session-custom-6f9619ff8b86-d011-b42d-00c04fc964ff".to_owned(),
+            "/tmp/pi-session-custom-6f9619ff-8b86-d011-b42d-00c04fc964fg".to_owned(),
+            // Durable roots and ordinary Pi projects stay in the catalog.
+            format!("/workspace/pi-session-custom-{uuid}"),
+            format!("/tmp/../tmp/pi-session-persist-now-{uuid}"),
+            "/tmp/pi-session-notes".to_owned(),
+            "/home/user/project".to_owned(),
+        ];
+        for cwd in durable {
+            session.cwd = PathBuf::from(&cwd);
             assert!(!session.is_catalog_temporary(), "{cwd}");
         }
     }

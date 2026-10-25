@@ -36,7 +36,7 @@ The installer verifies every download against the release's `SHA256SUMS` and ins
 Pin a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.10.0"
+curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.11.0
 ```
 
 If `al` is not on PATH after installation, open a new terminal or use the full path printed during install.
@@ -143,10 +143,10 @@ Routine catalog and picker skips are debug logs, quiet by default. Use `RUST_LOG
 
 - `al sessions [COUNT]` — list recent local sessions (default 5; use `--all` to show everything, `--dedupe` to keep the newest row per tool/cwd/summary). Workflow/subagent children are hidden unless `--children` is set. User forks that only carry `parentSession` stay visible.
   - Claude transcripts containing only sidechain conversation records are children too. Mixed transcripts remain visible, but their sidechain messages are excluded from the active conversation.
-  - Generated temporary workspaces are hidden by default. `--temporary` includes sessions whose cwd starts under `/tmp`, `/var/tmp`, or `/private/tmp` with a `.tmp` directory followed by at least six ASCII alphanumeric characters. Ordinary named projects under those roots stay visible. A temporary child needs both `--temporary` and `--children`; list, search, `--fzf`, and query honor both flags. Direct session references remain resolvable.
+- Generated temporary workspaces are hidden by default. `--temporary` includes a session when the first directory of its cwd under `/tmp`, `/var/tmp`, or `/private/tmp` is a generated scratch name: `.tmp` followed by at least six ASCII alphanumeric characters, or exactly one of the Pi scratch prefixes `pi-session-persist-now-`, `pi-session-custom-omit-`, or `pi-session-custom-` followed by a canonical UUID (8-4-4-4-12 hex digits with hyphens at those positions, case-insensitive, and nothing after it — truncated, unhypenated, or trailing-junk names stay visible). Everything nested below a matching directory is temporary as well; a `..` component anywhere in the cwd disables the rule; ordinary named projects under those roots, scratch-shaped names deeper inside a durable project, and paths outside the temporary roots stay visible. This is an explicit allowlist of observed scratch shapes, not a claim about Pi's directory generator. A temporary child needs both `--temporary` and `--children`; list, search, `--fzf`, and query honor both flags. Direct session references remain resolvable.
   - `al sessions list [COUNT]` — explicit list with the same flags.
   - Repeatable `--host HOST` adds a remote host to query. `local` is reserved for the current machine. With `--host`, `al` runs `al sessions list` on each host over SSH and prints read-only results grouped under `== <host> ==`. It is not a sync: no files are copied. Hosts are queried in the order given; `--all`/`--dedupe`/`--children`/COUNT are forwarded to each remote. Per-host deduplication only; there is no cross-host deduplication. The command continues after a failed host and exits nonzero if any host failed. Empty, whitespace-containing, control-character, or option-like host values are rejected. `--host` cannot be combined with `--paths`, `--picker`, or `--fzf`.
-    `--temporary` is also forwarded; remote hosts must run a version that supports that flag.
+    `--temporary` is also forwarded; the remote host must run 0.11.0 or newer. 0.11.0 introduced temporary-cwd filtering, covering both `.tmp…` names and the Pi scratch names above; releases 0.10.0 and earlier list both kinds and do not support `--temporary`.
   - `al sessions --fzf` / `al sessions list --fzf` — local interactive fuzzy filter over tool, time, session id, and summary, followed by a target picker that opens the session. Native Agent rows offer only `agent` and default to it. Requires `fzf` on PATH. Uses the full deduped catalog, not the default 5-row list.
   - `al sessions search QUERY` — search the text of user/assistant messages in discovered sessions. Search is local-only. `--dedupe` and `--picker` change output style. `--children` includes workflow/subagent sessions.
   - `al sessions query QUERY...` — the same picker-and-open flow as `--fzf`, after a local user/assistant message-body search, including parsed native Agent messages. Requires `fzf` on PATH.
@@ -247,19 +247,21 @@ git push origin main "v${VERSION}"
 
 CI builds the five targets below, packages each archive, generates `SHA256SUMS`, and publishes a GitHub Release.
 
+Release builds remap build-machine paths out of the binary (`--remap-path-prefix` for the checkout and the cargo/rustup homes), and CI fails if any build-machine path prefix survives in the raw bytes of a release binary.
+
 Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 
 ### Artifacts
 
 | Asset | Example |
-| macOS arm64 | `al-0.10.0-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `al-0.10.0-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc 2.31+) | `al-0.10.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc 2.31+) | `al-0.10.0-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `al-0.10.0-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `al-0.11.0-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `al-0.11.0-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 (glibc 2.31+) | `al-0.11.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc 2.31+) | `al-0.11.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `al-0.11.0-x86_64-pc-windows-msvc.zip` |
 | Checksums | `SHA256SUMS` |
 
-The tag must match `Cargo.toml` version exactly (`v0.10.0` ↔ `0.10.0`) or the build fails.
+The tag must match `Cargo.toml` version exactly (`v0.11.0` ↔ `0.11.0`) or the build fails.
 
 ## License
 

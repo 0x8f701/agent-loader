@@ -1445,6 +1445,90 @@ mod tests {
     }
 
     #[test]
+    fn list_and_search_recover_pi_session_scratch_cwds_only_with_temporary() {
+        let (_home, catalog) = catalog();
+        let uuid = "6f9619ff-8b86-d011-b42d-00c04fc964ff";
+        let cases = [
+            ("persist", format!("/tmp/pi-session-persist-now-{uuid}")),
+            ("omit", format!("/tmp/pi-session-custom-omit-{uuid}")),
+            ("plain", format!("/tmp/pi-session-custom-{uuid}")),
+            ("durable", "/tmp/pi-session-custom-work".to_owned()),
+        ];
+        for (id, cwd) in cases {
+            let path = catalog
+                .root_for_tool(SourceTool::Pi)
+                .path
+                .join(format!("project/{id}.jsonl"));
+            fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+            fs::write(
+                &path,
+                format!(
+                    concat!(
+                        r#"{{"type":"session","id":"{id}","cwd":"{cwd}","timestamp":"2026-01-01T00:00:00Z","sessionKind":"user"}}"#,
+                        "\n",
+                        r#"{{"type":"message","id":"m1","parentId":null,"message":{{"role":"user","content":"{id} scratch token"}}}}"#,
+                        "\n",
+                    ),
+                    id = id,
+                    cwd = cwd,
+                ),
+            )
+            .expect("write session");
+        }
+
+        fn ids(rows: &[SessionRow]) -> Vec<&str> {
+            rows.iter().map(|row| row.session_id.as_str()).collect()
+        }
+        // Default listing keeps only the durable project; the three scratch
+        // sessions are hidden. `--temporary` (include_temporary) recovers the
+        // three scratch sessions independently of include_children.
+        let listed = catalog.list(&ListOptions {
+            show_all: true,
+            tools: vec![SourceTool::Pi],
+            ..ListOptions::default()
+        });
+        let listed_ids = ids(&listed);
+        assert!(listed_ids.contains(&"durable"));
+        assert!(!listed_ids.contains(&"persist"));
+        assert!(!listed_ids.contains(&"omit"));
+        assert!(!listed_ids.contains(&"plain"));
+
+        let temporary = catalog.list(&ListOptions {
+            show_all: true,
+            include_temporary: true,
+            tools: vec![SourceTool::Pi],
+            ..ListOptions::default()
+        });
+        let temporary_ids = ids(&temporary);
+        assert!(temporary_ids.contains(&"persist"));
+        assert!(temporary_ids.contains(&"omit"));
+        assert!(temporary_ids.contains(&"plain"));
+
+        let searched = catalog
+            .search("scratch", &SearchOptions::default())
+            .expect("search");
+        let searched_ids = ids(&searched);
+        assert!(searched_ids.contains(&"durable"));
+        assert!(!searched_ids.contains(&"persist"));
+        assert!(!searched_ids.contains(&"omit"));
+        assert!(!searched_ids.contains(&"plain"));
+
+        let searched_temporary = catalog
+            .search(
+                "scratch",
+                &SearchOptions {
+                    include_temporary: true,
+                    ..SearchOptions::default()
+                },
+            )
+            .expect("search temporary");
+        let searched_temporary_ids = ids(&searched_temporary);
+        assert!(searched_temporary_ids.contains(&"persist"));
+        assert!(searched_temporary_ids.contains(&"omit"));
+        assert!(searched_temporary_ids.contains(&"plain"));
+    }
+
+    #[test]
     fn list_keeps_grok_user_forks_with_parent_session_id() {
         let (_home, catalog) = catalog();
         let directory = catalog

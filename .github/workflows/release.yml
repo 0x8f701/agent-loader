@@ -106,7 +106,28 @@ jobs:
           key: ubuntu-20.04-${{ matrix.target }}
 
       - name: Build al (release-dist)
-        run: cargo +1.85.0 build --profile release-dist --locked --target ${{ matrix.target }}
+        shell: bash
+        env:
+          RUSTFLAGS_EXTRA: ${{ matrix.rustflags }}
+        run: |
+          # Remap build-machine paths (cygpath-normalized workspace, cargo/rustup homes) out of the binary.
+          norm() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1" || return 1; else printf '%s' "$1"; fi; }
+          workspace="$(norm "$GITHUB_WORKSPACE")" || exit 1
+          cargo_home="$(norm "${CARGO_HOME:-$HOME/.cargo}")" || exit 1
+          rustup_home="$(norm "${RUSTUP_HOME:-$HOME/.rustup}")" || exit 1
+          flags=(
+            "--remap-path-prefix=${workspace}=/workspace"
+            "--remap-path-prefix=${cargo_home}=/cargo"
+            "--remap-path-prefix=${rustup_home}=/rustup"
+          )
+          if [ -n "$RUSTFLAGS_EXTRA" ]; then
+            read -r -a extra_flags <<< "$RUSTFLAGS_EXTRA"
+            flags+=("${extra_flags[@]}")
+          fi
+          # CARGO_ENCODED_RUSTFLAGS is US (0x1f)-separated; no quoting needed.
+          encoded="$(printf '%s\037' "${flags[@]}")"
+          export CARGO_ENCODED_RUSTFLAGS="${encoded%?}"
+          cargo +1.85.0 build --profile release-dist --locked --target ${{ matrix.target }}
 
       - name: Verify stripped release binary
         shell: bash
@@ -120,6 +141,23 @@ jobs:
             echo "release binary exceeds the 32 MiB distribution limit" >&2
             exit 1
           fi
+          # Distribution privacy gate: build-machine path prefixes must not survive.
+          norm() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1" || return 1; else printf '%s' "$1"; fi; }
+          workspace="$(norm "${GITHUB_WORKSPACE:-$PWD}")" || exit 1
+          home="$(norm "$HOME")" || exit 1
+          cargo_home="$(norm "${CARGO_HOME:-$HOME/.cargo}")" || exit 1
+          rustup_home="$(norm "${RUSTUP_HOME:-$HOME/.rustup}")" || exit 1
+          for needle in \
+            "$GITHUB_WORKSPACE" "$workspace" "${workspace//\//\\}" \
+            "$HOME" "$home" "${home//\//\\}" \
+            "${CARGO_HOME:-$HOME/.cargo}" "$cargo_home" "${cargo_home//\//\\}" \
+            "${RUSTUP_HOME:-$HOME/.rustup}" "$rustup_home" "${rustup_home//\//\\}"; do
+            [ -n "$needle" ] || continue
+            if grep -a -F -q -- "$needle" "$src"; then
+              echo "release binary leaks a build-machine path prefix" >&2
+              exit 1
+            fi
+          done
 
           sections="$RUNNER_TEMP/al-sections.txt"
           readelf -SW "$src" > "$sections"
@@ -204,9 +242,28 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build al (release-dist)
+        shell: bash
         env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo +1.85.0 build --profile release-dist --locked --target ${{ matrix.target }}
+          RUSTFLAGS_EXTRA: ${{ matrix.rustflags }}
+        run: |
+          # Remap build-machine paths (cygpath-normalized workspace, cargo/rustup homes) out of the binary.
+          norm() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1" || return 1; else printf '%s' "$1"; fi; }
+          workspace="$(norm "$GITHUB_WORKSPACE")" || exit 1
+          cargo_home="$(norm "${CARGO_HOME:-$HOME/.cargo}")" || exit 1
+          rustup_home="$(norm "${RUSTUP_HOME:-$HOME/.rustup}")" || exit 1
+          flags=(
+            "--remap-path-prefix=${workspace}=/workspace"
+            "--remap-path-prefix=${cargo_home}=/cargo"
+            "--remap-path-prefix=${rustup_home}=/rustup"
+          )
+          if [ -n "$RUSTFLAGS_EXTRA" ]; then
+            read -r -a extra_flags <<< "$RUSTFLAGS_EXTRA"
+            flags+=("${extra_flags[@]}")
+          fi
+          # CARGO_ENCODED_RUSTFLAGS is US (0x1f)-separated; no quoting needed.
+          encoded="$(printf '%s\037' "${flags[@]}")"
+          export CARGO_ENCODED_RUSTFLAGS="${encoded%?}"
+          cargo +1.85.0 build --profile release-dist --locked --target ${{ matrix.target }}
 
       - name: Verify stripped release binary
         shell: bash
@@ -222,6 +279,24 @@ jobs:
             echo "release binary exceeds the 32 MiB distribution limit" >&2
             exit 1
           fi
+
+          # Distribution privacy gate: build-machine path prefixes must not survive.
+          norm() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1" || return 1; else printf '%s' "$1"; fi; }
+          workspace="$(norm "${GITHUB_WORKSPACE:-$PWD}")" || exit 1
+          home="$(norm "$HOME")" || exit 1
+          cargo_home="$(norm "${CARGO_HOME:-$HOME/.cargo}")" || exit 1
+          rustup_home="$(norm "${RUSTUP_HOME:-$HOME/.rustup}")" || exit 1
+          for needle in \
+            "$GITHUB_WORKSPACE" "$workspace" "${workspace//\//\\}" \
+            "$HOME" "$home" "${home//\//\\}" \
+            "${CARGO_HOME:-$HOME/.cargo}" "$cargo_home" "${cargo_home//\//\\}" \
+            "${RUSTUP_HOME:-$HOME/.rustup}" "$rustup_home" "${rustup_home//\//\\}"; do
+            [ -n "$needle" ] || continue
+            if grep -a -F -q -- "$needle" "$src"; then
+              echo "release binary leaks a build-machine path prefix" >&2
+              exit 1
+            fi
+          done
 
       - name: Package archive (tar.gz)
         if: runner.os != 'Windows'
