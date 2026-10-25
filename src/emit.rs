@@ -272,6 +272,37 @@ pub fn resolve_codex_runtime_default() -> Result<CodexRuntime> {
     ) {
         return Ok(CodexRuntime { provider, model });
     }
+    codex_runtime_from_doctor()
+}
+
+fn codex_runtime_for_session<D: EmitDefaults>(
+    session: &Session,
+    context: &EmitContext,
+    defaults: &mut D,
+) -> Result<CodexRuntime> {
+    if let Some(runtime) = &context.codex_runtime {
+        return Ok(runtime.clone());
+    }
+    if let (Some(provider), Some(model)) = (
+        nonempty(&session.hints.provider),
+        nonempty(&session.hints.model),
+    ) {
+        return Ok(CodexRuntime {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        });
+    }
+    defaults.resolve_codex_runtime()
+}
+
+fn nonempty(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn codex_runtime_from_doctor() -> Result<CodexRuntime> {
     let doctor =
         command_output_with_timeout("codex", &["doctor", "--json"], Duration::from_secs(15))
             .context("running codex doctor --json")?;
@@ -420,10 +451,7 @@ pub fn emit_with_defaults<D: EmitDefaults>(
             write_jsonl(&output, &records)?;
         }
         TargetTool::Codex => {
-            let runtime = match &context.codex_runtime {
-                Some(runtime) => runtime.clone(),
-                None => defaults.resolve_codex_runtime()?,
-            };
+            let runtime = codex_runtime_for_session(session, context, defaults)?;
             let records = emit_codex(session, cwd, &session_id, start, &runtime);
             write_jsonl(&output, &records)?;
         }
@@ -774,6 +802,13 @@ fn emit_droid<D: EmitDefaults>(
                     "summary": text,
                     "summaryText": text,
                 }));
+            } else if kind == "todo" {
+                records.push(json!({
+                    "type": "todo_state",
+                    "id": note_id,
+                    "timestamp": fmt_iso(timestamp),
+                    "todos": { "todos": text },
+                }));
             } else {
                 let mut record = json!({
                     "type": "message",
@@ -887,6 +922,16 @@ fn emit_codex(
                     "timestamp": timestamp_text,
                     "type": "compacted",
                     "payload": { "message": text },
+                }));
+            } else if kind == "developer" {
+                records.push(json!({
+                    "timestamp": timestamp_text,
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{ "type": "input_text", "text": text }],
+                    },
                 }));
             } else {
                 let note = Message::from_parts(
@@ -2389,6 +2434,38 @@ mod tests {
         }
     }
 
+    struct CountingCodexDefaults {
+        inner: FixedDefaults,
+        codex_resolves: usize,
+    }
+
+    impl EmitDefaults for CountingCodexDefaults {
+        fn next_uuid(&mut self) -> Uuid {
+            self.inner.next_uuid()
+        }
+
+        fn now(&mut self) -> DateTime<Utc> {
+            self.inner.now()
+        }
+
+        fn owner(&mut self) -> String {
+            self.inner.owner()
+        }
+
+        fn resolve_omp_runtime(&mut self) -> Result<OmpRuntime> {
+            self.inner.resolve_omp_runtime()
+        }
+
+        fn resolve_codex_runtime(&mut self) -> Result<CodexRuntime> {
+            self.codex_resolves += 1;
+            self.inner.resolve_codex_runtime()
+        }
+
+        fn grok_model(&mut self) -> String {
+            self.inner.grok_model()
+        }
+    }
+
     fn fixture(home: &Path) -> Session {
         Session {
             tool: SourceTool::Claude,
@@ -2825,6 +2902,49 @@ mod tests {
         assert_eq!(records[3]["payload"]["type"], "user_message");
         assert_eq!(records[4]["payload"]["type"], "agent_message");
         assert_eq!(records[5]["type"], "response_item");
+    }
+
+    #[test]
+    fn complete_source_hints_skip_codex_defaults_and_partial_hints_invoke_them() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+
+        let mut complete = fixture(home);
+        complete.hints.provider = Some("hint-provider".to_owned());
+        complete.hints.model = Some("hint-model".to_owned());
+        let mut complete_defaults = CountingCodexDefaults {
+            inner: FixedDefaults::new(),
+            codex_resolves: 0,
+        };
+        let emitted = emit_with_defaults(
+            &complete,
+            TargetTool::Codex,
+            &EmitContext::new(home).with_session_id("codex-hints"),
+            &mut complete_defaults,
+        )
+        .unwrap();
+        assert_eq!(complete_defaults.codex_resolves, 0);
+        let records = read_jsonl(&emitted.path);
+        assert_eq!(records[0]["payload"]["model_provider"], "hint-provider");
+        assert_eq!(records[1]["payload"]["model"], "hint-model");
+
+        let mut provider_only = fixture(home);
+        provider_only.hints.provider = Some("hint-provider".to_owned());
+        let mut partial_defaults = CountingCodexDefaults {
+            inner: FixedDefaults::new(),
+            codex_resolves: 0,
+        };
+        let emitted = emit_with_defaults(
+            &provider_only,
+            TargetTool::Codex,
+            &EmitContext::new(home).with_session_id("codex-partial"),
+            &mut partial_defaults,
+        )
+        .unwrap();
+        assert_eq!(partial_defaults.codex_resolves, 1);
+        let records = read_jsonl(&emitted.path);
+        assert_eq!(records[0]["payload"]["model_provider"], "hint-provider");
+        assert_eq!(records[1]["payload"]["model"], "native-model");
     }
 
     #[test]

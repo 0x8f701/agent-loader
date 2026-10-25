@@ -103,13 +103,24 @@ pub fn sanitize_tsv_field(value: &str) -> String {
 /// Check tool, session id, and path for characters that would corrupt
 /// a TSV row (`\t`, `\n`, `\r`, `\0`). Returns the human-readable name
 /// of the first offending field, or `None` if all fields are safe.
-pub fn unsafe_field_name(tool: &str, session_id: &str, path: &str) -> Option<&'static str> {
-    unsafe_field_name_bytes(tool, session_id, path.as_bytes())
+pub fn unsafe_field_name(
+    tool: &str,
+    session_id: &str,
+    path: &str,
+) -> Option<&'static str> {
+    unsafe_field_name_bytes(tool, "", session_id, path.as_bytes())
 }
 
-fn unsafe_field_name_bytes(tool: &str, session_id: &str, path: &[u8]) -> Option<&'static str> {
+fn unsafe_field_name_bytes(
+    tool: &str,
+    display_time: &str,
+    session_id: &str,
+    path: &[u8],
+) -> Option<&'static str> {
     if has_unsafe_chars(tool) {
         Some("tool")
+    } else if has_unsafe_chars(display_time) {
+        Some("timestamp")
     } else if has_unsafe_chars(session_id) {
         Some("session id")
     } else if has_unsafe_bytes(path) {
@@ -140,20 +151,20 @@ fn exact_path_bytes(path: &Path) -> Option<&[u8]> {
 }
 
 /// Emit a five-field safe TSV row: `tool\ttimestamp\tsession_id\tsummary\tpath`.
-/// Returns `None` and prints a diagnostic to stderr when any structural
+/// Returns `None` and logs a debug diagnostic when any structural
 /// field contains characters that would corrupt the TSV or the platform
 /// cannot represent the path exactly.
 pub fn format_paths_line(row: &SessionRow) -> Option<Vec<u8>> {
     let tool = row.tool.as_str();
     let Some(path) = exact_path_bytes(&row.path) else {
-        eprintln!(
+        log::debug!(
             "skip {tool} session {}: path is not valid Unicode for --paths",
             row.path.display()
         );
         return None;
     };
-    if let Some(field) = unsafe_field_name_bytes(tool, &row.session_id, path) {
-        eprintln!(
+    if let Some(field) = unsafe_field_name_bytes(tool, &row.display_time, &row.session_id, path) {
+        log::debug!(
             "skip {tool} session {}: unsafe {field} for --paths",
             row.path.display()
         );
@@ -189,20 +200,20 @@ pub fn render_paths_tsv(rows: &[SessionRow]) -> Vec<u8> {
 /// Emit a six-field picker TSV row: colored display + `tool\ttimestamp
 /// \tsession_id\tsummary\tpath`. The display field is colored with the
 /// tool color; the remaining five fields are raw and unmodified.
-/// Returns `None` and prints a diagnostic to stderr when any structural
+/// Returns `None` and logs a debug diagnostic when any structural
 /// field contains characters that would corrupt the TSV or the platform
 /// cannot represent the path exactly.
 pub fn format_picker_line(row: &SessionRow, use_color: bool) -> Option<Vec<u8>> {
     let tool = row.tool.as_str();
     let Some(path) = exact_path_bytes(&row.path) else {
-        eprintln!(
+        log::debug!(
             "skip {tool} session {}: path is not valid Unicode for --picker",
             row.path.display()
         );
         return None;
     };
-    if let Some(field) = unsafe_field_name_bytes(tool, &row.session_id, path) {
-        eprintln!(
+    if let Some(field) = unsafe_field_name_bytes(tool, &row.display_time, &row.session_id, path) {
+        log::debug!(
             "skip {tool} session {}: unsafe {field} for --picker",
             row.path.display()
         );
@@ -821,6 +832,15 @@ mod tests {
     #[test]
     fn unsafe_field_name_checks_tool_first() {
         assert_eq!(unsafe_field_name("om\tp", "si\nd", "/tm\0p"), Some("tool"));
+    }
+
+    #[test]
+    fn paths_and_picker_lines_reject_unsafe_timestamp() {
+        let mut sample = row("sid", SourceTool::Omp, "ok", "/tmp", 1.0);
+        sample.display_time = "2024-01-15\n10:30:00".to_owned();
+        assert!(format_paths_line(&sample).is_none());
+        assert!(format_picker_line(&sample, false).is_none());
+        assert!(render_paths_tsv(&[sample]).is_empty());
     }
 
     // -- format_row --

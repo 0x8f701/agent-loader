@@ -31,7 +31,7 @@ const DEFAULT_INTERVAL: u64 = 3;
 const DUMP_VERSION: &str = "AL_LIVE_1";
 static PANE_MEMORY_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(all(test, unix))]
-pub(crate) static TMUX_TEST_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static TMUX_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 const KEEP_SUBMIT_RETRIES: u32 = 3;
 const KEEP_SUBMIT_WAIT_MS: u64 = 400;
 const KEEP_FOOTER_LINES: usize = 6;
@@ -2136,10 +2136,11 @@ fn attach_all(agents: &[LiveAgent]) -> Result<()> {
     if plan.is_empty() {
         bail!("no live agents");
     }
+    let mut aggregates: Vec<String> = Vec::new();
     for (host, sessions) in &plan {
-        create_host_aggregator(host, sessions)?;
+        aggregates.push(create_host_aggregator(host, sessions)?);
     }
-    attach_local_session(&plan[0].0)
+    attach_local_session(&aggregates[0])
 }
 
 fn attach_all_plan(agents: &[LiveAgent]) -> Vec<(String, Vec<String>)> {
@@ -2166,31 +2167,285 @@ fn attach_all_plan(agents: &[LiveAgent]) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-fn create_host_aggregator(host: &str, sessions: &[String]) -> Result<()> {
-    let target = format!("={host}");
-    let _ = Command::new("tmux")
-        .args(["kill-session", "-t", &target])
-        .output();
-    for (index, session) in sessions.iter().enumerate() {
-        let window = sanitize_tmux_name(session);
-        let mut command = Command::new("tmux");
-        if index == 0 {
-            command.args(["new-session", "-d", "-s", host, "-n", &window, "--"]);
-        } else {
-            command.args(["new-window", "-t", &target, "-n", &window, "--"]);
+const AGGREGATOR_MARKER: &str = "@al-aggregator";
+const AGGREGATE_HOST_OPTION: &str = "@al-host";
+const AGGREGATE_SESSION_OPTION: &str = "@al-session";
+
+/// Create or reuse the local aggregate tmux session for `host` and return its
+/// session name. Never kills or renames tmux state; foreign sessions keep their name.
+fn create_host_aggregator(host: &str, sessions: &[String]) -> Result<String> {
+    if let Some(aggregate) = find_aggregate_session(host)? {
+        append_missing_aggregate_windows(host, &aggregate, sessions)?;
+        return Ok(aggregate);
+    }
+    let name = free_aggregate_name(host)?;
+    let Some(first) = sessions.first() else {
+        bail!("no sessions to attach for {host}");
+    };
+    let window = free_window_name(&sanitize_tmux_name(first), &[]);
+    let output = Command::new("tmux")
+        .args([
+            "new-session",
+            "-dP",
+            "-F",
+            "#{window_id}",
+            "-s",
+            &name,
+            "-n",
+            &window,
+            "--",
+        ])
+        .args(session_attach_command(host, first))
+        .output()
+        .with_context(|| format!("could not create tmux aggregate for {host}"))?;
+    let window_id = parse_window_id(&String::from_utf8_lossy(&output.stdout));
+    if let Some(window_id) = window_id.as_deref() {
+        let marking = set_aggregate_window_options(&name, window_id, host, first)
+            .and_then(|_| set_aggregate_markers(&name, host));
+        if let Err(error) = marking {
+            if !output.status.success() {
+                return Err(error.context(format!(
+                    "could not create tmux aggregate for {host} (exit {})",
+                    output.status.code().unwrap_or(1)
+                )));
+            }
+            return Err(error);
         }
-        let status = command
+    } else if output.status.success() {
+        bail!("could not create tmux aggregate for {host}: tmux returned no window id");
+    }
+    if !output.status.success() {
+        bail!(
+            "could not create tmux aggregate for {host} (exit {}): {}",
+            output.status.code().unwrap_or(1),
+            tmux_error_line(&output.stderr)
+        );
+    }
+    append_missing_aggregate_windows(host, &name, sessions)?;
+    Ok(name)
+}
+
+fn find_aggregate_session(host: &str) -> Result<Option<String>> {
+    let output = Command::new("tmux")
+        .args([
+            "list-sessions",
+            "-F",
+            &format!(
+                "#{{session_name}}\t#{{{AGGREGATOR_MARKER}}}\t#{{{AGGREGATE_HOST_OPTION}}}"
+            ),
+        ])
+        .output()
+        .context("could not run tmux")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.splitn(3, '\t');
+        let (Some(name), Some(marker), Some(marker_host)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if marker == "1" && marker_host == host {
+            return Ok(Some(name.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn free_aggregate_name(host: &str) -> Result<String> {
+    let base = escape_tmux_session_name(host);
+    if !aggregate_session_exists(&base)? {
+        return Ok(base);
+    }
+    for index in 2.. {
+        let candidate = format!("{base}-{index}");
+        if !aggregate_session_exists(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("aggregate session name search");
+}
+
+fn aggregate_session_exists(name: &str) -> Result<bool> {
+    let output = Command::new("tmux")
+        .args(["has-session", "-t", &format!("={name}")])
+        .stderr(Stdio::null())
+        .output()
+        .context("could not run tmux")?;
+    Ok(output.status.success())
+}
+
+/// Collision-free tmux session name for a host: bytes outside `[A-Za-z0-9-]`
+/// become `_<hex>` of their UTF-8 encoding (`_` becomes `_5f`), so the mapping
+/// is injective and tmux target separators never appear.
+fn escape_tmux_session_name(host: &str) -> String {
+    let mut escaped = String::with_capacity(host.len());
+    for byte in host.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' => escaped.push(*byte as char),
+            b'_' => escaped.push_str("_5f"),
+            byte => escaped.push_str(&format!("_{byte:02x}")),
+        }
+    }
+    if escaped.is_empty() {
+        "host".to_owned()
+    } else {
+        escaped
+    }
+}
+
+/// Append one window per wanted session whose host+session markers are absent.
+fn append_missing_aggregate_windows(
+    host: &str,
+    aggregate: &str,
+    sessions: &[String],
+) -> Result<()> {
+    let output = Command::new("tmux")
+        .args([
+            "list-windows",
+            "-t",
+            &format!("={aggregate}"),
+            "-F",
+            &format!(
+                "#{{window_name}}\t#{{{AGGREGATE_HOST_OPTION}}}\t#{{{AGGREGATE_SESSION_OPTION}}}"
+            ),
+        ])
+        .output()
+        .context("could not run tmux")?;
+    if !output.status.success() {
+        bail!("could not list windows of aggregate {aggregate}");
+    }
+    let mut taken: Vec<String> = Vec::new();
+    let mut marked: HashSet<(String, String)> = HashSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.splitn(3, '\t');
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        taken.push(name.to_owned());
+        let marker_host = fields.next().unwrap_or_default();
+        let marker_session = fields.next().unwrap_or_default();
+        if !marker_host.is_empty() && !marker_session.is_empty() {
+            marked.insert((marker_host.to_owned(), marker_session.to_owned()));
+        }
+    }
+    for session in sessions {
+        if marked.contains(&(host.to_owned(), session.clone())) {
+            continue;
+        }
+        let window = free_window_name(&sanitize_tmux_name(session), &taken);
+        let output = Command::new("tmux")
+            .args([
+                "new-window",
+                "-dP",
+                "-F",
+                "#{window_id}",
+                "-t",
+                &format!("={aggregate}"),
+                "-n",
+                &window,
+                "--",
+            ])
             .args(session_attach_command(host, session))
-            .status()
+            .output()
             .with_context(|| format!("could not create tmux window for {host} {session}"))?;
-        if !status.success() {
+        taken.push(window.clone());
+        let window_id = parse_window_id(&String::from_utf8_lossy(&output.stdout));
+        if let Some(window_id) = window_id.as_deref() {
+            if let Err(error) = set_aggregate_window_options(aggregate, window_id, host, session) {
+                if !output.status.success() {
+                    return Err(error.context(format!(
+                        "could not create tmux window for {host} {session} (exit {})",
+                        output.status.code().unwrap_or(1)
+                    )));
+                }
+                return Err(error);
+            }
+            marked.insert((host.to_owned(), session.clone()));
+        } else if output.status.success() {
             bail!(
-                "could not create tmux window for {host} {session} (exit {})",
-                status.code().unwrap_or(1)
+                "could not create tmux window for {host} {session}: tmux returned no window id"
+            );
+        }
+        if !output.status.success() {
+            bail!(
+                "could not create tmux window for {host} {session} (exit {}): {}",
+                output.status.code().unwrap_or(1),
+                tmux_error_line(&output.stderr)
             );
         }
     }
     Ok(())
+}
+
+/// Validate tmux `-F #{window_id}` stdout: exactly `@` plus ASCII digits.
+fn parse_window_id(stdout: &str) -> Option<String> {
+    let id = stdout.trim();
+    let digits = id.strip_prefix('@')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(id.to_owned())
+}
+
+/// Bounded printable first line of command stderr for error messages. Stderr
+/// may embed hook script or user input; only the first line is used, control
+/// characters stripped, length-capped.
+fn tmux_error_line(stderr: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(stderr);
+    let line = decoded
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    line.chars().filter(|ch| !ch.is_control()).take(200).collect()
+}
+
+fn set_aggregate_window_options(
+    aggregate: &str,
+    window_id: &str,
+    host: &str,
+    session: &str,
+) -> Result<()> {
+    let target = format!("={aggregate}:{window_id}");
+    tmux_ok(&["set-option", "-w", "-t", &target, AGGREGATE_HOST_OPTION, host])?;
+    tmux_ok(&["set-option", "-w", "-t", &target, AGGREGATE_SESSION_OPTION, session])
+}
+
+fn set_aggregate_markers(aggregate: &str, host: &str) -> Result<()> {
+    // tmux does not honor the `=` exact-match prefix on default-scope
+    // set-option session targets; escaped names contain no glob characters,
+    // so the plain target is exact.
+    tmux_ok(&["set-option", "-t", aggregate, AGGREGATOR_MARKER, "1"])?;
+    tmux_ok(&["set-option", "-t", aggregate, AGGREGATE_HOST_OPTION, host])
+}
+
+fn tmux_ok(args: &[&str]) -> Result<()> {
+    let status = Command::new("tmux")
+        .args(args)
+        .status()
+        .context("could not run tmux")?;
+    if !status.success() {
+        bail!(
+            "tmux {} failed (exit {})",
+            args.first().copied().unwrap_or_default(),
+            status.code().unwrap_or(1)
+        );
+    }
+    Ok(())
+}
+
+fn free_window_name(base: &str, taken: &[String]) -> String {
+    if !taken.iter().any(|name| name == base) {
+        return base.to_owned();
+    }
+    for index in 2.. {
+        let candidate = format!("{base}-{index}");
+        if !taken.iter().any(|name| *name == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("window name search");
 }
 
 fn session_attach_command(host: &str, session: &str) -> Vec<String> {
@@ -2206,7 +2461,7 @@ fn session_attach_command(host: &str, session: &str) -> Vec<String> {
             target,
         ]
     } else {
-        crate::remote::argv(host, &["tmux", "attach-session", "-t", &target], true)
+        crate::remote::shell_argv(host, &["tmux", "attach-session", "-t", &target], true)
     }
 }
 
@@ -2273,7 +2528,7 @@ fn attach_agent(agent: &LiveAgent) -> Result<()> {
 fn attach_argv(agent: &LiveAgent, inside_tmux: bool) -> Vec<String> {
     let target = attach_target(agent);
     if agent.host != "local" {
-        crate::remote::argv(
+        crate::remote::shell_argv(
             &agent.host,
             &["tmux", "attach-session", "-t", &target],
             true,
@@ -3708,7 +3963,7 @@ Markdown table cells no longer split short ASCII tokens like P0.\n\
     #[test]
     fn agents_from_snapshot_skips_exited_named_windows() {
         let dir = tempfile::tempdir().unwrap();
-        let _lock = MEMORY_LOCK.lock().unwrap();
+        let _lock = MEMORY_LOCK.lock();
         unsafe {
             env::set_var("AL_LIVE_STATE_DIR", dir.path());
         }
@@ -3736,7 +3991,7 @@ Markdown table cells no longer split short ASCII tokens like P0.\n\
     #[test]
     fn agents_from_snapshot_keeps_live_processes() {
         let dir = tempfile::tempdir().unwrap();
-        let _lock = MEMORY_LOCK.lock().unwrap();
+        let _lock = MEMORY_LOCK.lock();
         unsafe {
             env::set_var("AL_LIVE_STATE_DIR", dir.path());
         }
@@ -3802,6 +4057,33 @@ Markdown table cells no longer split short ASCII tokens like P0.\n\
         assert!(remote[0] == "mosh" || remote[0] == "ssh", "{remote:?}");
         assert!(remote.contains(&"host-b".to_owned()), "{remote:?}");
         assert!(remote.contains(&"=cclo-c".to_owned()), "{remote:?}");
+        let spaced = session_attach_command("host-b", "my sess");
+        assert!(
+            spaced.contains(&"'=my sess'".to_owned()) || spaced.contains(&"=my sess".to_owned()),
+            "{spaced:?}"
+        );
+    }
+
+    #[test]
+    fn escape_tmux_session_name_is_injective_and_tmux_safe() {
+        assert_eq!(escape_tmux_session_name("x1"), "x1");
+        assert_eq!(escape_tmux_session_name("foo.bar"), "foo_2ebar");
+        assert_eq!(escape_tmux_session_name("foo_bar"), "foo_5fbar");
+        assert_eq!(escape_tmux_session_name("a:b"), "a_3ab");
+        assert_eq!(escape_tmux_session_name(""), "host");
+        assert_ne!(
+            escape_tmux_session_name("foo.bar"),
+            escape_tmux_session_name("foo_bar")
+        );
+        for host in ["foo.bar", "foo_bar", "my.host.example", "a:b", "mühost"] {
+            let escaped = escape_tmux_session_name(host);
+            assert!(
+                escaped
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'),
+                "{host} -> {escaped}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -3813,47 +4095,180 @@ Markdown table cells no longer split short ASCII tokens like P0.\n\
         let dir = tempfile::tempdir().unwrap();
         let tmux_dir = dir.path().join("tmux");
         fs::create_dir_all(&tmux_dir).unwrap();
-        let _lock = super::TMUX_TEST_LOCK.lock().unwrap();
-        struct ClearTmuxTmp;
-        impl Drop for ClearTmuxTmp {
+        let _lock = super::TMUX_TEST_LOCK.lock();
+        struct IsolatedTmux {
+            tmux_tmpdir: Option<std::ffi::OsString>,
+            tmux: Option<std::ffi::OsString>,
+            tmux_dir: std::path::PathBuf,
+            root: std::path::PathBuf,
+        }
+        impl Drop for IsolatedTmux {
             fn drop(&mut self) {
+                // Cleanup kills only the private -S socket inside this test tempdir; $TMUX stripped.
+                let socket_dir = self
+                    .tmux_dir
+                    .join(format!("tmux-{}", unsafe { libc::geteuid() }));
+                let socket = socket_dir.join("default");
+                let may_stop = Command::new("tmux")
+                    .env_remove("TMUX")
+                    .arg("-S").arg(&socket)
+                    .args(["list-sessions", "-F", "#{session_name}"])
+                    .output()
+                    .is_ok_and(|output| output.status.success()
+                        && !String::from_utf8_lossy(&output.stdout).contains("omlo-agent-loader"));
+                if socket_dir.starts_with(&self.root) && may_stop {
+                    let _ = Command::new("tmux")
+                        .env_remove("TMUX")
+                        .arg("-S")
+                        .arg(&socket)
+                        .arg("kill-server")
+                        .output();
+                }
                 unsafe {
-                    env::remove_var("TMUX_TMPDIR");
+                    match &self.tmux_tmpdir {
+                        Some(value) => env::set_var("TMUX_TMPDIR", value),
+                        None => env::remove_var("TMUX_TMPDIR"),
+                    }
+                    match &self.tmux {
+                        Some(value) => env::set_var("TMUX", value),
+                        None => env::remove_var("TMUX"),
+                    }
                 }
             }
         }
-        let _clear = ClearTmuxTmp;
+        let isolated = IsolatedTmux {
+            tmux_tmpdir: env::var_os("TMUX_TMPDIR"),
+            tmux: env::var_os("TMUX"),
+            tmux_dir: tmux_dir.clone(),
+            root: dir.path().to_path_buf(),
+        };
         unsafe {
             env::set_var("TMUX_TMPDIR", &tmux_dir);
             env::remove_var("TMUX");
+        }
+        let socket = tmux_dir.join(format!("tmux-{}/default", unsafe { libc::geteuid() }));
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(socket.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
         }
         let tmux = |args: &[&str]| {
             Command::new("tmux")
                 .env("TMUX_TMPDIR", &tmux_dir)
                 .env_remove("TMUX")
+                .args(["-f", "/dev/null"])
+                .arg("-S")
+                .arg(&socket)
                 .args(args)
                 .output()
                 .unwrap()
         };
-        let _ = tmux(&["kill-server"]);
+        let window_names = |target: &str| {
+            String::from_utf8_lossy(&tmux(&["list-windows", "-t", target, "-F", "#W"]).stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<String>>()
+        };
+        // A user session colliding with the host name must survive untouched.
+        assert!(tmux(&["new-session", "-d", "-s", "local", "-n", "user"])
+            .status
+            .success());
         assert!(tmux(&["new-session", "-d", "-s", "omlo-a", "-n", "w"])
             .status
             .success());
         assert!(tmux(&["new-session", "-d", "-s", "pilo-b", "-n", "w"])
             .status
             .success());
-        create_host_aggregator("local", &["omlo-a".into(), "pilo-b".into()]).unwrap();
-        let listed = tmux(&["list-windows", "-t", "=local", "-F", "#W"]);
-        let names = String::from_utf8_lossy(&listed.stdout);
-        assert!(
-            listed.status.success(),
-            "{names} {}",
-            String::from_utf8_lossy(&listed.stderr)
+        let aggregate =
+            create_host_aggregator("local", &["omlo-a".into(), "pilo-b".into()]).unwrap();
+        assert_eq!(aggregate, "local-2");
+        let names = window_names("=local-2");
+        assert!(names.iter().any(|name| name == "omlo-a"), "{names:?}");
+        assert!(names.iter().any(|name| name == "pilo-b"), "{names:?}");
+        assert_eq!(
+            String::from_utf8_lossy(
+                &tmux(&[
+                    "show-options",
+                    "-v",
+                    "-t",
+                    "local-2",
+                    "@al-aggregator"
+                ])
+                .stdout
+            )
+            .trim(),
+            "1"
         );
-        assert!(names.contains("omlo-a"), "{names}");
-        assert!(names.contains("pilo-b"), "{names}");
-        let _ = tmux(&["kill-server"]);
+        assert_eq!(
+            String::from_utf8_lossy(
+                &tmux(&["show-options", "-v", "-t", "local-2", "@al-host"]).stdout
+            )
+            .trim(),
+            "local"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(
+                &tmux(&[
+                    "show-options",
+                    "-w",
+                    "-v",
+                    "-t",
+                    "local-2:omlo-a",
+                    "@al-session"
+                ])
+                .stdout
+            )
+            .trim(),
+            "omlo-a"
+        );
+        // A user window added inside the aggregate survives re-runs.
+        assert!(tmux(&["new-window", "-d", "-t", "=local-2", "-n", "usershell"])
+            .status
+            .success());
+        let again =
+            create_host_aggregator("local", &["omlo-a".into(), "pilo-b".into()]).unwrap();
+        assert_eq!(again, "local-2");
+        let names = window_names("=local-2");
+        assert_eq!(
+            names.iter().filter(|name| *name == "omlo-a").count(),
+            1,
+            "{names:?}"
+        );
+        assert!(names.iter().any(|name| name == "usershell"), "{names:?}");
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert_eq!(window_names("=local"), vec!["user".to_owned()]);
+        // A newly live session is appended without touching existing windows.
+        assert!(tmux(&["new-session", "-d", "-s", "cclo-c", "-n", "w"])
+            .status
+            .success());
+        let third = create_host_aggregator(
+            "local",
+            &[
+                "omlo-a".into(),
+                "pilo-b".into(),
+                "cclo-c".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(third, "local-2");
+        let names = window_names("=local-2");
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.iter().any(|name| name == "cclo-c"), "{names:?}");
+        assert!(names.iter().any(|name| name == "usershell"), "{names:?}");
+        assert!(tmux(&["new-session", "-d", "-s", "hook-target"]).status.success());
+        assert!(tmux(&["set-hook", "-g", "after-new-window", "run-shell 'exit 2'"]).status.success());
+        let failed = create_host_aggregator("local", &["hook-target".into()]);
+        assert!(failed.is_err());
+        let names = window_names("=local-2");
+        let marker = tmux(&["show-options", "-w", "-v", "-t", "local-2:hook-target", "@al-session"]);
+        assert!(marker.status.success());
+        assert_eq!(String::from_utf8_lossy(&marker.stdout).trim(), "hook-target");
+        assert_eq!(names.iter().filter(|name| *name == "hook-target").count(), 1);
+        assert!(tmux(&["set-hook", "-gu", "after-new-window"]).status.success());
+        assert_eq!(create_host_aggregator("local", &["hook-target".into()]).unwrap(), "local-2");
+        assert_eq!(window_names("=local-2"), names);
+        drop(isolated);
     }
 
-    static MEMORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static MEMORY_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 }

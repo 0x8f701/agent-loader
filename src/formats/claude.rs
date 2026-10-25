@@ -47,7 +47,10 @@ pub fn parse(path: &Path) -> Result<Session> {
         .and_then(|index| records[*index].timestamp());
     let messages = project_messages(&records, &active_path, include_sidechain);
     let summary = summary.unwrap_or_else(|| summarize_messages(&messages));
-    let hints = session_hints(&records);
+    let mut hints = session_hints(&records);
+    if include_sidechain {
+        hints.session_kind = Some("sidechain".to_owned());
+    }
 
     Ok(Session {
         tool: SourceTool::Claude,
@@ -1591,6 +1594,8 @@ mod tests {
         let session = parse(file.path()).expect("parse");
         let texts: Vec<&str> = session.messages.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, ["task", "done"]);
+        assert_eq!(session.hints.session_kind.as_deref(), Some("sidechain"));
+        assert!(session.is_catalog_child());
     }
 
     #[test]
@@ -1607,6 +1612,8 @@ mod tests {
         let texts: Vec<&str> = session.messages.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, ["hi", "ok"]);
         assert!(!session.messages.iter().any(|m| m.text == "secret"));
+        assert_eq!(session.hints.session_kind, None);
+        assert!(!session.is_catalog_child());
     }
 
     #[test]

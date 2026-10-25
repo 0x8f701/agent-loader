@@ -1291,7 +1291,7 @@ fn validate_host(host: &str) -> Result<()> {
     Ok(())
 }
 
-fn posix_quote(value: &str) -> String {
+pub(crate) fn posix_quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('\'');
     for character in value.chars() {
@@ -1726,7 +1726,7 @@ mod tests {
         ))
         .unwrap();
         let session = session_name(&dest);
-        let _lock = crate::live::TMUX_TEST_LOCK.lock().unwrap();
+        let _lock = crate::live::TMUX_TEST_LOCK.lock();
         let _guard = TmuxSessionGuard {
             session: session.clone(),
         };
@@ -1761,7 +1761,7 @@ mod tests {
                 .as_nanos()
         );
         let window = "grolo-sample";
-        let _lock = crate::live::TMUX_TEST_LOCK.lock().unwrap();
+        let _lock = crate::live::TMUX_TEST_LOCK.lock();
         let _guard = TmuxSessionGuard {
             session: id.clone(),
         };

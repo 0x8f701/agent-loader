@@ -100,6 +100,135 @@ fn run_with_env(home: &Path, args: &[&str], variables: &[(&str, &OsStr)]) -> Out
         .unwrap_or_else(|e| panic!("spawning al: {e}"))
 }
 
+#[test]
+fn generated_temporary_sessions_require_an_explicit_override() {
+    let home = TempDir::new().unwrap();
+    for (id, cwd, child) in [
+        ("regular", "/tmp/my-project", false),
+        ("temporary", "/tmp/.tmpAb12Cd/work", false),
+        ("temporary-child", "/tmp/.tmpAb12Cd/work", true),
+    ] {
+        let mut session: Value = serde_json::from_str(&header(id, cwd)).unwrap();
+        if child {
+            session["sessionKind"] = Value::String("workflowSupervisor".to_owned());
+        }
+        write_pi_session(home.path(), "project", &format!("{id}.jsonl"), &[
+            session.to_string(), message("u1", None, "user", "shared needle"),
+        ]);
+    }
+    for base in [vec!["sessions", "--all", "--paths"], vec!["sessions", "search", "--picker", "shared needle"]] {
+        for (flags, expected) in [
+            (vec![], vec!["regular"]),
+            (vec!["--children"], vec!["regular"]),
+            (vec!["--temporary"], vec!["regular", "temporary"]),
+            (vec!["--temporary", "--children"], vec!["regular", "temporary", "temporary-child"]),
+        ] {
+            let mut args = base.clone();
+            args.extend(flags);
+            let output = run(home.path(), &args);
+            assert!(output.status.success());
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(text.lines().count(), expected.len());
+            for id in expected {
+                assert!(text.lines().any(|row| row.split('\t').any(|field| field == id)));
+            }
+        }
+    }
+}
+
+
+#[test]
+fn claude_sidechains_require_children_without_hiding_main_transcripts() {
+    let home = TempDir::new().unwrap();
+    let root = home.path().join(".claude/projects/project");
+    for (file, id, is_sidechain) in [
+        ("main.jsonl", "main-visible", false),
+        ("child.jsonl", "side-child", true),
+    ] {
+        let mut records = vec![serde_json::json!({
+            "type": "user", "uuid": "u1", "parentUuid": null,
+            "isSidechain": is_sidechain, "sessionId": id,
+            "cwd": "/workspace/project", "timestamp": "2026-07-21T06:13:11.040Z",
+            "message": {"role": "user", "content": "common needle"}
+        }).to_string()];
+        if !is_sidechain {
+            records.push(serde_json::json!({
+                "type": "assistant", "uuid": "child", "parentUuid": "u1",
+                "isSidechain": true, "sessionId": id,
+                "cwd": "/workspace/project", "timestamp": "2026-07-21T06:13:14.040Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "side-only needle"}]}
+            }).to_string());
+        }
+        write_lines(&root.join(file), &records);
+    }
+    for args in [
+        vec!["sessions", "--all", "--paths"],
+        vec!["sessions", "search", "common needle"],
+    ] {
+        let normal = run(home.path(), &args);
+        assert!(normal.status.success());
+        let normal_text = String::from_utf8_lossy(&normal.stdout);
+        assert!(normal_text.contains("main-visible"));
+        assert!(!normal_text.contains("side-child"));
+        let mut including_children = args;
+        including_children.push("--children");
+        let included = run(home.path(), &including_children);
+        assert!(included.status.success());
+        let included_text = String::from_utf8_lossy(&included.stdout);
+        assert!(included_text.contains("main-visible"));
+        assert!(included_text.contains("side-child"));
+    }
+    let side_text = run(home.path(), &["sessions", "search", "side-only needle", "--children"]);
+    assert!(side_text.status.success());
+    assert!(side_text.stdout.is_empty());
+}
+
+#[test]
+fn session_skip_diagnostics_follow_log_filters_without_changing_results() {
+    let home = TempDir::new().unwrap();
+    write_pi_session(
+        home.path(),
+        "project",
+        "valid.jsonl",
+        &[
+            header("valid-session", "/workspace/project"),
+            message("user", None, "user", "searchable content"),
+        ],
+    );
+    write_pi_session(home.path(), "project", "broken.jsonl", &["invalid json".to_owned()]);
+    let mut baseline = None;
+    for (filter, should_log) in [
+        ("off", false),
+        ("info", false),
+        ("debug", true),
+        ("trace", true),
+        ("unrelated=debug", false),
+        ("agent_loader::sessions=debug", true),
+        ("debug,agent_loader::sessions=off", false),
+        ("agent_loader::sessions=debug,agent_loader::sessions=off", false),
+    ] {
+        let output = run_with_env(
+            home.path(),
+            &["sessions", "--all", "--paths"],
+            &[("RUST_LOG", OsStr::new(filter))],
+        );
+        assert!(output.status.success(), "filter {filter}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stderr.contains("skip pi session"), should_log, "filter {filter}");
+        if !should_log {
+            assert!(output.stderr.is_empty(), "filter {filter}");
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("valid-session"));
+        assert!(!stdout.contains("skip pi session"));
+        assert_eq!(stdout.lines().count(), 1);
+        if let Some(expected) = &baseline {
+            assert_eq!(&output.stdout, expected);
+        } else {
+            baseline = Some(output.stdout);
+        }
+    }
+}
 fn write_lines(path: &Path, lines: &[String]) {
     fs::create_dir_all(path.parent().expect("fixture parent")).unwrap();
     let mut file = fs::File::create(path).unwrap();
@@ -1256,7 +1385,7 @@ fn sessions_fzf_picks_session_and_opens_native_pi() {
         std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     let output = run_with_env(
         home.path(),
-        &["sessions", "--fzf"],
+        &["sessions", "--temporary", "--fzf"],
         &[
             ("PATH", path_var.as_os_str()),
             ("AL_FZF_STATE", fzf_state.as_os_str()),
@@ -1294,7 +1423,7 @@ fn sessions_list_fzf_matches_bare_fzf() {
         std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     let output = run_with_env(
         home.path(),
-        &["sessions", "list", "--fzf"],
+        &["sessions", "list", "--temporary", "--fzf"],
         &[
             ("PATH", path_var.as_os_str()),
             ("AL_FZF_STATE", fzf_state.as_os_str()),
@@ -1341,7 +1470,7 @@ fn sessions_query_searches_then_opens_only_the_match() {
         std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     let output = run_with_env(
         home.path(),
-        &["sessions", "query", "UNIQUE", "needle"],
+        &["sessions", "query", "--temporary", "UNIQUE", "needle"],
         &[
             ("PATH", path_var.as_os_str()),
             ("AL_FZF_STATE", fzf_state.as_os_str()),
@@ -1437,7 +1566,7 @@ fn sessions_fzf_without_fzf_on_path_fails() {
     let path = std::env::join_paths([empty.as_path()]).unwrap();
     let output = run_with_env(
         home.path(),
-        &["sessions", "--fzf"],
+        &["sessions", "--temporary", "--fzf"],
         &[("PATH", path.as_os_str())],
     );
     assert!(!output.status.success());
@@ -1988,12 +2117,6 @@ fn tmux_available() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(unix)]
-fn kill_tmux_session(session: &str) {
-    let _ = Command::new("tmux")
-        .args(["kill-session", "-t", session])
-        .status();
-}
 
 #[cfg(unix)]
 #[test]
@@ -2044,6 +2167,7 @@ fn new_project_sends_native_goal_via_tmux() {
     let grok_name = format!("altest-grok-{}-{stamp}", std::process::id());
     let omp_name = format!("altest-omp-{}-{stamp}", std::process::id());
     let home = TempDir::new().unwrap();
+    let socket = TempDir::new().unwrap();
     let bin = home.path().join("bin");
     write_fake_tool(
         &bin,
@@ -2057,13 +2181,17 @@ fn new_project_sends_native_goal_via_tmux() {
     );
     let path = path_with(&bin);
     let wait = std::ffi::OsString::from("2000");
-    let _grok_guard = scopeguard_kill(&grok_name);
+    let _grok_guard = TmuxKillOnDrop {
+        session: grok_name.clone(),
+        tmpdir: Some(socket.path().to_path_buf()),
+    };
     let grok = run_with_env(
         home.path(),
         &["new", &grok_name, "ship the parser", "--executor", "grok"],
         &[
             ("PATH", path.as_os_str()),
             ("AL_GOAL_WAIT_MS", wait.as_os_str()),
+            ("TMUX_TMPDIR", socket.path().as_os_str()),
         ],
     );
     assert!(
@@ -2078,6 +2206,8 @@ fn new_project_sends_native_goal_via_tmux() {
             "-t",
             &format!("{grok_name}:grolo-{grok_name}"),
         ])
+        .env("TMUX_TMPDIR", socket.path())
+        .env_remove("TMUX")
         .output()
         .expect("tmux capture grok");
     assert!(grok_pane.status.success(), "grok capture failed");
@@ -2087,13 +2217,17 @@ fn new_project_sends_native_goal_via_tmux() {
         "grok pane missing /goal: {grok_text:?}"
     );
 
-    let _omp_guard = scopeguard_kill(&omp_name);
+    let _omp_guard = TmuxKillOnDrop {
+        session: omp_name.clone(),
+        tmpdir: Some(socket.path().to_path_buf()),
+    };
     let omp = run_with_env(
         home.path(),
         &["new", &omp_name, "ship the parser", "--executor", "omp"],
         &[
             ("PATH", path.as_os_str()),
             ("AL_GOAL_WAIT_MS", wait.as_os_str()),
+            ("TMUX_TMPDIR", socket.path().as_os_str()),
         ],
     );
     assert!(
@@ -2108,6 +2242,8 @@ fn new_project_sends_native_goal_via_tmux() {
             "-t",
             &format!("{omp_name}:omlo-{omp_name}"),
         ])
+        .env("TMUX_TMPDIR", socket.path())
+        .env_remove("TMUX")
         .output()
         .expect("tmux capture omp");
     assert!(omp_pane.status.success(), "omp capture failed");
@@ -2122,13 +2258,6 @@ fn new_project_sends_native_goal_via_tmux() {
     );
 }
 
-#[cfg(unix)]
-fn scopeguard_kill(session: &str) -> TmuxKillOnDrop {
-    TmuxKillOnDrop {
-        session: session.to_owned(),
-        tmpdir: None,
-    }
-}
 
 #[cfg(unix)]
 struct TmuxKillOnDrop {
@@ -2207,7 +2336,10 @@ fn live_list_attach_watch_and_supervise_surface() {
     let list = run_with_env(
         home.path(),
         &["list", "--json"],
-        &[("AL_LIVE_STATE_DIR", state.path().as_os_str())],
+        &[
+            ("AL_LIVE_STATE_DIR", state.path().as_os_str()),
+            ("TMUX_TMPDIR", state.path().as_os_str()),
+        ],
     );
     assert!(
         list.status.success(),
@@ -2230,7 +2362,10 @@ fn live_list_attach_watch_and_supervise_surface() {
     let plain = run_with_env(
         home.path(),
         &["list"],
-        &[("AL_LIVE_STATE_DIR", state.path().as_os_str())],
+        &[
+            ("AL_LIVE_STATE_DIR", state.path().as_os_str()),
+            ("TMUX_TMPDIR", state.path().as_os_str()),
+        ],
     );
     assert!(
         plain.status.success(),
@@ -2277,7 +2412,10 @@ fn live_list_attach_watch_and_supervise_surface() {
     let attach_missing = run_with_env(
         home.path(),
         &["attach", "--target", "%999"],
-        &[("AL_LIVE_STATE_DIR", state.path().as_os_str())],
+        &[
+            ("AL_LIVE_STATE_DIR", state.path().as_os_str()),
+            ("TMUX_TMPDIR", state.path().as_os_str()),
+        ],
     );
     assert!(
         !attach_missing.status.success(),
@@ -2291,6 +2429,7 @@ fn live_list_attach_watch_and_supervise_surface() {
         &[
             ("AL_SUPERVISE_MAX_TICKS", OsStr::new("1")),
             ("AL_LIVE_STATE_DIR", state.path().as_os_str()),
+            ("TMUX_TMPDIR", state.path().as_os_str()),
         ],
     );
     let keep_all_err = String::from_utf8_lossy(&keep_all.stderr);

@@ -43,7 +43,10 @@ const IMAGE_ONLY_PLACEHOLDER: &str = "[Image]";
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexItem {
     SessionMeta(CodexSessionMeta),
-    ResponseMessage(CodexResponseMessage),
+    ResponseMessage {
+        message: CodexResponseMessage,
+        from_event: bool,
+    },
     FunctionCall {
         call_id: String,
         name: String,
@@ -177,6 +180,7 @@ pub fn parse(path: &Path) -> Result<Session> {
     let mut first_line_timestamp: Option<String> = None;
     let mut hints = crate::domain::SessionHints::default();
     let mut compaction_summary = None;
+    let mut previous_assistant_from_event: Option<bool> = None;
 
     for value in values {
         let timestamp = value
@@ -193,13 +197,25 @@ pub fn parse(path: &Path) -> Result<Session> {
                 // (`state/src/extract.rs:62-66`).
                 if session_meta.is_none() {
                     apply_codex_hints(&mut hints, &meta.extra);
+                    if codex_source_is_subagent(meta.extra.get("source")) {
+                        hints.session_kind = Some("subagent".to_owned());
+                    }
                     session_meta = Some(meta);
                 }
             }
-            CodexItem::ResponseMessage(record) => {
-                if let Some(message) = project_message(&record, timestamp.as_deref()) {
-                    if !duplicate_assistant_text(&messages, &message) {
-                        messages.push(message);
+            CodexItem::ResponseMessage { message, from_event } => {
+                if let Some(projected) = project_message(&message, timestamp.as_deref()) {
+                    let complementary = duplicate_assistant_text(&messages, &projected)
+                        && previous_assistant_from_event
+                            .is_some_and(|previous| previous != from_event);
+                    if complementary {
+                        previous_assistant_from_event = Some(from_event);
+                    } else {
+                        let remember = assistant_text_message(&projected);
+                        messages.push(projected);
+                        if remember {
+                            previous_assistant_from_event = Some(from_event);
+                        }
                     }
                 }
             }
@@ -351,7 +367,10 @@ fn classify_response_item(payload: Value, type_tag: Option<String>, record: Valu
         .map(str::to_owned);
     match inner_type.as_deref() {
         Some("message") => serde_json::from_value::<CodexResponseMessage>(payload)
-            .map(CodexItem::ResponseMessage)
+            .map(|message| CodexItem::ResponseMessage {
+                message,
+                from_event: false,
+            })
             .unwrap_or(CodexItem::Unknown {
                 type_tag,
                 raw: record,
@@ -443,13 +462,14 @@ fn classify_event_msg(payload: Value, type_tag: Option<String>, record: Value) -
                 .map(str::to_owned);
             match (inner_type.as_deref(), text) {
                 (Some("agent_reasoning"), Some(text)) => CodexItem::Reasoning { text },
-                (Some("agent_message"), Some(text)) => {
-                    CodexItem::ResponseMessage(CodexResponseMessage {
+                (Some("agent_message"), Some(text)) => CodexItem::ResponseMessage {
+                    message: CodexResponseMessage {
                         role: "assistant".to_owned(),
                         content: Value::String(text),
                         extra: Map::new(),
-                    })
-                }
+                    },
+                    from_event: true,
+                },
                 _ => CodexItem::Unknown {
                     type_tag,
                     raw: record,
@@ -484,11 +504,18 @@ fn project_message(record: &CodexResponseMessage, timestamp: Option<&str>) -> Op
     parsed_message(Some(&record.role), Some(&record.content), timestamp)
 }
 
+fn assistant_text_message(message: &Message) -> bool {
+    message.role == Role::Assistant
+        && message
+            .parts
+            .iter()
+            .any(|part| matches!(part, ContentPart::Text(text) if !text.is_empty()))
+}
+
 fn duplicate_assistant_text(messages: &[Message], incoming: &Message) -> bool {
-    incoming.role == Role::Assistant
-        && !incoming.text.is_empty()
+    assistant_text_message(incoming)
         && messages.last().is_some_and(|previous| {
-            previous.role == Role::Assistant && previous.text == incoming.text
+            assistant_text_message(previous) && previous.text == incoming.text
         })
 }
 
@@ -534,6 +561,14 @@ fn apply_codex_hints(hints: &mut crate::domain::SessionHints, extra: &Map<String
             .find_map(|key| extra.get(key).and_then(Value::as_str))
             .and_then(|value| value.parse().ok());
     }
+}
+
+/// Native `SessionSource` is externally tagged. Only the `subagent` variant is
+/// a catalog child; string origins and other object variants stay main sessions.
+fn codex_source_is_subagent(source: Option<&Value>) -> bool {
+    source
+        .and_then(Value::as_object)
+        .is_some_and(|source| source.contains_key("subagent"))
 }
 
 fn project_function_output(call_id: String, output: Value, timestamp: Option<String>) -> Message {
@@ -900,6 +935,51 @@ mod tests {
     }
 
     #[test]
+    fn session_meta_subagent_source_object_is_a_child() {
+        let meta = r#"{"timestamp":"2026-07-29T06:04:37.826Z","type":"session_meta","payload":{"id":"11111111-1111-4111-8111-111111111111","timestamp":"2026-07-29T06:04:37.826Z","cwd":"/workspace/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"22222222-2222-4222-8222-222222222222","depth":1,"agent_path":null,"agent_nickname":"worker"}}},"cli_version":"sessions-convert"}}"#;
+        let file = session_file(&[meta, USER_RESPONSE]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(session.hints.session_kind.as_deref(), Some("subagent"));
+        assert!(session.is_catalog_child());
+    }
+
+    #[test]
+    fn normal_source_and_forked_from_stay_main_sessions() {
+        let cli = r#"{"timestamp":"2026-07-29T06:04:37.826Z","type":"session_meta","payload":{"id":"11111111-1111-4111-8111-111111111111","timestamp":"2026-07-29T06:04:37.826Z","cwd":"/workspace/project","originator":"codex-tui","source":"cli","cli_version":"sessions-convert"}}"#;
+        let cli_session = parse(session_file(&[cli, USER_RESPONSE]).path()).expect("parse");
+        assert_eq!(cli_session.hints.session_kind, None);
+        assert!(!cli_session.is_catalog_child());
+
+        let exec = r#"{"timestamp":"2026-07-29T06:04:37.826Z","type":"session_meta","payload":{"id":"11111111-1111-4111-8111-111111111111","timestamp":"2026-07-29T06:04:37.826Z","cwd":"/workspace/project","originator":"codex-exec","source":{"exec":{}},"cli_version":"sessions-convert"}}"#;
+        let exec_session = parse(session_file(&[exec, USER_RESPONSE]).path()).expect("parse");
+        assert_eq!(exec_session.hints.session_kind, None);
+
+        let vscode = r#"{"timestamp":"2026-07-29T06:04:37.826Z","type":"session_meta","payload":{"id":"11111111-1111-4111-8111-111111111111","timestamp":"2026-07-29T06:04:37.826Z","cwd":"/workspace/project","originator":"codex-vscode","source":{"vscode":{}},"cli_version":"sessions-convert"}}"#;
+        let vscode_session = parse(session_file(&[vscode, USER_RESPONSE]).path()).expect("parse");
+        assert_eq!(vscode_session.hints.session_kind, None);
+
+        let bare = r#"{"timestamp":"2026-07-29T06:04:37.826Z","type":"session_meta","payload":{"id":"11111111-1111-4111-8111-111111111111","timestamp":"2026-07-29T06:04:37.826Z","cwd":"/workspace/project","originator":"codex-tui","source":"subagent","cli_version":"sessions-convert"}}"#;
+        let bare_session = parse(session_file(&[bare, USER_RESPONSE]).path()).expect("parse");
+        assert_eq!(bare_session.hints.session_kind, None);
+        assert!(!bare_session.is_catalog_child());
+
+        let forked = r#"{"timestamp":"2026-07-29T06:04:37.826Z","type":"session_meta","payload":{"id":"11111111-1111-4111-8111-111111111111","timestamp":"2026-07-29T06:04:37.826Z","cwd":"/workspace/project","originator":"codex-tui","source":"cli","forked_from_id":"33333333-3333-4333-8333-333333333333","cli_version":"sessions-convert"}}"#;
+        let forked_session = parse(session_file(&[forked, USER_RESPONSE]).path()).expect("parse");
+        assert_eq!(forked_session.hints.session_kind, None);
+        assert!(!forked_session.is_catalog_child());
+    }
+
+    #[test]
+    fn later_session_meta_and_turn_context_do_not_set_subagent() {
+        let later = r#"{"timestamp":"2026-07-29T06:05:00.000Z","type":"session_meta","payload":{"id":"deadbeef-0000-0000-0000-000000000000","timestamp":"2026-07-29T06:05:00.000Z","cwd":"/elsewhere","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"22222222-2222-4222-8222-222222222222","depth":1}}},"cli_version":"x"}}"#;
+        let turn = r#"{"timestamp":"2026-07-29T06:04:38.000Z","type":"turn_context","payload":{"cwd":"/srv/late","source":{"subagent":{"thread_spawn":{"parent_thread_id":"22222222-2222-4222-8222-222222222222","depth":1}}}}}"#;
+        let file = session_file(&[META, later, turn, USER_RESPONSE]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(session.hints.session_kind, None);
+        assert!(!session.is_catalog_child());
+    }
+
+    #[test]
     fn image_only_user_message_preview() {
         let user = CodexUserMessageEvent {
             message: String::new(),
@@ -981,6 +1061,91 @@ mod tests {
             .map(|message| message.text.as_str())
             .collect();
         assert_eq!(assistant, ["checking the driver"]);
+    }
+
+    #[test]
+    fn consecutive_response_items_with_identical_text_are_kept() {
+        let first = r#"{"timestamp":"2026-07-29T06:04:39.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"same answer"}]}}"#;
+        let second = r#"{"timestamp":"2026-07-29T06:04:40.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"same answer"}]}}"#;
+        let file = session_file(&[META, first, second]);
+        let session = parse(file.path()).expect("parse");
+        let assistant: Vec<&str> = session
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(assistant, ["same answer", "same answer"]);
+    }
+
+    #[test]
+    fn response_then_matching_agent_event_collapses_to_one_assistant() {
+        let response = r#"{"timestamp":"2026-07-29T06:04:39.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking the driver"}]}}"#;
+        let event = r#"{"timestamp":"2026-07-29T06:04:39.100Z","type":"event_msg","payload":{"type":"agent_message","message":"checking the driver"}}"#;
+        let file = session_file(&[META, response, event]);
+        let session = parse(file.path()).expect("parse");
+        let assistant: Vec<&str> = session
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(assistant, ["checking the driver"]);
+    }
+
+    #[test]
+    fn event_then_two_identical_responses_keeps_the_second_response() {
+        let event = r#"{"timestamp":"2026-07-29T06:04:39.000Z","type":"event_msg","payload":{"type":"agent_message","message":"same answer"}}"#;
+        let first = r#"{"timestamp":"2026-07-29T06:04:39.100Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"same answer"}]}}"#;
+        let second = r#"{"timestamp":"2026-07-29T06:04:40.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"same answer"}]}}"#;
+        let file = session_file(&[META, event, first, second]);
+        let session = parse(file.path()).expect("parse");
+        let assistant: Vec<&str> = session
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(assistant, ["same answer", "same answer"]);
+    }
+
+    #[test]
+    fn response_then_two_identical_events_keeps_the_second_event() {
+        let response = r#"{"timestamp":"2026-07-29T06:04:39.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"same answer"}]}}"#;
+        let first = r#"{"timestamp":"2026-07-29T06:04:39.100Z","type":"event_msg","payload":{"type":"agent_message","message":"same answer"}}"#;
+        let second = r#"{"timestamp":"2026-07-29T06:04:40.000Z","type":"event_msg","payload":{"type":"agent_message","message":"same answer"}}"#;
+        let file = session_file(&[META, response, first, second]);
+        let session = parse(file.path()).expect("parse");
+        let assistant: Vec<&str> = session
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(assistant, ["same answer", "same answer"]);
+    }
+
+    #[test]
+    fn developer_note_does_not_drop_matching_assistant_text() {
+        let developer = r#"{"timestamp":"2026-07-29T06:04:38.500Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"same answer"}]}}"#;
+        let event = r#"{"timestamp":"2026-07-29T06:04:39.000Z","type":"event_msg","payload":{"type":"agent_message","message":"same answer"}}"#;
+        let response = r#"{"timestamp":"2026-07-29T06:04:39.100Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"same answer"}]}}"#;
+        let file = session_file(&[META, developer, event, response]);
+        let session = parse(file.path()).expect("parse");
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, ContentPart::Note { kind, text } if kind == "developer" && text == "same answer")
+            })
+        }));
+        let assistant_text: Vec<&str> = session
+            .messages
+            .iter()
+            .filter(|message| {
+                message.parts.iter().any(|part| matches!(part, ContentPart::Text(_)))
+            })
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(assistant_text, ["same answer"]);
     }
 
     #[test]

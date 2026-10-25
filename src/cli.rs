@@ -120,6 +120,9 @@ pub struct SessionListArgs {
     /// Include workflow/subagent child sessions in the listing.
     #[arg(long)]
     pub children: bool,
+    /// Include temporary sessions in the listing.
+    #[arg(long)]
+    pub temporary: bool,
     #[arg(
         long = "host",
         value_name = "HOST",
@@ -143,6 +146,9 @@ pub struct SessionSearchArgs {
     /// Include workflow/subagent child sessions in the search results.
     #[arg(long)]
     pub children: bool,
+    /// Include temporary sessions in the search results.
+    #[arg(long)]
+    pub temporary: bool,
     #[arg(long)]
     pub picker: bool,
     #[arg(value_parser = nonempty_query)]
@@ -313,6 +319,12 @@ pub struct SuperviseDiffArgs {
 
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct SessionQueryArgs {
+    /// Include workflow/subagent child sessions in the search results.
+    #[arg(long)]
+    pub children: bool,
+    /// Include temporary sessions in the search results.
+    #[arg(long)]
+    pub temporary: bool,
     #[arg(required = true, num_args = 1.., value_parser = nonempty_query)]
     pub query: Vec<String>,
 }
@@ -431,7 +443,16 @@ fn nonempty_host(value: &str) -> Result<String, String> {
     }
 }
 
+fn install_debug_log() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("off"))
+        .format_timestamp(None)
+        .format_target(false)
+        .format_indent(None)
+        .try_init();
+}
+
 pub fn run() -> anyhow::Result<()> {
+    install_debug_log();
     let cli = match Cli::try_parse_from(std::env::args_os()) {
         Ok(cli) => cli,
         Err(error) => error.exit(),
@@ -472,7 +493,9 @@ fn dispatch_sessions(sessions: SessionsCli) -> anyhow::Result<()> {
         None => dispatch_list(sessions.default_list),
         Some(SessionsCommand::List(args)) => dispatch_list(args),
         Some(SessionsCommand::Search(args)) => dispatch_search(args),
-        Some(SessionsCommand::Query(args)) => dispatch_picker(Some(args.query.join(" "))),
+        Some(SessionsCommand::Query(args)) => {
+            dispatch_picker(Some(args.query.join(" ")), args.children, args.temporary)
+        }
         Some(SessionsCommand::Convert(args)) => dispatch_convert(args),
         Some(SessionsCommand::Move(args)) => dispatch_move(args),
         Some(SessionsCommand::Fork(args)) => {
@@ -512,13 +535,14 @@ fn dispatch_list(args: SessionListArgs) -> anyhow::Result<()> {
 
 fn dispatch_local_list(args: &SessionListArgs) -> anyhow::Result<()> {
     if args.fzf {
-        return dispatch_picker(None);
+        return dispatch_picker(None, args.children, args.temporary);
     }
     let rows = crate::sessions::list_rows(&crate::sessions::ListOptions {
         count: args.count,
         show_all: args.all,
         dedupe: args.dedupe,
         include_children: args.children,
+        include_temporary: args.temporary,
         tools: Vec::new(),
     })?;
     if args.paths {
@@ -576,6 +600,9 @@ fn remote_session_list_command(args: &SessionListArgs) -> String {
     if args.children {
         command.push_str(" '--children'");
     }
+    if args.temporary {
+        command.push_str(" '--temporary'");
+    }
     command
 }
 
@@ -599,6 +626,7 @@ fn dispatch_search(args: SessionSearchArgs) -> anyhow::Result<()> {
         &crate::sessions::SearchOptions {
             dedupe: args.dedupe,
             include_children: args.children,
+            include_temporary: args.temporary,
             tools: Vec::new(),
         },
     )?;
@@ -901,14 +929,19 @@ fn prepare_session_launch(
     let created_output = emitted.path.clone();
     Ok((emitted.path, emitted.session_id, Some(created_output)))
 }
-fn dispatch_picker(query: Option<String>) -> anyhow::Result<()> {
+fn dispatch_picker(
+    query: Option<String>,
+    include_children: bool,
+    include_temporary: bool,
+) -> anyhow::Result<()> {
     let is_search = query.is_some();
     let rows = match query {
         Some(query) => crate::sessions::search_rows(
             &query,
             &crate::sessions::SearchOptions {
                 dedupe: true,
-                include_children: false,
+                include_children,
+                include_temporary,
                 tools: Vec::new(),
             },
         )?,
@@ -916,7 +949,8 @@ fn dispatch_picker(query: Option<String>) -> anyhow::Result<()> {
             count: None,
             show_all: true,
             dedupe: true,
-            include_children: false,
+            include_children,
+            include_temporary,
             tools: Vec::new(),
         })?,
     };
@@ -1302,6 +1336,7 @@ mod tests {
         assert_eq!(default.default_list.count, Some(12));
         assert!(default.default_list.dedupe);
         assert!(!default.default_list.children);
+        assert!(!default.default_list.temporary);
         assert!(default.default_list.paths);
         assert!(default.default_list.hosts.is_empty());
 
@@ -1312,6 +1347,7 @@ mod tests {
             "7",
             "--all",
             "--children",
+            "--temporary",
             "--picker",
         ])
         .unwrap();
@@ -1324,6 +1360,7 @@ mod tests {
         assert_eq!(list.count, Some(7));
         assert!(list.all);
         assert!(list.children);
+        assert!(list.temporary);
         assert!(list.picker);
     }
 
@@ -1406,10 +1443,18 @@ mod tests {
         };
         assert!(search.dedupe);
         assert!(!search.children);
+        assert!(!search.temporary);
         assert!(search.picker);
         assert_eq!(search.query, "Needle");
-        let with_children =
-            Cli::try_parse_from(["al", "sessions", "search", "--children", "Needle"]).unwrap();
+        let with_children = Cli::try_parse_from([
+            "al",
+            "sessions",
+            "search",
+            "--children",
+            "--temporary",
+            "Needle",
+        ])
+        .unwrap();
         let Some(Command::Sessions(sessions)) = with_children.command else {
             panic!("expected sessions command");
         };
@@ -1417,6 +1462,7 @@ mod tests {
             panic!("expected search command");
         };
         assert!(search.children);
+        assert!(search.temporary);
         assert!(Cli::try_parse_from(["al", "sessions", "search", "   "]).is_err());
         assert!(
             Cli::try_parse_from(["al", "sessions", "search", "--host", "host-a", "q"]).is_err()
@@ -1430,11 +1476,12 @@ mod tests {
             all: true,
             dedupe: true,
             children: true,
+            temporary: true,
             ..SessionListArgs::default()
         };
         assert_eq!(
             remote_session_list_command(&args),
-            "exec 'al' 'sessions' 'list' '4' '--all' '--dedupe' '--children'"
+            "exec 'al' 'sessions' 'list' '4' '--all' '--dedupe' '--children' '--temporary'"
         );
         assert_eq!(
             remote_session_list_command(&SessionListArgs::default()),
@@ -1689,6 +1736,18 @@ mod tests {
             panic!("expected query command");
         };
         assert_eq!(args.query, ["one", "two"]);
+        let filtered =
+            Cli::try_parse_from(["al", "sessions", "query", "--children", "--temporary", "one"])
+                .unwrap();
+        let Some(Command::Sessions(sessions)) = filtered.command else {
+            panic!("expected sessions command");
+        };
+        let Some(SessionsCommand::Query(args)) = sessions.command else {
+            panic!("expected query command");
+        };
+        assert!(args.children);
+        assert!(args.temporary);
+        assert_eq!(args.query, ["one"]);
         assert!(Cli::try_parse_from(["al", "sessions", "query"]).is_err());
         assert!(Cli::try_parse_from(["al", "sessions", "query", "   "]).is_err());
     }

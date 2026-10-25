@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Component, Components, Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -334,6 +334,13 @@ impl Session {
     pub fn is_catalog_child(&self) -> bool {
         self.hints.hidden || is_internal_session_kind(self.hints.session_kind.as_deref())
     }
+
+    /// Scratch sessions whose cwd is a generated directory directly under a
+    /// temporary root. A durable project that merely lives in `/tmp`, or that
+    /// contains a `.tmp…` component deeper in the path, stays in the catalog.
+    pub fn is_catalog_temporary(&self) -> bool {
+        is_generated_temporary_cwd(&self.cwd)
+    }
 }
 
 /// Native workflow/subagent kinds. Missing or `user` is a first-class session.
@@ -342,6 +349,48 @@ pub fn is_internal_session_kind(kind: Option<&str>) -> bool {
         return false;
     };
     !kind.eq_ignore_ascii_case("user")
+}
+
+/// True when `cwd`'s first component under `/tmp`, `/private/tmp`, or `/var/tmp`
+/// is `.tmp` followed by at least six ASCII alphanumeric characters, and the
+/// rest of that component is alphanumeric too.
+fn is_generated_temporary_cwd(cwd: &Path) -> bool {
+    if cwd.components().any(|component| component == Component::ParentDir) {
+        return false;
+    }
+    let mut components = cwd.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return false;
+    }
+    let Some(first) = next_normal(&mut components) else {
+        return false;
+    };
+    let child = match first {
+        "tmp" => next_normal(&mut components),
+        "private" | "var" => match next_normal(&mut components) {
+            Some("tmp") => next_normal(&mut components),
+            _ => None,
+        },
+        _ => None,
+    };
+    child.is_some_and(is_generated_temporary_name)
+}
+
+fn next_normal<'a>(components: &mut Components<'a>) -> Option<&'a str> {
+    loop {
+        match components.next()? {
+            Component::CurDir => {}
+            Component::Normal(name) => return name.to_str(),
+            _ => return None,
+        }
+    }
+}
+
+fn is_generated_temporary_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(".tmp") else {
+        return false;
+    };
+    suffix.len() >= 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 #[derive(Debug, Clone)]
@@ -607,6 +656,60 @@ mod tests {
         session.hints.session_kind = None;
         session.hints.hidden = true;
         assert!(session.is_catalog_child());
+    }
+
+    #[test]
+    fn catalog_temporary_matches_generated_tmp_children_only() {
+        let mut session = Session {
+            tool: SourceTool::Pi,
+            session_id: "s".to_owned(),
+            cwd: PathBuf::from("/workspace/project"),
+            start_timestamp: None,
+            summary: String::new(),
+            messages: Vec::new(),
+            path: PathBuf::from("/tmp/s.jsonl"),
+            modified_epoch: None,
+            hints: SessionHints::default(),
+        };
+        let temporary = [
+            "/tmp/.tmpAbc123",
+            "/tmp/.tmpAbc123/nested/deeper",
+            "/private/tmp/.tmpabcdef",
+            "/var/tmp/.tmp000000/work",
+            "/tmp/.tmpA1b2C3/",
+            "/tmp/./.tmpAbc123",
+            "/tmp/.tmpAbc123/./nested",
+            "/tmp/.tmpsession",
+        ];
+        for cwd in temporary {
+            session.cwd = PathBuf::from(cwd);
+            assert!(session.is_catalog_temporary(), "{cwd}");
+        }
+        let durable = [
+            "/tmp",
+            "/tmp/",
+            "/private/tmp",
+            "/var/tmp",
+            "/tmp/grok",
+            "/tmp/project",
+            "/tmp/.tmp",
+            "/tmp/.tmpAbc12",
+            "/tmp/.tmpAbc12!",
+            "/tmp/.tmpAbc-123",
+            "/workspace/project/.tmpAbc123",
+            "/workspace/.tmpAbc123/nested",
+            "/opt/tmp/.tmpAbc123",
+            "tmp/.tmpAbc123",
+            "/tmp/project/.tmpAbc123",
+            "/private/var/tmp/.tmpAbc123",
+            "/tmp/../tmp/.tmpAbc123",
+            "/tmp/.tmpAbc123/../project",
+            "/tmp/.tmpAb12Cd/../../durable",
+        ];
+        for cwd in durable {
+            session.cwd = PathBuf::from(cwd);
+            assert!(!session.is_catalog_temporary(), "{cwd}");
+        }
     }
 
     #[test]

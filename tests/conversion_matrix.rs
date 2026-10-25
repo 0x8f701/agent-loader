@@ -1,9 +1,9 @@
 //! Source × target conversion matrix.
 //!
-//! Every convertible source is emitted to every target except Agent. The
-//! portable conversation must keep user/assistant text, thinking, tool calls,
-//! and tool results that the target format can represent.
-
+//! Every convertible source, including Agent, is emitted to every target except
+//! Agent. The portable conversation must keep user/assistant text, thinking,
+//! tool ids, tool arguments, and tool results that the target can represent.
+//! Fields a target cannot store are reported as representability losses.
 use std::fs;
 use std::path::Path;
 
@@ -296,6 +296,11 @@ fn native_sources_convert_to_every_target() {
             r#"{"type":"message","id":"x1","parentId":"b1","timestamp":"2026-09-04T10:00:06.000Z","message":{"role":"bashExecution","command":"ls","output":"src","timestamp":6}}"#,
         ],
     );
+    let rpi = home.join(".rpi/sessions/--workspace-project--/2026-09-04T10-00-00_rpi-src.jsonl");
+    if let Some(parent) = rpi.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::copy(&pi, &rpi).unwrap();
 
     let omp =
         home.join(".omp/agent/sessions/--workspace-project--/2026-09-04T10-00-00_omp-src.jsonl");
@@ -387,13 +392,17 @@ fn native_sources_convert_to_every_target() {
     .unwrap();
     let grok = grok_dir.join("summary.json");
 
+    let agent = write_agent_store(home);
+
     let sources = [
         (SourceTool::Pi, pi),
+        (SourceTool::Rpi, rpi),
         (SourceTool::Omp, omp),
         (SourceTool::Claude, claude),
         (SourceTool::Droid, droid),
         (SourceTool::Codex, codex),
         (SourceTool::Grok, grok),
+        (SourceTool::Agent, agent),
     ];
 
     for (source, input) in sources {
@@ -402,6 +411,7 @@ fn native_sources_convert_to_every_target() {
             .filter(|target| *target != TargetTool::Agent)
         {
             let parsed = convert_native(home, source, &input, target);
+            let before = catalog_parse(home, source, &input);
             assert!(
                 contains_text(&parsed, "list the file"),
                 "{source}->{target} dropped user text"
@@ -411,8 +421,16 @@ fn native_sources_convert_to_every_target() {
                 "{source}->{target} dropped tool use"
             );
             assert!(
+                has_tool_id(&parsed, "call-1"),
+                "{source}->{target} dropped tool id"
+            );
+            assert!(
                 has_tool_result(&parsed, "fn main()"),
                 "{source}->{target} dropped tool result"
+            );
+            assert!(
+                has_tool_result_id(&parsed, "call-1"),
+                "{source}->{target} dropped tool result id"
             );
             assert!(
                 has_thinking(&parsed, "I should read it"),
@@ -427,16 +445,57 @@ fn native_sources_convert_to_every_target() {
                 Some("source-model"),
                 "{source}->{target} dropped model hint"
             );
-            assert_eq!(
-                parsed.hints.thinking_level,
-                Some(ThinkingLevel::High),
-                "{source}->{target} dropped thinking level"
-            );
+            if matches!(
+                source,
+                SourceTool::Pi | SourceTool::Rpi | SourceTool::Omp | SourceTool::Codex
+            ) {
+                assert_eq!(
+                    before.hints.provider.as_deref(),
+                    Some("source-provider"),
+                    "{source} parser dropped provider"
+                );
+            }
+            if before.hints.provider.is_some()
+                && matches!(
+                    target,
+                    TargetTool::Pi | TargetTool::Rpi | TargetTool::Omp | TargetTool::Codex
+                )
+            {
+                assert_eq!(
+                    parsed.hints.provider.as_deref(),
+                    before.hints.provider.as_deref(),
+                    "{source}->{target} dropped representable provider"
+                );
+            }
+            if source == SourceTool::Agent {
+                assert_eq!(
+                    before.hints.thinking_level,
+                    None,
+                    "{source} parser invented thinking level"
+                );
+            } else {
+                assert_eq!(
+                    before.hints.thinking_level,
+                    Some(ThinkingLevel::High),
+                    "{source} parser dropped thinking level"
+                );
+            }
+            if before.hints.thinking_level.is_some() {
+                assert_eq!(
+                    parsed.hints.thinking_level,
+                    before.hints.thinking_level,
+                    "{source}->{target} dropped thinking level"
+                );
+            }
             assert!(
                 has_object_tool_input(&parsed, "path", "src/lib.rs"),
                 "{source}->{target} dropped object tool arguments"
             );
-            if matches!(source, SourceTool::Claude | SourceTool::Codex) {
+            if matches!(source, SourceTool::Claude | SourceTool::Codex)
+                || (matches!(source, SourceTool::Pi | SourceTool::Rpi)
+                    && (has_note(&before, "prior context")
+                        || contains_text(&before, "prior context")))
+            {
                 assert!(
                     has_note(&parsed, "prior context") || contains_text(&parsed, "prior context"),
                     "{source}->{target} dropped compact summary"
@@ -449,13 +508,17 @@ fn native_sources_convert_to_every_target() {
                     );
                 }
             }
-            if matches!(source, SourceTool::Claude | SourceTool::Grok) {
+            if matches!(source, SourceTool::Claude | SourceTool::Grok | SourceTool::Agent) {
+                assert!(
+                    has_image(&before, "toolImgData"),
+                    "{source} parser dropped nested tool-result image"
+                );
                 assert!(
                     has_image(&parsed, "toolImgData"),
                     "{source}->{target} dropped nested tool-result image"
                 );
             }
-            if source == SourceTool::Pi {
+            if matches!(source, SourceTool::Pi | SourceTool::Rpi) {
                 assert!(
                     has_note(&parsed, "other branch work")
                         || contains_text(&parsed, "other branch work"),
@@ -498,8 +561,74 @@ fn native_sources_convert_to_every_target() {
                     "{source}->{target} dropped search_result block"
                 );
             }
+
         }
     }
+}
+
+fn catalog_parse(home: &Path, source: SourceTool, input: &Path) -> Session {
+    Catalog::new(home)
+        .parse(source, input)
+        .unwrap_or_else(|error| panic!("parse {source}: {error}"))
+}
+
+fn write_agent_store(home: &Path) -> std::path::PathBuf {
+    let directory = home.join(".cursor/chats/0123456789abcdef0123456789abcdef/agent-src");
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("store.db");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)", [])
+        .unwrap();
+    connection
+        .execute("CREATE TABLE blobs(id TEXT PRIMARY KEY, data BLOB)", [])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO meta VALUES('0', ?1)",
+            [r#"{"agentId":"agent-src","model":"source-model"}"#],
+        )
+        .unwrap();
+    let blobs: [&[u8]; 4] = [
+        br#"{"role":"user","content":[{"type":"text","text":"list the file"},{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}]}"#,
+        br#"{"role":"assistant","content":[{"type":"redacted-reasoning","data":"opaque"},{"type":"thinking","thinking":"I should read it","signature":"think-sig"},{"type":"text","text":"reading now"},{"type":"tool-call","toolCallId":"call-1","toolName":"Read","args":{"path":"src/lib.rs"}}]}"#,
+        br#"{"role":"tool","content":[{"type":"tool-result","toolCallId":"call-1","result":[{"type":"text","text":"fn main() {}"},{"type":"image","data":"toolImgData","mimeType":"image/png"}],"isError":false}]}"#,
+        br#"{"role":"assistant","content":"the file starts with fn main"}"#,
+    ];
+    for (index, blob) in blobs.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO blobs VALUES(?1, ?2)",
+                rusqlite::params![index.to_string(), blob],
+            )
+            .unwrap();
+    }
+    drop(connection);
+    fs::write(
+        directory.join("meta.json"),
+        r#"{"cwd":"/workspace/project","title":"read the file","createdAtMs":1756976400000}"#,
+    )
+    .unwrap();
+    path
+}
+
+fn has_tool_id(session: &Session, id: &str) -> bool {
+    session.messages.iter().any(|message| {
+        message.parts.iter().any(|part| {
+            matches!(part, ContentPart::ToolUse { id: tool, .. } if tool == id)
+        })
+    })
+}
+
+fn has_tool_result_id(session: &Session, id: &str) -> bool {
+    session.messages.iter().any(|message| {
+        message.parts.iter().any(|part| {
+            matches!(
+                part,
+                ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == id
+            )
+        })
+    })
 }
 
 fn keeps_compaction_hint(target: TargetTool) -> bool {
@@ -521,6 +650,109 @@ fn has_object_tool_input(session: &Session, key: &str, value: &str) -> bool {
                 part,
                 ContentPart::ToolUse { input, .. }
                     if input.get(key).and_then(serde_json::Value::as_str) == Some(value)
+            )
+        })
+    })
+}
+
+#[test]
+fn codex_developer_note_round_trips_and_unknown_note_stays_text() {
+    let temporary = TempDir::new().unwrap();
+    let home = temporary.path();
+    let input = home.join(
+        ".codex/sessions/2026/09/04/rollout-2026-09-04T10-00-00-bbbbbbbb-0000-4000-8000-0000000000d0.jsonl",
+    );
+    write_lines(
+        &input,
+        &[
+            r#"{"timestamp":"2026-09-04T10:00:00.000Z","type":"session_meta","payload":{"id":"bbbbbbbb-0000-4000-8000-0000000000d0","timestamp":"2026-09-04T10:00:00.000Z","cwd":"/workspace/project","originator":"codex","cli_version":"0.0.0","source":"cli","model_provider":"source-provider"}}"#,
+            r#"{"timestamp":"2026-09-04T10:00:00.050Z","type":"turn_context","payload":{"cwd":"/workspace/project","model":"source-model"}}"#,
+            r#"{"timestamp":"2026-09-04T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"native developer instruction"}]}}"#,
+            r#"{"timestamp":"2026-09-04T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"list the file"}]}}"#,
+            r#"{"timestamp":"2026-09-04T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"reading now"}]}}"#,
+        ],
+    );
+    let before = catalog_parse(home, SourceTool::Codex, &input);
+    assert!(
+        has_note_kind(&before, "developer", "native developer instruction"),
+        "parser did not keep developer note"
+    );
+    let parsed = convert_native(home, SourceTool::Codex, &input, TargetTool::Codex);
+    assert!(
+        has_note_kind(&parsed, "developer", "native developer instruction"),
+        "developer note was not preserved"
+    );
+    assert!(
+        !has_note_kind(&parsed, "custom", "native developer instruction"),
+        "developer note changed kind"
+    );
+
+    let mut unknown = before;
+    unknown.messages.insert(
+        0,
+        Message::from_parts(
+            Role::User,
+            vec![ContentPart::Note {
+                kind: "custom".to_owned(),
+                text: "user custom content".to_owned(),
+            }],
+            None,
+        ),
+    );
+    let context = emit_context(home).with_session_id(
+        "cccccccc-0000-4000-8000-0000000000d1".to_owned(),
+    );
+    let emitted = emit(&unknown, TargetTool::Codex, &context).unwrap();
+    let reparsed = parse_emitted(&Catalog::new(home), TargetTool::Codex, &emitted.path);
+    assert!(
+        !has_note_kind(&reparsed, "developer", "user custom content"),
+        "unknown note was elevated to developer"
+    );
+    assert!(
+        contains_text(&reparsed, "user custom content"),
+        "unknown note text was dropped"
+    );
+}
+
+#[test]
+fn droid_todo_state_round_trips_as_todo_note() {
+    let temporary = TempDir::new().unwrap();
+    let home = temporary.path();
+    let input = home.join(".factory/sessions/-workspace-project/droid-todo.jsonl");
+    write_lines(
+        &input,
+        &[
+            r#"{"type":"session_start","id":"droid-todo","title":"read the file","cwd":"/workspace/project","version":2,"owner":"tester","model":"source-model","thinkingLevel":"high"}"#,
+            r#"{"type":"todo_state","id":"td1","timestamp":"2026-09-04T10:00:00.500Z","todos":{"todos":"1. [pending] inspect parser"}}"#,
+            r#"{"type":"message","id":"u1","timestamp":"2026-09-04T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"list the file"}]}}"#,
+            r#"{"type":"message","id":"a1","timestamp":"2026-09-04T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"reading now"}]}}"#,
+        ],
+    );
+    let before = catalog_parse(home, SourceTool::Droid, &input);
+    assert!(
+        has_note_kind(&before, "todo", "1. [pending] inspect parser"),
+        "parser did not keep todo note"
+    );
+    let parsed = convert_native(home, SourceTool::Droid, &input, TargetTool::Droid);
+    assert!(
+        has_note_kind(&parsed, "todo", "1. [pending] inspect parser"),
+        "todo note was not preserved"
+    );
+    assert!(
+        !parsed.messages.iter().any(|message| {
+            message.role == Role::User && message.text.contains("inspect parser")
+        }),
+        "todo note was rewritten as user text"
+    );
+}
+
+fn has_note_kind(session: &Session, kind: &str, needle: &str) -> bool {
+    session.messages.iter().any(|message| {
+        message.parts.iter().any(|part| {
+            matches!(
+                part,
+                ContentPart::Note { kind: note_kind, text }
+                    if note_kind == kind && text.contains(needle)
             )
         })
     })

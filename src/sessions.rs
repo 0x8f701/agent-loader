@@ -42,6 +42,9 @@ pub struct ListOptions {
     pub dedupe: bool,
     /// Include workflow/subagent child sessions. Default hides them.
     pub include_children: bool,
+    /// Include sessions whose cwd is a generated temporary directory.
+    /// Default hides them. Independent of `include_children`.
+    pub include_temporary: bool,
     /// An empty list selects every source. Repeated values are harmless.
     pub tools: Vec<SourceTool>,
 }
@@ -51,6 +54,9 @@ pub struct SearchOptions {
     pub dedupe: bool,
     /// Include workflow/subagent child sessions. Default hides them.
     pub include_children: bool,
+    /// Include sessions whose cwd is a generated temporary directory.
+    /// Default hides them. Independent of `include_children`.
+    pub include_temporary: bool,
     /// An empty list selects every source. Repeated values are harmless.
     pub tools: Vec<SourceTool>,
 }
@@ -141,7 +147,7 @@ impl Catalog {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    eprintln!(
+                    log::debug!(
                         "skip {} session discovery under {}: {error}",
                         tool,
                         root.path.display()
@@ -206,8 +212,10 @@ impl Catalog {
 
     pub fn list(&self, options: &ListOptions) -> Vec<SessionRow> {
         let include_children = options.include_children;
+        let include_temporary = options.include_temporary;
         let rows = self.scan_matching(&options.tools, |session| {
-            include_children || !session.is_catalog_child()
+            (include_children || !session.is_catalog_child())
+                && (include_temporary || !session.is_catalog_temporary())
         });
         select_rows(rows, options.count, options.show_all, options.dedupe)
     }
@@ -218,8 +226,10 @@ impl Catalog {
         }
         let needle = query.to_lowercase();
         let include_children = options.include_children;
+        let include_temporary = options.include_temporary;
         let rows = self.scan_matching(&options.tools, |session| {
             (include_children || !session.is_catalog_child())
+                && (include_temporary || !session.is_catalog_temporary())
                 && session
                     .messages
                     .iter()
@@ -322,7 +332,7 @@ impl Catalog {
                     Ok(metadata) if metadata.is_file() => metadata,
                     Ok(_) => continue,
                     Err(error) => {
-                        eprintln!("skip {tool} session {}: {error}", path.display());
+                        log::debug!("skip {tool} session {}: {error}", path.display());
                         continue;
                     }
                 };
@@ -331,7 +341,7 @@ impl Catalog {
                     Ok(session) => session,
                     Err(error) if is_expected_skip(&error) => continue,
                     Err(error) => {
-                        eprintln!(
+                        log::debug!(
                             "skip {tool} session {}: {}",
                             path.display(),
                             error.root_cause()
@@ -340,7 +350,7 @@ impl Catalog {
                     }
                 };
                 if session.session_id.is_empty() {
-                    eprintln!("skip {tool} session {}: missing session id", path.display());
+                    log::debug!("skip {tool} session {}: missing session id", path.display());
                     continue;
                 }
                 if !predicate(&session) {
@@ -1304,6 +1314,137 @@ mod tests {
     }
 
     #[test]
+    fn list_and_search_hide_generated_temporary_cwds_unless_requested() {
+        let (_home, catalog) = catalog();
+        let cases = [
+            (
+                "scratch",
+                "/tmp/.tmpAbc123",
+                "scratch token",
+                "workflowWorker",
+            ),
+            (
+                "nested",
+                "/private/tmp/.tmpAbc123/deeper/work",
+                "nested token",
+                "user",
+            ),
+            ("root", "/tmp", "root token", "user"),
+            ("named", "/tmp/grok", "named token", "user"),
+            ("short", "/tmp/.tmpAbc12", "short token", "user"),
+            (
+                "buried",
+                "/workspace/project/.tmpAbc123",
+                "buried token",
+                "user",
+            ),
+            ("var", "/var/tmp/.tmp000000/job", "var token", "user"),
+        ];
+        for (id, cwd, text, kind) in cases {
+            let path = catalog
+                .root_for_tool(SourceTool::Pi)
+                .path
+                .join(format!("project/{id}.jsonl"));
+            fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+            fs::write(
+                &path,
+                format!(
+                    concat!(
+                        r#"{{"type":"session","id":"{id}","cwd":"{cwd}","timestamp":"2026-01-01T00:00:00Z","sessionKind":"{kind}"}}"#,
+                        "\n",
+                        r#"{{"type":"message","id":"m1","parentId":null,"message":{{"role":"user","content":"{text}"}}}}"#,
+                        "\n",
+                    ),
+                    id = id,
+                    cwd = cwd,
+                    kind = kind,
+                    text = text,
+                ),
+            )
+            .expect("write session");
+        }
+
+        fn ids(rows: &[SessionRow]) -> Vec<&str> {
+            rows.iter().map(|row| row.session_id.as_str()).collect()
+        }
+        let listed = catalog.list(&ListOptions {
+            show_all: true,
+            tools: vec![SourceTool::Pi],
+            ..ListOptions::default()
+        });
+        let listed_ids = ids(&listed);
+        for kept in ["root", "named", "short", "buried"] {
+            assert!(listed_ids.contains(&kept), "{kept}");
+        }
+        assert!(!listed_ids.contains(&"scratch"));
+        assert!(!listed_ids.contains(&"nested"));
+        assert!(!listed_ids.contains(&"var"));
+
+        let temporary = catalog.list(&ListOptions {
+            show_all: true,
+            include_temporary: true,
+            tools: vec![SourceTool::Pi],
+            ..ListOptions::default()
+        });
+        let temporary_ids = ids(&temporary);
+        assert!(temporary_ids.contains(&"nested"));
+        assert!(temporary_ids.contains(&"var"));
+        assert!(!temporary_ids.contains(&"scratch"));
+
+        let both = catalog.list(&ListOptions {
+            show_all: true,
+            include_children: true,
+            include_temporary: true,
+            tools: vec![SourceTool::Pi],
+            ..ListOptions::default()
+        });
+        assert!(ids(&both).contains(&"scratch"));
+
+        let searched = catalog
+            .search("token", &SearchOptions::default())
+            .expect("search");
+        let searched_ids = ids(&searched);
+        assert!(searched_ids.contains(&"root"));
+        assert!(!searched_ids.contains(&"nested"));
+        assert!(!searched_ids.contains(&"scratch"));
+
+        let searched_temporary = catalog
+            .search(
+                "token",
+                &SearchOptions {
+                    include_temporary: true,
+                    ..SearchOptions::default()
+                },
+            )
+            .expect("search temporary");
+        let searched_temporary_ids = ids(&searched_temporary);
+        assert!(searched_temporary_ids.contains(&"nested"));
+        assert!(!searched_temporary_ids.contains(&"scratch"));
+
+        let searched_both = catalog
+            .search(
+                "token",
+                &SearchOptions {
+                    include_children: true,
+                    include_temporary: true,
+                    ..SearchOptions::default()
+                },
+            )
+            .expect("search both");
+        assert!(ids(&searched_both).contains(&"scratch"));
+
+        let scanned = catalog.scan(&[SourceTool::Pi]);
+        assert!(ids(&scanned).contains(&"scratch"));
+        assert_eq!(
+            catalog
+                .resolve_for_tool(SourceTool::Pi, "scratch")
+                .expect("resolve scratch")
+                .cwd,
+            Path::new("/tmp/.tmpAbc123")
+        );
+    }
+
+    #[test]
     fn list_keeps_grok_user_forks_with_parent_session_id() {
         let (_home, catalog) = catalog();
         let directory = catalog
@@ -1409,6 +1550,84 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, "match");
         assert!(catalog.search("  ", &SearchOptions::default()).is_err());
+    }
+
+    #[test]
+    fn search_folds_unicode_case_orders_newest_first_and_reports_no_match() {
+        let (_home, catalog) = catalog();
+        let older = write_pi(
+            &catalog,
+            "older",
+            "older.jsonl",
+            "older",
+            "/tmp/older",
+            &[("assistant", "Σίγμα plan")],
+        );
+        let newer = write_pi(
+            &catalog,
+            "newer",
+            "newer.jsonl",
+            "newer",
+            "/tmp/newer",
+            &[("user", "σίγμα notes")],
+        );
+        set_modified(&older, 10);
+        set_modified(&newer, 20);
+
+        let rows = catalog
+            .search("ΣΊΓΜΑ", &SearchOptions::default())
+            .expect("unicode search");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["newer", "older"]
+        );
+        assert!(
+            catalog
+                .search("absent token", &SearchOptions::default())
+                .expect("empty search")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_dedupe_collapses_same_workspace_summary_after_matching() {
+        let (_home, catalog) = catalog();
+        let older = write_pi(
+            &catalog,
+            "one",
+            "old.jsonl",
+            "old",
+            "/tmp/same",
+            &[("user", "Shared summary"), ("assistant", "needle")],
+        );
+        let newer = write_pi(
+            &catalog,
+            "two",
+            "new.jsonl",
+            "new",
+            "/tmp/same",
+            &[("user", "shared   summary"), ("assistant", "needle")],
+        );
+        set_modified(&older, 10);
+        set_modified(&newer, 30);
+
+        let rows = catalog
+            .search(
+                "needle",
+                &SearchOptions {
+                    dedupe: true,
+                    ..SearchOptions::default()
+                },
+            )
+            .expect("deduped search");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
     }
 
     #[test]
@@ -1585,6 +1804,7 @@ mod tests {
                 &SearchOptions {
                     dedupe: false,
                     include_children: false,
+                    include_temporary: false,
                     tools: vec![SourceTool::Agent],
                 },
             )

@@ -11,7 +11,9 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "env_logger",
  "libc",
+ "log",
  "parking_lot",
  "percent-encoding",
  "predicates",
@@ -263,6 +265,15 @@ name = "difflib"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6184e33543162437515c2e2b48714794e37845ec9851711914eec9d308f6ebe8"
+
+[[package]]
+name = "env_logger"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cd405aab171cb85d6735e5c8d9db038c17d3ca007a4d2c25f337935c3d90580"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "errno"

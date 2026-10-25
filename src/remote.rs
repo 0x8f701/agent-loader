@@ -149,6 +149,27 @@ pub fn argv_with(tool: RemoteTool, host: &str, remote: &[&str], tty: bool) -> Ve
         }
     }
 }
+/// Serialize remote command words for the transport selected for `host`.
+/// ssh joins argv with spaces and hands the string to the remote login shell,
+/// so every word is single-quoted; mosh 1.4 quotes each word for the ssh hop
+/// itself and mosh-server execs the command directly, so words pass raw.
+pub fn shell_argv(host: &str, words: &[&str], tty: bool) -> Vec<String> {
+    shell_argv_with(preferred_for(host), host, words, tty)
+}
+
+fn shell_argv_with(tool: RemoteTool, host: &str, words: &[&str], tty: bool) -> Vec<String> {
+    match tool {
+        RemoteTool::Mosh => argv_with(tool, host, words, tty),
+        RemoteTool::Ssh => {
+            let quoted: Vec<String> = words
+                .iter()
+                .map(|word| crate::new::posix_quote(word))
+                .collect();
+            let refs: Vec<&str> = quoted.iter().map(String::as_str).collect();
+            argv_with(tool, host, &refs, tty)
+        }
+    }
+}
 
 pub fn argv_os(host: &OsStr, remote: impl AsRef<OsStr>, tty: bool) -> (OsString, Vec<OsString>) {
     let host = host.to_string_lossy();
@@ -244,7 +265,7 @@ fn executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RemoteTool, argv_with, choose, should_fallback_with, ssh_probe_args};
+    use super::{RemoteTool, argv_with, choose, shell_argv_with, should_fallback_with, ssh_probe_args};
     use std::io;
 
     #[test]
@@ -268,6 +289,15 @@ mod tests {
                 "list-panes"
             ]
         );
+    }
+    #[test]
+    fn shell_argv_quotes_for_ssh_and_passes_raw_for_mosh() {
+        let words = ["tmux", "attach-session", "-t", "=my sess"];
+        let ssh = shell_argv_with(RemoteTool::Ssh, "host-a", &words, true);
+        assert!(ssh.contains(&"'=my sess'".to_owned()), "{ssh:?}");
+        let mosh = shell_argv_with(RemoteTool::Mosh, "host-a", &words, true);
+        assert!(mosh.contains(&"=my sess".to_owned()), "{mosh:?}");
+        assert!(!mosh.contains(&"'=my sess'".to_owned()), "{mosh:?}");
     }
 
     #[test]
