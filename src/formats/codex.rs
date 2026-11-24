@@ -366,10 +366,17 @@ fn classify_response_item(payload: Value, type_tag: Option<String>, record: Valu
         .and_then(Value::as_str)
         .map(str::to_owned);
     match inner_type.as_deref() {
-        Some("message") => serde_json::from_value::<CodexResponseMessage>(payload)
-            .map(|message| CodexItem::ResponseMessage {
-                message,
-                from_event: false,
+        // `agent_message` response items are inter-agent turns with
+        // `author`/`recipient` but no `role`; they are assistant-authored.
+        Some("message" | "agent_message") => serde_json::from_value::<CodexResponseMessage>(payload)
+            .map(|mut message| {
+                if message.role.is_empty() {
+                    message.role = "assistant".to_owned();
+                }
+                CodexItem::ResponseMessage {
+                    message,
+                    from_event: false,
+                }
             })
             .unwrap_or(CodexItem::Unknown {
                 type_tag,
@@ -395,6 +402,29 @@ fn classify_response_item(payload: Value, type_tag: Option<String>, record: Valu
                     .unwrap_or(Value::Null),
             ),
         },
+        // `tool_search_call` names no tool; the synthetic name keeps the call
+        // visible without inventing data. Restricted to this kind only.
+        Some("tool_search_call") => CodexItem::FunctionCall {
+            call_id: payload
+                .get("call_id")
+                .or_else(|| payload.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            name: payload
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("tool_search")
+                .to_owned(),
+            arguments: crate::formats::object_or_json(
+                payload
+                    .get("arguments")
+                    .or_else(|| payload.get("input"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+        },
         Some("web_search_call") => CodexItem::FunctionCall {
             call_id: payload
                 .get("id")
@@ -411,21 +441,46 @@ fn classify_response_item(payload: Value, type_tag: Option<String>, record: Valu
                     .unwrap_or(Value::Null),
             ),
         },
-        Some("function_call_output" | "custom_tool_call_output") => CodexItem::FunctionCallOutput {
-            call_id: payload
-                .get("call_id")
-                .or_else(|| payload.get("id"))
-                .and_then(Value::as_str)
+        // `tool_search_output` carries discovered `tools` instead of `output`.
+        Some("function_call_output" | "custom_tool_call_output" | "tool_search_output") => {
+            CodexItem::FunctionCallOutput {
+                call_id: payload
+                    .get("call_id")
+                    .or_else(|| payload.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                output: payload
+                    .get("output")
+                    .or_else(|| payload.get("tools"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            }
+        }
+        // Reasoning is almost always `encrypted_content`-only; when no
+        // plaintext or summary text exists the record degrades to an opaque
+        // `Unknown` instead of emitting an empty `Thinking` part.
+        Some("reasoning") => {
+            let text = first_text_from_content(payload.get("content").unwrap_or(&payload))
+                .or_else(|| {
+                    payload
+                        .get("summary")
+                        .and_then(|summary| match summary {
+                            Value::String(_) => summary.as_str(),
+                            _ => first_text_from_content(summary),
+                        })
+                })
                 .unwrap_or("")
-                .to_owned(),
-            output: payload.get("output").cloned().unwrap_or(Value::Null),
-        },
-        Some("reasoning") => CodexItem::Reasoning {
-            text: first_text_from_content(payload.get("content").unwrap_or(&payload))
-                .or_else(|| payload.get("summary").and_then(Value::as_str))
-                .unwrap_or("")
-                .to_owned(),
-        },
+                .to_owned();
+            if text.is_empty() {
+                CodexItem::Unknown {
+                    type_tag,
+                    raw: record,
+                }
+            } else {
+                CodexItem::Reasoning { text }
+            }
+        }
         _ => CodexItem::Unknown {
             type_tag,
             raw: record,
@@ -580,6 +635,15 @@ fn project_function_output(call_id: String, output: Value, timestamp: Option<Str
         .map(str::to_owned)
         .or_else(|| match &output {
             Value::String(text) => Some(text.clone()),
+            _ => None,
+        })
+        // Structured outputs without a text block (e.g. `tool_search_output`'s
+        // `tools` array) serialize to compact JSON instead of dropping.
+        .or_else(|| match &parsed {
+            Value::Null => None,
+            value @ (Value::Array(_) | Value::Object(_)) => {
+                serde_json::to_string(value).ok()
+            }
             _ => None,
         })
         .unwrap_or_default();
@@ -1171,6 +1235,82 @@ mod tests {
         assert!(session.messages.iter().any(|message| {
             message.parts.iter().any(|part| {
                 matches!(part, ContentPart::Note { kind, text } if kind == "compaction" && text == "prior context")
+            })
+        }));
+    }
+
+    #[test]
+    fn tool_search_call_and_output_survive_parse() {
+        // Real rollouts name no `name` on `tool_search_call` and carry the
+        // discovered tools under `tools` on `tool_search_output`.
+        let call = r#"{"timestamp":"2026-07-29T06:04:40.000Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"ts_1","id":"ts_1","arguments":{"limit":5},"status":"completed"}}"#;
+        let output = r#"{"timestamp":"2026-07-29T06:04:41.000Z","type":"response_item","payload":{"type":"tool_search_output","call_id":"ts_1","tools":[{"name":"shell"}],"status":"completed"}}"#;
+        let file = session_file(&[META, call, output]);
+        let session = parse(file.path()).expect("parse");
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolUse { id, name, input }
+                        if id == "ts_1"
+                            && name == "tool_search"
+                            && input.get("limit").and_then(Value::as_u64) == Some(5)
+                )
+            })
+        }));
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolResult { tool_use_id, content, .. }
+                        if tool_use_id == "ts_1" && content.contains("\"shell\"")
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn agent_message_response_item_projects_as_assistant() {
+        // Inter-agent `agent_message` items carry `author`/`recipient` instead
+        // of `role`; the text is assistant-authored and must not be dropped.
+        let item = r#"{"timestamp":"2026-07-29T06:04:39.000Z","type":"response_item","payload":{"type":"agent_message","author":"planner","recipient":"worker","content":[{"type":"input_text","text":"delegated note"}]}}"#;
+        let file = session_file(&[META, item]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].role, Role::Assistant);
+        assert_eq!(session.messages[0].text, "delegated note");
+    }
+
+    #[test]
+    fn encrypted_only_reasoning_degrades_without_empty_thinking() {
+        // Almost all real reasoning items are `encrypted_content`-only with an
+        // empty summary list; they must not emit an empty `Thinking` part.
+        let item = r#"{"timestamp":"2026-07-29T06:04:39.000Z","type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"}}"#;
+        let record: Value = serde_json::from_str(item).expect("json");
+        assert!(matches!(
+            classify_line(record),
+            CodexItem::Unknown {
+                type_tag: Some(tag),
+                ..
+            } if tag == "response_item"
+        ));
+        let file = session_file(&[META, item, USER_RESPONSE]);
+        let session = parse(file.path()).expect("parse");
+        assert!(!session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, ContentPart::Thinking { text, .. } if text.is_empty())
+            })
+        }));
+    }
+
+    #[test]
+    fn summarized_reasoning_surfaces_summary_text() {
+        let item = r#"{"timestamp":"2026-07-29T06:04:39.000Z","type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"plan first"}],"encrypted_content":"opaque"}}"#;
+        let file = session_file(&[META, item]);
+        let session = parse(file.path()).expect("parse");
+        assert!(session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, ContentPart::Thinking { text, .. } if text == "plan first")
             })
         }));
     }

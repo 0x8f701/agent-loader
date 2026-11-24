@@ -333,6 +333,17 @@ fn first_text_like(content: &Value) -> Option<String> {
 }
 
 fn parse_updates(file: File, messages: &mut Vec<Message>) {
+    // Fold `tool_call`/`tool_call_update` records by `toolCallId`: each call
+    // yields exactly one `ToolUse` (non-terminal records amend it in place)
+    // and at most one `ToolResult` (terminal records append once or replace
+    // an existing result), so no update is duplicated or lost.
+    #[derive(Default)]
+    struct CallSlots {
+        use_index: Option<usize>,
+        result_index: Option<usize>,
+    }
+    let mut call_slots: std::collections::HashMap<String, CallSlots> =
+        std::collections::HashMap::new();
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else {
             continue;
@@ -343,8 +354,35 @@ fn parse_updates(file: File, messages: &mut Vec<Message>) {
         let Some(update) = record.pointer("/params/update") else {
             continue;
         };
-        if let Some(message) = grok_update_message(update) {
+        let tool_call_id = matches!(
+            update.get("sessionUpdate").and_then(Value::as_str),
+            Some("tool_call" | "tool_call_update")
+        )
+        .then(|| update.get("toolCallId").and_then(Value::as_str))
+        .flatten()
+        .map(str::to_owned);
+        let Some(message) = grok_update_message(update) else {
+            continue;
+        };
+        let Some(id) = tool_call_id else {
             messages.push(message);
+            continue;
+        };
+        let slots = call_slots.entry(id).or_default();
+        let slot = match message.role {
+            Role::Assistant => &mut slots.use_index,
+            Role::Tool => &mut slots.result_index,
+            _ => {
+                messages.push(message);
+                continue;
+            }
+        };
+        match slot {
+            Some(index) => messages[*index] = message,
+            none => {
+                *none = Some(messages.len());
+                messages.push(message);
+            }
         }
     }
 }
@@ -374,7 +412,9 @@ fn grok_update_message(update: &Value) -> Option<Message> {
                 timestamp,
             )
         }),
-        "tool_call" => {
+        // `tool_call_update` uses the same fields as `tool_call`; a completed
+        // or failed status carries the result content.
+        "tool_call" | "tool_call_update" => {
             let id = update
                 .get("toolCallId")
                 .and_then(Value::as_str)
@@ -749,5 +789,61 @@ mod tests {
             reparsed.extra.get("future_field"),
             Some(&serde_json::json!({"nested": true}))
         );
+    }
+
+    #[test]
+    fn tool_call_updates_fold_into_one_call_and_one_result() {
+        // Real ACP streams send `tool_call` then repeated `tool_call_update`
+        // records; they must fold by `toolCallId` into exactly one ToolUse
+        // (latest non-terminal payload) plus at most one ToolResult (latest
+        // terminal payload) — the invocation is never lost or duplicated.
+        let home = TempDir::new().expect("temp home");
+        let root = home.path().join(".grok/sessions");
+        fs::create_dir_all(&root).expect("create grok root");
+        let summary = r#"{"info":{"id":"sid","cwd":"/tmp/grok"},"session_summary":"t","created_at":"2026-01-01T00:00:00Z"}"#;
+        let path = write_session(&root, "%2Ftmp%2Fgrok", "sid", summary, "");
+        fs::write(
+            path.parent().unwrap().join("updates.jsonl"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"Read","status":"pending","rawInput":{"path":"a.rs"}}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","rawInput":{"path":"b.rs"}}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed","content":{"type":"text","text":"ok"}}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"failed","content":{"type":"text","text":"denied"}}}}"#,
+                "\n",
+            ),
+        )
+        .expect("write updates");
+        let session = parse(&path, &root).expect("parse");
+        let related: Vec<&Message> = session
+            .messages
+            .iter()
+            .filter(|message| {
+                message.parts.iter().any(|part| match part {
+                    crate::domain::ContentPart::ToolUse { id, .. }
+                    | crate::domain::ContentPart::ToolResult {
+                        tool_use_id: id,
+                        ..
+                    } => id == "call-1",
+                    _ => false,
+                })
+            })
+            .collect();
+        assert_eq!(related.len(), 2);
+        assert!(related.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, crate::domain::ContentPart::ToolUse { id, input, .. }
+                    if id == "call-1"
+                        && input.get("path").and_then(Value::as_str) == Some("b.rs"))
+            })
+        }));
+        assert!(related.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, crate::domain::ContentPart::ToolResult { tool_use_id, content, is_error }
+                    if tool_use_id == "call-1" && content == "denied" && *is_error)
+            })
+        }));
     }
 }

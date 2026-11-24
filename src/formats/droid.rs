@@ -82,12 +82,22 @@ pub fn parse(path: &Path) -> Result<Session> {
     for value in values {
         match value.get("type").and_then(Value::as_str) {
             Some("compaction_state") => {
-                if let Some(summary) = ["summaryText", "summary", "text", "message"]
-                    .into_iter()
-                    .find_map(|key| value.get(key).and_then(Value::as_str))
-                    .filter(|text| !text.is_empty())
-                {
-                    compaction_summary = Some(summary.to_owned());
+                // `provider_switch_serialization` records store internal
+                // serialized provider state in `summaryText` (observed up to
+                // ~1.2 MB in real sessions), not a displayable compaction
+                // summary. Only that exact wire-format kind is excluded; any
+                // other or absent kind keeps the summary so unknown future
+                // kinds still surface their prose.
+                let is_serialization = value.get("summaryKind").and_then(Value::as_str)
+                    == Some("provider_switch_serialization");
+                if !is_serialization {
+                    if let Some(summary) = ["summaryText", "summary", "text", "message"]
+                        .into_iter()
+                        .find_map(|key| value.get(key).and_then(Value::as_str))
+                        .filter(|text| !text.is_empty())
+                    {
+                        compaction_summary = Some(summary.to_owned());
+                    }
                 }
                 continue;
             }
@@ -461,6 +471,49 @@ mod tests {
                 )
             })
         }));
+    }
+
+    #[test]
+    fn provider_switch_serialization_is_not_a_summary() {
+        // Real Droid `provider_switch_serialization` records carry serialized
+        // provider state in `summaryText`; it must not surface as a compaction
+        // note or hint.
+        let serialization = r#"{"type":"compaction_state","id":"c1","timestamp":"2026-01-01T00:00:00.000Z","summaryKind":"provider_switch_serialization","summaryText":"serialized-provider-state","summaryTokens":100,"removedCount":0}"#;
+        let file = session_file(&[SESSION_START, serialization, USER_MSG]);
+        let session = parse(file.path()).expect("parse");
+
+        assert_eq!(session.hints.compaction_summary, None);
+        assert!(!session.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, crate::domain::ContentPart::Note { kind, .. } if kind == "compaction")
+            })
+        }));
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn llm_summary_kind_still_produces_a_compaction_note() {
+        let compaction = r#"{"type":"compaction_state","id":"c1","timestamp":"2026-01-01T00:00:00.000Z","summaryKind":"llm_summary","summaryText":"prior context","summaryTokens":42,"removedCount":3}"#;
+        let file = session_file(&[SESSION_START, compaction, USER_MSG]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(
+            session.hints.compaction_summary.as_deref(),
+            Some("prior context")
+        );
+    }
+
+    #[test]
+    fn unknown_summary_kind_still_surfaces_its_summary() {
+        // An unrecognized `summaryKind` is preserved per the
+        // unknown-kinds-keep-their-payload contract: only the known
+        // `provider_switch_serialization` wire tag is excluded.
+        let compaction = r#"{"type":"compaction_state","id":"c1","summaryKind":"other_serialization","summaryText":"future prose","summaryTokens":5}"#;
+        let file = session_file(&[SESSION_START, compaction, USER_MSG]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(
+            session.hints.compaction_summary.as_deref(),
+            Some("future prose")
+        );
     }
 
     #[test]

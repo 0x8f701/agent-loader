@@ -559,10 +559,15 @@ mod tests {
             &msg("m4", Some("m3"), "developer", r#""dev""#),
         ]);
         let session = parse(file.path()).expect("parse");
-        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages.len(), 4);
         assert_eq!(session.messages[0].role, Role::User);
         assert_eq!(session.messages[1].role, Role::Assistant);
         assert_eq!(session.messages[2].role, Role::Tool);
+        assert!(matches!(
+            &session.messages[3].parts[0],
+            crate::domain::ContentPart::Note { kind, text }
+                if kind == "developer" && text == "dev"
+        ));
     }
 
     #[test]

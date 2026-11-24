@@ -883,6 +883,23 @@ fn build_grok(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Resul
     Ok(LaunchPlan::Command(command))
 }
 
+/// Native `droid` subcommands (per `droid --help`) that must pass through
+/// without the launcher's `--resume` injection. `search` and `find` are the
+/// same command under two names; `resume` is the native resume command.
+const DROID_SUBCOMMANDS: &[&str] = &[
+    "resume",
+    "exec",
+    "daemon",
+    "search",
+    "find",
+    "update",
+    "mcp",
+    "plugin",
+    "computer",
+    "doctor",
+    "help",
+];
+
 fn build_droid(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Result<LaunchPlan> {
     let base = [
         os("--settings"),
@@ -920,6 +937,13 @@ fn build_droid(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Resu
         let mut prefix = base.to_vec();
         prefix.extend([os("--fork"), session]);
         command_with_tail("droid", prefix, tail)
+    } else if DROID_SUBCOMMANDS.iter().any(|name| args[0] == OsStr::new(name))
+        || starts_with_hyphen(&args[0])
+    {
+        // Native subcommands (`exec`, `doctor`, `help`, ...) and leading
+        // flags (`--help`, `--version`, `-w`, ...) pass through on the
+        // launcher base; injecting `--resume` would swallow the subcommand.
+        command_with_tail("droid", base, args)
     } else {
         let mut prefix = base.to_vec();
         prefix.push(os("--resume"));
@@ -2091,6 +2115,85 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn droid_native_subcommands_pass_through_without_resume() {
+        let home = test_home();
+        let settings = home.join(".factory").join("settings.json").into_os_string();
+        let base = [os("--settings"), settings, os("--auto"), os("high")];
+        for subcommand in [
+            "resume", "exec", "daemon", "search", "find", "update", "mcp", "plugin", "computer",
+            "doctor", "help",
+        ] {
+            let command = assert_command(
+                build_launcher(
+                    LauncherKind::Droid,
+                    &[os(subcommand), os("extra")],
+                    &home,
+                    Path::new("/tmp"),
+                )
+                .unwrap(),
+            );
+            let mut expected = base.to_vec();
+            expected.extend([os(subcommand), os("extra")]);
+            assert_eq!(command.args, expected, "subcommand {subcommand}");
+        }
+    }
+
+    #[test]
+    fn droid_leading_flag_passes_through_without_resume() {
+        let home = test_home();
+        let command = assert_command(
+            build_launcher(LauncherKind::Droid, &strings(&["--help"]), &home, Path::new("/tmp"))
+                .unwrap(),
+        );
+        let settings = home.join(".factory").join("settings.json").into_os_string();
+        assert_eq!(
+            command.args,
+            vec![os("--settings"), settings, os("--auto"), os("high"), os("--help")]
+        );
+    }
+
+    #[test]
+    fn droid_session_selectors_keep_resume_and_fork() {
+        let home = test_home();
+        let settings = home.join(".factory").join("settings.json").into_os_string();
+        let base = vec![os("--settings"), settings, os("--auto"), os("high")];
+
+        let resume = assert_command(
+            build_launcher(
+                LauncherKind::Droid,
+                &strings(&["--session", "abc-123"]),
+                &home,
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        let mut expected = base.clone();
+        expected.extend(strings(&["--resume", "abc-123"]));
+        assert_eq!(resume.args, expected);
+
+        let fork = assert_command(
+            build_launcher(
+                LauncherKind::Droid,
+                &strings(&["--resume", "abc-123", "--fork"]),
+                &home,
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        let mut expected = base.clone();
+        expected.extend(strings(&["--fork", "abc-123"]));
+        assert_eq!(fork.args, expected);
+
+        let positional = assert_command(
+            build_launcher(LauncherKind::Droid, &strings(&["abc-123"]), &home, Path::new("/tmp"))
+                .unwrap(),
+        );
+        let mut expected = base;
+        expected.extend(strings(&["--resume", "abc-123"]));
+        assert_eq!(positional.args, expected);
+    }
+
 
     #[test]
     fn cclo_default_is_continue_then_permission_default_fallback() {

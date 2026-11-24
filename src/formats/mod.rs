@@ -381,15 +381,20 @@ fn thinking_part(object: &serde_json::Map<String, Value>) -> Option<ContentPart>
     let text = ["thinking", "text", "summary"]
         .into_iter()
         .find_map(|key| object.get(key).and_then(Value::as_str))
-        .filter(|text| !text.is_empty())?;
+        .unwrap_or_default();
+    let signature = object
+        .get("signature")
+        .or_else(|| object.get("thinkingSignature"))
+        .or_else(|| object.get("thinking_signature"))
+        .and_then(Value::as_str)
+        .filter(|signature| !signature.is_empty())
+        .map(str::to_owned);
+    if text.is_empty() && signature.is_none() {
+        return None;
+    }
     Some(ContentPart::Thinking {
         text: text.to_owned(),
-        signature: object
-            .get("signature")
-            .or_else(|| object.get("thinkingSignature"))
-            .or_else(|| object.get("thinking_signature"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        signature,
     })
 }
 
@@ -659,6 +664,67 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn content_parts_keeps_signature_only_thinking() {
+        let content = json!([
+            {"type": "thinking", "thinking": "", "signature": "sig-only"},
+            {"type": "reasoning", "thinkingSignature": "opaque"},
+            {"type": "thinking"},
+            {"type": "thinking", "thinking": "", "signature": ""},
+            {"type": "thinking", "signature": 42},
+            {"type": "thinking", "thinking": "  padded  "},
+            {"type": "redactedThinking", "data": "enc"}
+        ]);
+        let parts = content_parts(&content);
+        assert_eq!(
+            parts,
+            vec![
+                ContentPart::Thinking {
+                    text: String::new(),
+                    signature: Some("sig-only".to_owned()),
+                },
+                ContentPart::Thinking {
+                    text: String::new(),
+                    signature: Some("opaque".to_owned()),
+                },
+                ContentPart::Thinking {
+                    text: "  padded  ".to_owned(),
+                    signature: None,
+                },
+                ContentPart::Thinking {
+                    text: "[redacted]".to_owned(),
+                    signature: Some("enc".to_owned()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parsed_message_keeps_signature_only_thinking() {
+        let content = json!([{"type": "thinking", "signature": "sig-only"}]);
+        let message =
+            parsed_message(Some("assistant"), Some(&content), None).expect("message");
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.text, "");
+        assert_eq!(
+            message.parts,
+            vec![ContentPart::Thinking {
+                text: String::new(),
+                signature: Some("sig-only".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn parsed_message_drops_empty_thinking_without_signature() {
+        let content = json!([
+            {"type": "thinking", "thinking": ""},
+            {"type": "thinking", "signature": false},
+            {"type": "thinking", "thinking": "", "signature": ""}
+        ]);
+        assert!(parsed_message(Some("assistant"), Some(&content), None).is_none());
     }
 
     #[test]

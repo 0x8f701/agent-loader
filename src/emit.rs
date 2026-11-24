@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::domain::{ContentPart, Message, Role, Session, TargetTool, ThinkingLevel};
-use crate::fs::atomic_write_jsonl;
+use crate::fs::create_jsonl;
 
 const MAX_FILESYSTEM_COMPONENT_BYTES: usize = 255;
 const CLAUDE_VERSION: &str = "2.1.263";
@@ -559,6 +559,7 @@ fn emit_pi<D: EmitDefaults>(
         }),
     ];
     let mut parent_id = thinking_id;
+    let mut tool_names = std::collections::HashMap::<String, String>::new();
     push_tree_compaction_hint(
         session,
         &mut records,
@@ -591,6 +592,7 @@ fn emit_pi<D: EmitDefaults>(
                 defaults,
                 &provider,
                 &model,
+                &mut tool_names,
             );
         }
     }
@@ -632,6 +634,7 @@ fn push_pi_message_record<D: EmitDefaults>(
     defaults: &mut D,
     provider: &str,
     model: &str,
+    tool_names: &mut std::collections::HashMap<String, String>,
 ) {
     let message_id = short_id(defaults.next_uuid());
     records.push(json!({
@@ -639,7 +642,14 @@ fn push_pi_message_record<D: EmitDefaults>(
         "id": message_id,
         "parentId": parent_id.clone(),
         "timestamp": fmt_iso(timestamp),
-        "message": pi_message_payload(message, timestamp, defaults, provider, model),
+        "message": pi_message_payload(
+            message,
+            timestamp,
+            defaults,
+            provider,
+            model,
+            tool_names,
+        ),
     }));
     *parent_id = message_id;
 }
@@ -714,6 +724,7 @@ fn emit_omp<D: EmitDefaults>(
         }),
     ];
     let mut parent_id = thinking_id;
+    let mut tool_names = std::collections::HashMap::<String, String>::new();
     push_tree_compaction_hint(
         session,
         &mut records,
@@ -741,6 +752,7 @@ fn emit_omp<D: EmitDefaults>(
                 defaults,
                 provider,
                 model,
+                &mut tool_names,
             ),
         }));
         parent_id = message_id;
@@ -997,23 +1009,15 @@ fn emit_claude<D: EmitDefaults>(
             .as_deref()
             .filter(|text| !text.is_empty())
         {
-            let message_uuid = defaults.next_uuid().to_string();
-            records.push(json!({
-                "parentUuid": parent_uuid,
-                "isSidechain": false,
-                "userType": "external",
-                "cwd": cwd,
-                "sessionId": session_id,
-                "version": CLAUDE_VERSION,
-                "gitBranch": "",
-                "type": "user",
-                "isCompactSummary": true,
-                "uuid": message_uuid,
-                "timestamp": fmt_iso(start),
-                "message": { "role": "user", "content": text },
-                "permissionMode": "default",
-            }));
-            parent_uuid = Some(message_uuid);
+            parent_uuid = Some(push_claude_compaction(
+                &mut records,
+                cwd,
+                session_id,
+                fmt_iso(start),
+                text,
+                None,
+                defaults,
+            ));
         }
     }
     for (index, message) in session.messages.iter().enumerate() {
@@ -1022,21 +1026,16 @@ fn emit_claude<D: EmitDefaults>(
         for (kind, text) in notes {
             let message_uuid = defaults.next_uuid().to_string();
             if kind == "compaction" {
-                records.push(json!({
-                    "parentUuid": parent_uuid,
-                    "isSidechain": false,
-                    "userType": "external",
-                    "cwd": cwd,
-                    "sessionId": session_id,
-                    "version": CLAUDE_VERSION,
-                    "gitBranch": "",
-                    "type": "user",
-                    "isCompactSummary": true,
-                    "uuid": message_uuid,
-                    "timestamp": fmt_iso(timestamp),
-                    "message": { "role": "user", "content": text },
-                    "permissionMode": "default",
-                }));
+                let logical_parent = parent_uuid.clone();
+                parent_uuid = Some(push_claude_compaction(
+                    &mut records,
+                    cwd,
+                    session_id,
+                    fmt_iso(timestamp),
+                    &text,
+                    logical_parent.as_deref(),
+                    defaults,
+                ));
             } else {
                 records.push(json!({
                     "parentUuid": parent_uuid,
@@ -1054,8 +1053,8 @@ fn emit_claude<D: EmitDefaults>(
                         "content": text,
                     },
                 }));
+                parent_uuid = Some(message_uuid);
             }
-            parent_uuid = Some(message_uuid);
         }
         if rest.is_empty() {
             continue;
@@ -1092,7 +1091,7 @@ fn emit_claude<D: EmitDefaults>(
                 "type": "message",
                 "role": "assistant",
                 "content": claude_content_blocks(&rest_message),
-                "stop_reason": "end_turn",
+                "stop_reason": claude_stop_reason(&rest_message),
                 "stop_sequence": null,
                 "usage": { "input_tokens": 0, "output_tokens": 0 },
             });
@@ -1366,8 +1365,16 @@ fn pi_message_payload<D: EmitDefaults>(
     defaults: &mut D,
     provider: &str,
     model: &str,
+    tool_names: &mut std::collections::HashMap<String, String>,
 ) -> Value {
     let parts = message.effective_parts();
+    for part in &parts {
+        if let ContentPart::ToolUse { id, name, .. } = part {
+            if !id.is_empty() && !name.is_empty() {
+                tool_names.insert(id.clone(), name.clone());
+            }
+        }
+    }
     let mut payload = serde_json::Map::new();
     payload.insert("timestamp".to_owned(), json!(timestamp.timestamp_millis()));
     payload.insert("usage".to_owned(), zero_usage());
@@ -1383,10 +1390,13 @@ fn pi_message_payload<D: EmitDefaults>(
         payload.insert("role".to_owned(), json!("toolResult"));
         if let Some((tool_use_id, content, is_error)) = result {
             payload.insert("toolCallId".to_owned(), json!(tool_use_id));
-            payload.insert("toolName".to_owned(), json!(""));
+            payload.insert(
+                "toolName".to_owned(),
+                json!(tool_names.get(tool_use_id).map(String::as_str).unwrap_or("")),
+            );
             payload.insert(
                 "content".to_owned(),
-                tool_result_content(content, &parts, false),
+                pi_tool_result_blocks(content, &parts),
             );
             payload.insert("isError".to_owned(), json!(is_error));
         } else {
@@ -1400,7 +1410,15 @@ fn pi_message_payload<D: EmitDefaults>(
         payload.insert("api".to_owned(), json!("openai-completions"));
         payload.insert("provider".to_owned(), json!(provider));
         payload.insert("model".to_owned(), json!(model));
-        payload.insert("stopReason".to_owned(), json!("stop"));
+        let stop_reason = if parts
+            .iter()
+            .any(|part| matches!(part, ContentPart::ToolUse { .. }))
+        {
+            "toolUse"
+        } else {
+            "stop"
+        };
+        payload.insert("stopReason".to_owned(), json!(stop_reason));
         payload.insert(
             "responseId".to_owned(),
             json!(format!(
@@ -1411,6 +1429,13 @@ fn pi_message_payload<D: EmitDefaults>(
     }
     Value::Object(payload)
 }
+fn pi_tool_result_blocks(content: &str, parts: &[ContentPart]) -> Value {
+    match tool_result_content(content, parts, false) {
+        Value::Array(blocks) => Value::Array(blocks),
+        text => json!([{"type": "text", "text": text}]),
+    }
+}
+
 
 fn pi_content_blocks(parts: &[ContentPart]) -> Vec<Value> {
     if parts.is_empty() {
@@ -1469,6 +1494,62 @@ fn claude_record_type(message: &Message) -> &'static str {
         Role::User | Role::Tool => "user",
     }
 }
+fn claude_stop_reason(message: &Message) -> &'static str {
+    if message
+        .effective_parts()
+        .iter()
+        .any(|part| matches!(part, ContentPart::ToolUse { .. }))
+    {
+        "tool_use"
+    } else {
+        "end_turn"
+    }
+}
+
+fn push_claude_compaction<D: EmitDefaults>(
+    records: &mut Vec<Value>,
+    cwd: &str,
+    session_id: &str,
+    timestamp: String,
+    text: &str,
+    logical_parent: Option<&str>,
+    defaults: &mut D,
+) -> String {
+    let boundary_uuid = defaults.next_uuid().to_string();
+    records.push(json!({
+        "parentUuid": Value::Null,
+        "logicalParentUuid": logical_parent,
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": cwd,
+        "sessionId": session_id,
+        "version": CLAUDE_VERSION,
+        "gitBranch": "",
+        "type": "system",
+        "subtype": "compact_boundary",
+        "uuid": boundary_uuid,
+        "timestamp": timestamp,
+        "compactMetadata": { "compactSummary": text },
+    }));
+    let summary_uuid = defaults.next_uuid().to_string();
+    records.push(json!({
+        "parentUuid": boundary_uuid,
+        "isSidechain": false,
+        "userType": "external",
+        "cwd": cwd,
+        "sessionId": session_id,
+        "version": CLAUDE_VERSION,
+        "gitBranch": "",
+        "type": "user",
+        "isCompactSummary": true,
+        "uuid": summary_uuid,
+        "timestamp": timestamp,
+        "message": { "role": "user", "content": text },
+        "permissionMode": "default",
+    }));
+    summary_uuid
+}
+
 
 fn claude_user_content(message: &Message) -> Value {
     let parts = message.effective_parts();
@@ -1673,7 +1754,7 @@ fn codex_special_part(part: &ContentPart, timestamp_text: &str) -> Vec<Value> {
             "type": "response_item",
             "payload": {
                 "type": "reasoning",
-                "content": [{ "type": "output_text", "text": text }],
+                "summary": [{ "type": "summary_text", "text": text }],
             },
         })],
         ContentPart::ToolUse { id, name, input } => vec![json!({
@@ -2125,14 +2206,14 @@ fn write_jsonl(path: &Path, records: &[Value]) -> Result<()> {
         .ok_or_else(|| anyhow!("output path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("creating output directory {}", parent.display()))?;
-    atomic_write_jsonl(path, records)
+    create_jsonl(path, records)
 }
 
 fn write_grok_bundle<D: EmitDefaults>(
     summary_path: &Path,
     cwd: &str,
     bundle: &GrokBundle,
-    defaults: &mut D,
+    _defaults: &mut D,
 ) -> Result<()> {
     let session_dir = summary_path
         .parent()
@@ -2142,43 +2223,27 @@ fn write_grok_bundle<D: EmitDefaults>(
         .ok_or_else(|| anyhow!("Grok session path has no cwd directory"))?;
     fs::create_dir_all(cwd_dir)
         .with_context(|| format!("creating Grok cwd directory {}", cwd_dir.display()))?;
-    if session_dir.exists() {
-        bail!(
-            "refusing to replace existing Grok session directory {}",
-            session_dir.display()
-        );
+    match fs::create_dir(session_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "refusing to replace existing Grok session directory {}",
+                session_dir.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("creating Grok session directory {}", session_dir.display())
+            });
+        }
     }
-    let staging = cwd_dir.join(format!(
-        ".{}.{}.tmp",
-        session_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("session"),
-        defaults.next_uuid()
-    ));
-    validate_component(
-        "Grok staging directory",
-        staging
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("Grok staging directory is not valid UTF-8"))?,
-    )?;
-    fs::create_dir(&staging)
-        .with_context(|| format!("creating Grok staging directory {}", staging.display()))?;
     let result = (|| -> Result<()> {
-        atomic_write_jsonl(
-            &staging.join("summary.json"),
+        create_jsonl(
+            &session_dir.join("summary.json"),
             std::slice::from_ref(&bundle.summary),
         )?;
-        atomic_write_jsonl(&staging.join("chat_history.jsonl"), &bundle.chat)?;
-        atomic_write_jsonl(&staging.join("updates.jsonl"), &bundle.updates)?;
-        fs::rename(&staging, session_dir).with_context(|| {
-            format!(
-                "publishing Grok session {} as {}",
-                staging.display(),
-                session_dir.display()
-            )
-        })?;
+        create_jsonl(&session_dir.join("chat_history.jsonl"), &bundle.chat)?;
+        create_jsonl(&session_dir.join("updates.jsonl"), &bundle.updates)?;
         let encoded = utf8_percent_encode(cwd, URL_PATH_ENCODE_SET).to_string();
         if encoded != encode_grok_cwd(cwd) {
             let cwd_sidecar = cwd_dir.join(".cwd");
@@ -2188,13 +2253,14 @@ fn write_grok_bundle<D: EmitDefaults>(
                 })?;
             }
         }
+        #[cfg(unix)]
         fs::File::open(cwd_dir)
             .and_then(|directory| directory.sync_all())
             .with_context(|| format!("syncing Grok cwd directory {}", cwd_dir.display()))?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_dir_all(session_dir);
     }
     result
 }
@@ -2822,14 +2888,15 @@ mod tests {
         );
         assert_eq!(messages[1]["message"]["role"], "toolResult");
         assert_eq!(messages[1]["message"]["toolCallId"], "call-1");
-        assert_eq!(messages[1]["message"]["content"], "fn main() {}");
+        assert_eq!(messages[1]["message"]["content"][0]["type"], "text");
+        assert_eq!(messages[1]["message"]["content"][0]["text"], "fn main() {}");
         assert_eq!(messages[1]["message"]["isError"], false);
         assert_eq!(messages[2]["message"]["role"], "user");
         assert_eq!(messages[2]["message"]["content"][0]["type"], "image");
         assert_eq!(messages[2]["message"]["content"][0]["data"], "toolImgData");
         assert_eq!(messages[3]["message"]["role"], "toolResult");
         assert_eq!(messages[3]["message"]["toolCallId"], "call-2");
-        assert_eq!(messages[3]["message"]["content"], "second result");
+        assert_eq!(messages[3]["message"]["content"][0]["text"], "second result");
         assert_eq!(messages[3]["message"]["isError"], true);
         assert_eq!(messages[4]["message"]["role"], "assistant");
         assert!(
@@ -2900,6 +2967,51 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["message"]["role"], "toolResult");
         assert_eq!(messages[0]["message"]["toolCallId"], "call-1");
+        assert_eq!(messages[0]["message"]["content"][0]["type"], "text");
+        assert_eq!(messages[0]["message"]["content"][0]["text"], "fn main() {}");
+    }
+
+    #[test]
+    fn tool_role_content_keeps_text_and_images_for_pi_family() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let session = Session {
+            messages: vec![Message::from_parts(
+                Role::Tool,
+                vec![
+                    ContentPart::ToolResult {
+                        tool_use_id: "call-1".to_owned(),
+                        content: "fn main() {}".to_owned(),
+                        is_error: false,
+                    },
+                    ContentPart::Image {
+                        mime_type: Some("image/png".to_owned()),
+                        data: "toolImgData".to_owned(),
+                    },
+                ],
+                Some("2026-07-30T10:11:13.000Z".to_owned()),
+            )],
+            ..fixture(home)
+        };
+        for target in [TargetTool::Pi, TargetTool::Omp, TargetTool::Rpi] {
+            let emitted = emit_with_defaults(
+                &session,
+                target,
+                &EmitContext::new(home).with_session_id(format!("image-{}", target.as_str())),
+                &mut FixedDefaults::new(),
+            )
+            .unwrap();
+            let content = read_jsonl(&emitted.path)
+                .into_iter()
+                .find(|record| record["message"]["role"] == "toolResult")
+                .expect("tool result")["message"]["content"]
+                .clone();
+            assert_eq!(content[0]["type"], "text");
+            assert_eq!(content[0]["text"], "fn main() {}");
+            assert_eq!(content[1]["type"], "image");
+            assert_eq!(content[1]["data"], "toolImgData");
+            assert_eq!(content[1]["mimeType"], "image/png");
+        }
     }
 
     #[test]
@@ -3434,4 +3546,207 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 131_072);
     }
+    #[test]
+    fn claude_native_parser_keeps_active_summary_tool_stop_and_chain() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let mut session = fixture(home);
+        session.messages = vec![
+            Message::from_parts(
+                Role::Assistant,
+                vec![ContentPart::Note {
+                    kind: "compaction".to_owned(),
+                    text: "earlier context".to_owned(),
+                }],
+                Some("2026-07-30T10:11:13.000Z".to_owned()),
+            ),
+            Message::plain(
+                Role::User,
+                "dropped prompt",
+                Some("2026-07-30T10:11:14.000Z".to_owned()),
+            ),
+            Message::from_parts(
+                Role::Assistant,
+                vec![ContentPart::Note {
+                    kind: "compaction".to_owned(),
+                    text: "active context".to_owned(),
+                }],
+                Some("2026-07-30T10:11:15.000Z".to_owned()),
+            ),
+            Message::plain(
+                Role::User,
+                "kept prompt",
+                Some("2026-07-30T10:11:16.000Z".to_owned()),
+            ),
+            Message::from_parts(
+                Role::Assistant,
+                vec![
+                    ContentPart::Text("calling".to_owned()),
+                    ContentPart::ToolUse {
+                        id: "tool-1".to_owned(),
+                        name: "Read".to_owned(),
+                        input: serde_json::json!({ "path": "a.rs" }),
+                    },
+                ],
+                Some("2026-07-30T10:11:17.000Z".to_owned()),
+            ),
+            Message::plain(
+                Role::Assistant,
+                "finished",
+                Some("2026-07-30T10:11:18.000Z".to_owned()),
+            ),
+        ];
+        let emitted = emit_with_defaults(
+            &session,
+            TargetTool::Claude,
+            &EmitContext::new(home).with_session_id("claude-native"),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        let records = read_jsonl(&emitted.path);
+        let boundaries: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record["type"] == "system" && record["subtype"] == "compact_boundary"
+            })
+            .collect();
+        assert_eq!(boundaries.len(), 2);
+        assert!(boundaries[0]["parentUuid"].is_null());
+        assert!(boundaries[0]["logicalParentUuid"].is_null());
+        assert!(boundaries[1]["parentUuid"].is_null());
+        assert!(boundaries[1]["logicalParentUuid"].is_string());
+        let summaries: Vec<_> = records
+            .iter()
+            .filter(|record| record["isCompactSummary"] == true)
+            .collect();
+        assert_eq!(summaries[0]["parentUuid"], boundaries[0]["uuid"]);
+        assert_eq!(summaries[1]["parentUuid"], boundaries[1]["uuid"]);
+        let tool = records
+            .iter()
+            .find(|record| {
+                record["message"]["content"]
+                    .as_array()
+                    .is_some_and(|content| content.iter().any(|block| block["type"] == "tool_use"))
+            })
+            .expect("tool assistant");
+        let plain = records
+            .iter()
+            .find(|record| record["message"]["content"][0]["text"] == "finished")
+            .expect("plain assistant");
+        assert_eq!(tool["message"]["stop_reason"], "tool_use");
+        assert_eq!(plain["message"]["stop_reason"], "end_turn");
+        assert_eq!(records.last().unwrap()["leafUuid"], plain["uuid"]);
+
+        let parsed = crate::formats::claude::parse(&emitted.path).unwrap();
+        let texts: Vec<&str> = parsed.messages.iter().map(|message| message.text.as_str()).collect();
+        assert_eq!(texts, ["active context", "kept prompt", "calling\nRead", "finished"]);
+        assert_eq!(parsed.hints.compaction_summary.as_deref(), Some("active context"));
+        assert!(parsed.messages.iter().any(|message| {
+            message.parts.iter().any(|part| matches!(
+                part,
+                ContentPart::Note { kind, text } if kind == "compaction" && text == "active context"
+            ))
+        }));
+    }
+
+    #[test]
+    fn codex_reasoning_uses_native_summary_text() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let mut session = fixture(home);
+        session.messages[1] = Message::from_parts(
+            Role::Assistant,
+            vec![ContentPart::Thinking {
+                text: "plan first".to_owned(),
+                signature: Some("not-representable".to_owned()),
+            }],
+            Some("2026-07-30T10:11:14.000Z".to_owned()),
+        );
+        let emitted = emit_with_defaults(
+            &session,
+            TargetTool::Codex,
+            &EmitContext::new(home)
+                .with_session_id("codex-reasoning")
+                .with_codex_runtime(CodexRuntime {
+                    provider: "provider".to_owned(),
+                    model: "model".to_owned(),
+                }),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        let records = read_jsonl(&emitted.path);
+        let reasoning = records
+            .iter()
+            .find(|record| record["payload"]["type"] == "reasoning")
+            .expect("reasoning");
+        assert!(reasoning["payload"].get("content").is_none());
+        assert!(reasoning["payload"].get("encrypted_content").is_none());
+        assert_eq!(
+            reasoning["payload"]["summary"],
+            serde_json::json!([{ "type": "summary_text", "text": "plan first" }])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emission_refuses_existing_output_and_source_aliases() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let session = fixture(home);
+        for (index, target) in TargetTool::ALL
+            .into_iter()
+            .filter(|target| *target != TargetTool::Agent)
+            .enumerate()
+        {
+            let session_id = format!("00000000-0000-4000-8000-{index:012x}");
+            let output = match target {
+                TargetTool::Grok => home.join(format!("existing-{session_id}")),
+                TargetTool::Antigravity => home.join(format!("{session_id}.db")),
+                _ => home.join(format!("{session_id}.jsonl")),
+            };
+            if target.uses_grok_storage() {
+                fs::create_dir(&output).unwrap();
+            }
+            let sentinel = if target.uses_grok_storage() {
+                output.join("summary.json")
+            } else {
+                output.clone()
+            };
+            fs::write(&sentinel, b"kept").unwrap();
+            let error = emit_with_defaults(
+                &session,
+                target,
+                &EmitContext::new(home)
+                    .with_session_id(&session_id)
+                    .with_output(&output),
+                &mut FixedDefaults::new(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("refusing"),
+                "{target} replaced existing output: {error}"
+            );
+            assert_eq!(fs::read(&sentinel).unwrap(), b"kept");
+
+            let source = home.join(format!("source-{session_id}.jsonl"));
+            fs::write(&source, b"source").unwrap();
+            let alias = home.join(format!("alias-{session_id}.jsonl"));
+            symlink(&source, &alias).unwrap();
+            let source_inode = fs::metadata(&source).unwrap().ino();
+            let error = emit_with_defaults(
+                &session,
+                target,
+                &EmitContext::new(home)
+                    .with_session_id(&session_id)
+                    .with_output(&alias),
+                &mut FixedDefaults::new(),
+            )
+            .unwrap_err();
+            assert_eq!(fs::read(&source).unwrap(), b"source");
+            assert_eq!(fs::metadata(&source).unwrap().ino(), source_inode);
+        }
+    }
+
 }

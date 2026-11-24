@@ -320,6 +320,208 @@ pub fn atomic_write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> Result<()
     }
     result
 }
+/// Publishes one JSONL file only when `path` does not already exist.
+///
+/// Bytes are synced in a private same-filesystem staging directory and installed with `link`,
+/// which fails if the destination exists. Unix also syncs the destination directory. Windows
+/// provides no supported flush for the held read-only directory handle, so directory durability
+/// is intentionally not claimed there. `atomic_write_jsonl` remains the replacing writer.
+pub fn create_jsonl<T: Serialize>(path: &Path, records: &[T]) -> Result<()> {
+    let path = absolute_without_parent_components(path)
+        .with_context(|| format!("validating output path {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("output path has no parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("output path has no file name: {}", path.display()))?;
+    validate_single_name(name)
+        .with_context(|| format!("validating output file name {}", path.display()))?;
+    let parent_directory = open_absolute_directory(parent)
+        .with_context(|| format!("opening output directory {}", parent.display()))?;
+    if inspect_entry_at(&parent_directory, name).is_ok() {
+        bail!("refusing to overwrite {}", path.display());
+    }
+
+    let (staging_name, staging_directory) = create_private_staging(&parent_directory)
+        .with_context(|| format!("creating private staging directory in {}", parent.display()))?;
+    let result = (|| -> Result<()> {
+        let (temporary_name, temporary_file) = create_temporary_file_at(&staging_directory)
+            .context("creating staged JSONL file")?;
+        let written = (|| -> Result<()> {
+            #[cfg(unix)]
+            let mut temporary_file = File::from(temporary_file);
+            #[cfg(not(unix))]
+            let mut temporary_file = temporary_file;
+            {
+                let mut writer = BufWriter::new(&mut temporary_file);
+                for record in records {
+                    serde_json::to_writer(&mut writer, record)
+                        .context("serializing JSONL record")?;
+                    writer.write_all(b"\n").context("writing JSONL newline")?;
+                }
+                writer.flush().context("flushing temporary JSONL file")?;
+            }
+            temporary_file
+                .sync_all()
+                .context("syncing temporary JSONL file")?;
+            link_new_file(&staging_directory, &temporary_name, &parent_directory, name)
+                .with_context(|| format!("refusing to overwrite {}", path.display()))?;
+            sync_directory(&parent_directory).context("syncing output directory")?;
+            Ok(())
+        })();
+        remove_staged_file(&staging_directory, &temporary_name);
+        written
+    })();
+    drop(staging_directory);
+    remove_staging(&parent_directory, &staging_name);
+    result
+}
+
+#[cfg(unix)]
+fn create_private_staging(parent: &std::os::fd::OwnedFd) -> io::Result<(CString, std::os::fd::OwnedFd)> {
+    for _ in 0..128 {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let name = c_string(OsStr::new(&format!(
+            ".al-stage-{}-{sequence:016x}",
+            std::process::id()
+        )))?;
+        // SAFETY: `name` is one valid NUL-terminated component. mkdirat uses the mode argument
+        // and does not retain the pointer. 0o700 keeps the staging directory private.
+        let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+        if result == 0 {
+            return match openat_owned(
+                parent.as_raw_fd(),
+                OsStr::from_bytes(name.as_bytes()),
+                DIRECTORY_OPEN_FLAGS,
+            ) {
+                Ok(descriptor) => Ok((name, descriptor)),
+                Err(error) => {
+                    // SAFETY: `name` is the directory just created by mkdirat and is still empty.
+                    let _ = unsafe {
+                        libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+                    };
+                    Err(error)
+                }
+            };
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a private staging directory",
+    ))
+}
+
+#[cfg(not(unix))]
+fn create_private_staging(parent: &OwnedFd) -> io::Result<(PathBuf, OwnedFd)> {
+    validate_open_directory(parent)?;
+    for _ in 0..128 {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".al-stage-{}-{sequence:016x}", std::process::id());
+        validate_single_name(OsStr::new(&name))?;
+        let path = parent.path.join(&name);
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                #[cfg(windows)]
+                let opened = open_directory_no_follow(&path).map(|file| OwnedFd {
+                    path: path.clone(),
+                    guards: vec![file],
+                });
+                #[cfg(not(windows))]
+                let opened = open_absolute_directory(&path).map_err(io::Error::other);
+                return match opened {
+                    Ok(descriptor) => Ok((path, descriptor)),
+                    Err(error) => {
+                        let _ = std::fs::remove_dir(&path);
+                        Err(error)
+                    }
+                };
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a private staging directory",
+    ))
+}
+
+/// `link` fails atomically when the destination exists, unlike rename.
+#[cfg(unix)]
+fn link_new_file(
+    source_directory: &std::os::fd::OwnedFd,
+    source: &CString,
+    destination_directory: &std::os::fd::OwnedFd,
+    destination: &OsStr,
+) -> io::Result<()> {
+    let destination = c_string(destination)?;
+    // SAFETY: both names are valid NUL-terminated components of their live directory descriptors.
+    // linkat retains neither pointer. A zero flag does not follow a final symlink.
+    let result = unsafe {
+        libc::linkat(
+            source_directory.as_raw_fd(),
+            source.as_ptr(),
+            destination_directory.as_raw_fd(),
+            destination.as_ptr(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn link_new_file(
+    source_directory: &OwnedFd,
+    source: &Path,
+    destination_directory: &OwnedFd,
+    destination: &OsStr,
+) -> io::Result<()> {
+    validate_open_directory(source_directory)?;
+    validate_open_directory(destination_directory)?;
+    std::fs::hard_link(source, destination_directory.path.join(destination))
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &std::os::fd::OwnedFd) -> io::Result<()> {
+    File::from(directory.try_clone()?).sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_directory: &OwnedFd) -> io::Result<()> {
+    // The file bytes were synced before `link`. Windows `FlushFileBuffers` requires write access,
+    // which the read-only directory guard does not have, so directory durability is not available.
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_staged_file(directory: &std::os::fd::OwnedFd, name: &CString) {
+    let _ = unlink_at(directory, name);
+}
+
+#[cfg(not(unix))]
+fn remove_staged_file(_directory: &OwnedFd, name: &Path) {
+    let _ = std::fs::remove_file(name);
+}
+
+#[cfg(unix)]
+fn remove_staging(parent: &std::os::fd::OwnedFd, name: &CString) {
+    // SAFETY: `name` is the NUL-terminated staging component and AT_REMOVEDIR removes that directory.
+    let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+}
+
+#[cfg(not(unix))]
+fn remove_staging(_parent: &OwnedFd, path: &Path) {
+    let _ = std::fs::remove_dir_all(path);
+}
 
 /// Opens `directory` beneath `root`, walking every component with `O_NOFOLLOW`.
 ///
@@ -1092,6 +1294,35 @@ mod tests {
             "temporary files leaked: {leftovers:?}"
         );
     }
+    #[test]
+    fn exclusive_jsonl_write_removes_staging_after_failure_and_existing_destination() {
+        struct FailingSerialize;
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("intentional serialization failure"))
+            }
+        }
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("session.jsonl");
+        let failed = create_jsonl(&path, &[FailingSerialize]);
+        assert!(failed.is_err());
+        assert!(!path.exists());
+
+        fs::write(&path, b"kept").unwrap();
+        let existing = create_jsonl(&path, &[json!({"changed": true})]);
+        assert!(existing.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"kept");
+        let leftovers: Vec<_> = fs::read_dir(temporary.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".al-stage-"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging directories leaked: {leftovers:?}");
+    }
+
 
     #[test]
     fn path_under_root_rejects_directory_with_symlinked_ancestor() {

@@ -15,8 +15,8 @@ use serde_json::{Map, Value, json};
 use crate::domain::{Message, Session, SourceTool};
 use crate::formats::tree::TreeNode;
 use crate::formats::{
-    compaction_note, content_parts, hints_from_tree_records, read_jsonl_values, summarize_messages,
-    tree,
+    compaction_note, content_parts, hints_from_tree_records, normalize, read_jsonl_values,
+    summarize_messages, tree,
 };
 
 /// Parse a Pi/OMP session export into a lossy `Session`.
@@ -118,7 +118,9 @@ pub fn parse(path: &Path) -> Result<Session> {
     if let Some(note) = compaction_note(hints.compaction_summary.as_deref()) {
         messages.insert(0, note);
     }
-    let summary = summarize_messages(&messages);
+    let summary = session_display_name(&values, &path_ids)
+        .map(|name| normalize(&name, 100))
+        .unwrap_or_else(|| summarize_messages(&messages));
 
     // The header's cwd is used verbatim — even when empty (ancient v1 files) —
     // rather than inventing a parent-dir fallback. Only the empty-file branch
@@ -301,7 +303,7 @@ pub(crate) fn tree_role<'a>(
         Some("user" | "assistant" | "tool" | "toolResult" | "tool_result") => role,
         Some(
             "bashExecution" | "pythonExecution" | "fileMention" | "branchSummary"
-            | "compactionSummary" | "custom" | "hookMessage",
+            | "compactionSummary" | "custom" | "hookMessage" | "developer",
         ) => Some("assistant"),
         Some(_) => None,
         None => matches!(
@@ -342,12 +344,15 @@ pub(crate) fn synthesized_tree_content(record: &Value) -> Option<Value> {
             message.get("summary").and_then(Value::as_str)?,
         ),
         Some("custom" | "hookMessage") => Some(visible_custom_note(message).unwrap_or(json!([]))),
+        Some("developer") => developer_note(message),
         _ => None,
     }
 }
 
 fn visible_custom_note(object: &Map<String, Value>) -> Option<Value> {
-    if object.get("display").and_then(Value::as_bool) != Some(true) {
+    if object.get("display").and_then(Value::as_bool) != Some(true)
+        || object.get("excludeFromContext").and_then(Value::as_bool) == Some(true)
+    {
         return None;
     }
     let kind = object
@@ -378,6 +383,9 @@ fn execution_note(
     message: &Map<String, Value>,
     command_keys: &[&str],
 ) -> Option<Value> {
+    if message.get("excludeFromContext").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
     let command = command_keys
         .iter()
         .find_map(|key| message.get(*key).and_then(Value::as_str))
@@ -440,6 +448,34 @@ fn pi_tool_result_content(message: &Map<String, Value>, content: Option<&Value>)
         "content": content.cloned().unwrap_or(Value::Null),
         "isError": message.get("isError").and_then(Value::as_bool).unwrap_or(false),
     }])
+}
+
+fn developer_note(message: &Map<String, Value>) -> Option<Value> {
+    let text = message
+        .get("content")
+        .map(|value| crate::domain::joined_text(&content_parts(value)))
+        .unwrap_or_default();
+    note_blocks("developer", text.trim())
+}
+
+/// Latest non-empty `session_info.name` on the active branch.
+fn session_display_name(records: &[Value], path_ids: &[&str]) -> Option<String> {
+    records.iter().rev().find_map(|record| {
+        let object = record.as_object()?;
+        if object.get("type").and_then(Value::as_str) != Some("session_info") {
+            return None;
+        }
+        let id = object.get("id").and_then(Value::as_str).unwrap_or("");
+        if !path_ids.contains(&id) {
+            return None;
+        }
+        object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 /// Build a fallback `Session` for an empty (not-yet-flushed) file: id from the
@@ -760,13 +796,19 @@ mod tests {
             &msg("m5", Some("m4"), "developer", r#""dev""#),
         ]);
         let session = parse(file.path()).expect("parse");
-        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages.len(), 4);
         assert_eq!(session.messages[0].role, Role::User);
         assert_eq!(session.messages[0].text, "q");
         assert_eq!(session.messages[1].role, Role::Assistant);
         assert_eq!(session.messages[1].text, "ans");
         assert_eq!(session.messages[2].role, Role::Tool);
         assert_eq!(session.messages[2].text, "tool");
+        assert!(matches!(
+            &session.messages[3].parts[0],
+            crate::domain::ContentPart::Note { kind, text }
+                if kind == "developer" && text == "dev"
+        ));
+        assert!(session.messages.iter().all(|message| message.text != "custom"));
     }
 
     #[test]
@@ -1017,6 +1059,61 @@ mod tests {
         let session = parse(file.path()).expect("parse");
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].text, "ready");
+    }
+
+    #[test]
+    fn developer_message_projects_as_a_note() {
+        let file = write_session(&[
+            HEADER,
+            r#"{"type":"message","id":"d","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"developer","content":[{"type":"text","text":"hidden instruction"}]}}"#,
+            &msg(
+                "a",
+                Some("d"),
+                "assistant",
+                r#"[{"type":"text","text":"ready"}]"#,
+            ),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert!(matches!(
+            &session.messages[0].parts[0],
+            crate::domain::ContentPart::Note { kind, text }
+                if kind == "developer" && text == "hidden instruction"
+        ));
+        assert_eq!(session.messages[1].text, "ready");
+    }
+
+    #[test]
+    fn context_excluded_entries_are_not_projected() {
+        let file = write_session(&[
+            HEADER,
+            r#"{"type":"message","id":"b","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"bashExecution","command":"ls","output":"src","excludeFromContext":true,"timestamp":1}}"#,
+            r#"{"type":"custom_message","id":"n","parentId":"b","timestamp":"2026-01-01T00:00:02.000Z","customType":"handoff","content":"hidden handoff","display":true,"excludeFromContext":true}"#,
+            &msg(
+                "a",
+                Some("n"),
+                "assistant",
+                r#"[{"type":"text","text":"ready"}]"#,
+            ),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].text, "ready");
+    }
+
+    #[test]
+    fn session_info_name_overrides_summary_on_the_active_branch() {
+        // The last appended entry is the native leaf. The unused name is an
+        // earlier sibling, so it is not selected by being newest in the file.
+        let file = write_session(&[
+            HEADER,
+            r#"{"type":"session_info","id":"dead","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","name":"Dead branch"}"#,
+            r#"{"type":"session_info","id":"n0","parentId":null,"timestamp":"2026-01-01T00:00:02.000Z","name":"Old name"}"#,
+            r#"{"type":"session_info","id":"n1","parentId":"n0","timestamp":"2026-01-01T00:00:03.000Z","name":"Saved name"}"#,
+            &msg("a", Some("n1"), "user", r#""first user text""#),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(session.summary, "Saved name");
+        assert_eq!(session.messages[0].text, "first user text");
     }
 
     #[test]

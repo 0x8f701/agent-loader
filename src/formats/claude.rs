@@ -3,8 +3,13 @@
 //! Claude stores a session as an append-only JSONL graph at
 //! `~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl`. This adapter
 //! follows the native 2.1.263 loader's active-leaf, compaction, parent recovery,
-//! and parallel-response rules before projecting the intentionally lossy
-//! user/assistant text contract.
+//! and parallel-response rules before projecting portable conversation content.
+//! Native-only graph, runtime, and opaque block metadata are not part of `Session`.
+//!
+//! Portable projection retains text, signed thinking, tool call inputs, textual
+//! tool results/error flags, supported embedded images, attachment notes, and
+//! the active compaction summary. It does not retain native branch history,
+//! usage, runtime state, file snapshots, or opaque blocks such as tool references.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -47,7 +52,12 @@ pub fn parse(path: &Path) -> Result<Session> {
         .and_then(|index| records[*index].timestamp());
     let messages = project_messages(&records, &active_path, include_sidechain);
     let summary = summary.unwrap_or_else(|| summarize_messages(&messages));
-    let mut hints = session_hints(&records);
+    let mut hints = session_hints(
+        active_path
+            .iter()
+            .map(|index| &records[*index])
+            .filter(|record| include_sidechain || !record.is_sidechain()),
+    );
     if include_sidechain {
         hints.session_kind = Some("sidechain".to_owned());
     }
@@ -660,11 +670,11 @@ fn attachment_note_text(kind: &AttachmentKind, raw: &Value) -> Option<String> {
     }
 }
 
-fn session_hints(records: &[Record]) -> SessionHints {
+fn session_hints<'a>(records: impl IntoIterator<Item = &'a Record>) -> SessionHints {
     let mut hints = SessionHints::default();
     for record in records {
         if let RecordKind::Assistant(assistant) = &record.kind {
-            if hints.model.is_none() {
+            if assistant.is_api_error_message != Some(true) {
                 if let Some(model) = assistant
                     .message
                     .as_ref()
@@ -673,12 +683,13 @@ fn session_hints(records: &[Record]) -> SessionHints {
                 {
                     hints.model = Some(model.to_owned());
                 }
-            }
-            if hints.thinking_level.is_none() {
-                hints.thinking_level = assistant
+                if let Some(level) = assistant
                     .effort
                     .as_deref()
-                    .and_then(|value| value.parse().ok());
+                    .and_then(|value| value.parse().ok())
+                {
+                    hints.thinking_level = Some(level);
+                }
             }
         }
         if let Some(summary) = compact_summary_text(record) {
@@ -1401,7 +1412,7 @@ pub struct MessageBody {
     pub id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "stop_reason")]
     pub stop_reason: Option<String>,
     #[serde(default)]
     pub usage: Option<Value>,
@@ -1425,9 +1436,9 @@ pub struct Block {
     pub raw: Value,
 }
 
-/// Known content-block variants. `[UNVERIFIED-ON-DISK]` for `tool_use`/
-/// `tool_result`/`thinking` (shapes recovered from the CLI binary); unknown
-/// block types collapse to `Unknown` while the raw block is retained.
+/// Known content-block variants. Text, tool calls/results, and signed thinking
+/// were verified by schema-only inspection of native transcripts. Unknown block
+/// types collapse to `Unknown` while the raw block is retained.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BlockKind {
@@ -1758,7 +1769,7 @@ mod tests {
 
     #[test]
     fn content_block_variants_round_trip() {
-        // [UNVERIFIED-ON-DISK] shapes recovered from the CLI binary.
+        // Synthetic values with schema verified against native transcripts.
         let content = serde_json::json!([
             {"type":"text","text":"hello"},
             {"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}},
@@ -2178,5 +2189,76 @@ mod tests {
         assert_eq!(user.extra.get("futureField"), Some(&serde_json::json!(42)));
         // Typed envelope fields are still accessible.
         assert_eq!(user.envelope.uuid.as_deref(), Some("u1"));
+    }
+
+    #[test]
+    fn native_snake_case_stop_reason_is_typed_and_serialized() {
+        let value = serde_json::json!({
+            "role": "assistant", "content": [], "stop_reason": "tool_use"
+        });
+        let body: MessageBody = serde_json::from_value(value).expect("message body");
+        assert_eq!(body.stop_reason.as_deref(), Some("tool_use"));
+        assert!(!body.extra.contains_key("stop_reason"));
+        let serialized = serde_json::to_value(body).expect("serialize");
+        assert_eq!(serialized["stop_reason"], "tool_use");
+        assert!(serialized.get("stopReason").is_none());
+    }
+
+    #[test]
+    fn hints_follow_active_model_changes_without_error_or_sidechain_models() {
+        let first = r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","model":"synthetic-first","content":[{"type":"text","text":"first"}]},"effort":"low"}"#;
+        let latest = r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","message":{"role":"assistant","model":"synthetic-latest","content":[{"type":"text","text":"latest"}]},"effort":"high"}"#;
+        let error = r#"{"type":"assistant","uuid":"e1","parentUuid":"a2","isApiErrorMessage":true,"message":{"role":"assistant","model":"synthetic-error","content":[{"type":"text","text":"error"}]},"effort":"low"}"#;
+        let sidechain = r#"{"type":"assistant","uuid":"sc1","parentUuid":"a1","isSidechain":true,"message":{"role":"assistant","model":"synthetic-sidechain","content":[]},"effort":"low"}"#;
+        let abandoned = r#"{"type":"assistant","uuid":"b1","parentUuid":"u1","message":{"role":"assistant","model":"synthetic-abandoned","content":[]},"effort":"low"}"#;
+        let pinned = r#"{"type":"last-prompt","leafUuid":"e1","explicit":true}"#;
+        let file = write_session(&[
+            &user("u1", None, r#""prompt""#),
+            first,
+            latest,
+            error,
+            sidechain,
+            abandoned,
+            pinned,
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(session.hints.model.as_deref(), Some("synthetic-latest"));
+        assert_eq!(session.hints.thinking_level, Some(crate::domain::ThinkingLevel::High));
+    }
+
+    #[test]
+    fn portable_projection_retains_signed_thinking_tools_and_nested_images() {
+        let response = r#"[{"type":"thinking","thinking":"synthetic reasoning","signature":"synthetic-signature"},{"type":"tool_use","id":"tool1","name":"Inspect","input":{"synthetic":true}}]"#;
+        let output = r#"[{"type":"tool_result","tool_use_id":"tool1","is_error":true,"content":[{"type":"text","text":"synthetic output"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"c3ludGhldGlj"}}]}]"#;
+        let file = write_session(&[
+            &user("u1", None, r#""prompt""#),
+            &assistant("a1", "u1", response),
+            &user("tr1", Some("a1"), output),
+        ]);
+        let session = parse(file.path()).expect("parse");
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[1].parts, vec![
+            ContentPart::Thinking {
+                text: "synthetic reasoning".to_owned(),
+                signature: Some("synthetic-signature".to_owned()),
+            },
+            ContentPart::ToolUse {
+                id: "tool1".to_owned(),
+                name: "Inspect".to_owned(),
+                input: serde_json::json!({"synthetic": true}),
+            },
+        ]);
+        assert_eq!(session.messages[2].role, Role::User);
+        assert_eq!(session.messages[2].parts, vec![
+            ContentPart::ToolResult {
+                tool_use_id: "tool1".to_owned(),
+                content: "synthetic output".to_owned(),
+                is_error: true,
+            },
+            ContentPart::Image {
+                mime_type: Some("image/png".to_owned()),
+                data: "c3ludGhldGlj".to_owned(),
+            },
+        ]);
     }
 }

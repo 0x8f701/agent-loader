@@ -33,6 +33,7 @@ pub enum AgentParseError {
 }
 
 pub fn parse(path: &Path) -> Result<Session> {
+    // Native roots select the current context only; archived compaction history is not exported.
     let metadata = fs::metadata(path)
         .with_context(|| format!("reading Agent store metadata {}", path.display()))?;
     let connection = Connection::open_with_flags(
@@ -49,7 +50,7 @@ pub fn parse(path: &Path) -> Result<Session> {
     {
         return Err(AgentParseError::Subagent.into());
     }
-    let messages = read_messages(&connection, path)?;
+    let messages = read_messages(&connection, path, meta.as_ref())?;
     let directory = path
         .parent()
         .with_context(|| format!("Agent store has no parent: {}", path.display()))?;
@@ -69,6 +70,7 @@ pub fn parse(path: &Path) -> Result<Session> {
     let start_timestamp = sidecar
         .as_ref()
         .and_then(|value| value.created_at_ms.or(value.updated_at_ms))
+        .or_else(|| meta.as_ref()?.get("createdAt")?.as_i64())
         .and_then(timestamp_from_millis);
     let summary = sidecar
         .as_ref()
@@ -183,7 +185,23 @@ fn read_sidecar(path: &Path) -> Result<Option<Sidecar>> {
     Ok(serde_json::from_slice(&bytes).ok())
 }
 
-fn read_messages(connection: &Connection, path: &Path) -> Result<Vec<Message>> {
+fn read_messages(connection: &Connection, path: &Path, meta: Option<&Value>) -> Result<Vec<Message>> {
+    if let Some(root) = meta.and_then(|value| value.get("latestRootBlobId")) {
+        let root = root.as_str().context("Agent root blob ID is not a string")?;
+        let blob = read_blob(connection, root)?.context("Agent root blob is missing")?;
+        let references = root_message_references(&blob).context("decoding Agent active context")?;
+        let mut messages = Vec::new();
+        for reference in references {
+            let blob = read_blob(connection, &reference)?
+                .context("Agent active context message blob is missing")?;
+            let value: Value = serde_json::from_slice(&blob)
+                .context("decoding Agent active context message")?;
+            if let Some(message) = project_message(&value, true) {
+                messages.push(message);
+            }
+        }
+        return Ok(messages);
+    }
     let mut statement = match connection.prepare("SELECT data FROM blobs ORDER BY rowid") {
         Ok(statement) => statement,
         Err(error) if is_missing_table(&error) => return Ok(Vec::new()),
@@ -204,12 +222,75 @@ fn read_messages(connection: &Connection, path: &Path) -> Result<Vec<Message>> {
             continue;
         };
         for value in json_values(&blob) {
-            if let Some(message) = project_message(&value) {
+            if let Some(message) = project_message(&value, false) {
                 messages.push(message);
             }
         }
     }
     Ok(messages)
+}
+
+fn read_blob(connection: &Connection, id: &str) -> Result<Option<Vec<u8>>> {
+    connection
+        .query_row("SELECT data FROM blobs WHERE id = ?1", [id], |row| {
+            match row.get_ref(0)? {
+                ValueRef::Blob(value) | ValueRef::Text(value) => Ok(value.to_vec()),
+                _ => Err(rusqlite::Error::InvalidColumnType(
+                    0,
+                    "data".to_owned(),
+                    row.get_ref(0)?.data_type(),
+                )),
+            }
+        })
+        .optional()
+        .context("reading Agent context blob")
+}
+
+fn root_message_references(mut bytes: &[u8]) -> Result<Vec<String>> {
+    let mut references = Vec::new();
+    while !bytes.is_empty() {
+        let tag = read_varint(&mut bytes)?;
+        anyhow::ensure!(tag >> 3 != 0, "invalid Agent root field number");
+        anyhow::ensure!(tag >> 3 != 1 || tag & 7 == 2, "invalid Agent message reference wire type");
+        let length = match tag & 7 {
+            0 => {
+                read_varint(&mut bytes)?;
+                continue;
+            }
+            1 => 8,
+            2 => usize::try_from(read_varint(&mut bytes)?)?,
+            5 => 4,
+            _ => anyhow::bail!("unsupported Agent root wire type"),
+        };
+        anyhow::ensure!(length <= bytes.len(), "truncated Agent root field");
+        let (value, remainder) = bytes.split_at(length);
+        if tag >> 3 == 1 {
+            anyhow::ensure!(tag & 7 == 2 && length == 32, "invalid Agent message reference");
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut reference = String::with_capacity(64);
+            for byte in value {
+                reference.push(HEX[(byte >> 4) as usize] as char);
+                reference.push(HEX[(byte & 15) as usize] as char);
+            }
+            references.push(reference);
+        }
+        bytes = remainder;
+    }
+    Ok(references)
+}
+
+fn read_varint(bytes: &mut &[u8]) -> Result<u64> {
+    let mut value = 0u64;
+    for shift in (0..70).step_by(7) {
+        let (&byte, remainder) = bytes.split_first().context("truncated Agent root varint")?;
+        *bytes = remainder;
+        anyhow::ensure!(shift < 63 || byte <= 1, "overflowing Agent root varint");
+        value |= u64::from(byte & 127) << shift;
+        if byte & 128 == 0 {
+            return Ok(value);
+        }
+    }
+    anyhow::bail!("overflowing Agent root varint")
 }
 
 fn is_missing_table(error: &rusqlite::Error) -> bool {
@@ -260,7 +341,7 @@ fn balanced_json_objects(data: &[u8]) -> impl Iterator<Item = &[u8]> {
     objects.into_iter()
 }
 
-fn project_message(value: &Value) -> Option<Message> {
+fn project_message(value: &Value, include_summary: bool) -> Option<Message> {
     let object = value.as_object()?;
     let role = match object.get("role").and_then(Value::as_str)? {
         "user" => Role::User,
@@ -268,10 +349,23 @@ fn project_message(value: &Value) -> Option<Message> {
         "tool" => Role::Tool,
         _ => return None,
     };
-    if role == Role::User && is_synthesized_user_record(object) {
+    if !include_summary && role == Role::User && is_synthesized_user_record(object) {
         return None;
     }
     let mut parts = object.get("content").map(content_parts).unwrap_or_default();
+    if let Some(Value::Array(content)) = object.get("content") {
+        for part in content {
+            if part.get("type").and_then(Value::as_str) == Some("tool-result") {
+                if let Some(content) = part.get("experimental_content") {
+                    parts.extend(
+                        content_parts(content)
+                            .into_iter()
+                            .filter(|part| matches!(part, ContentPart::Image { .. })),
+                    );
+                }
+            }
+        }
+    }
     if let Some(Value::Array(calls)) = object.get("tool_calls") {
         for call in calls {
             parts.push(ContentPart::ToolUse {
@@ -427,6 +521,54 @@ fn metadata_epoch(metadata: &fs::Metadata) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn active_root_orders_messages_and_excludes_unreferenced_blobs() {
+        let (_home, path) = fixture(
+            Some(r#"{"latestRootBlobId":"synthetic-root"}"#),
+            &[br#"{"role":"user","content":"unreferenced sentinel"}"#],
+            None,
+        );
+        let connection = Connection::open(&path).unwrap();
+        let mut root = Vec::new();
+        for byte in [1u8, 2, 3] {
+            root.extend_from_slice(&[10, 32]);
+            root.extend_from_slice(&[byte; 32]);
+        }
+        for (byte, message) in [
+            (3u8, r#"{"role":"assistant","content":"answer"}"#),
+            (2, r#"{"role":"user","content":"question"}"#),
+            (1, r#"{"role":"user","content":"context summary","providerOptions":{"cursor":{"isSummary":true}}}"#),
+        ] {
+            let id = hex(&String::from_utf8(vec![byte; 32]).unwrap());
+            connection.execute("INSERT INTO blobs VALUES(?1, ?2)", params![id, message]).unwrap();
+        }
+        connection.execute("INSERT INTO blobs VALUES('synthetic-root', ?1)", [root]).unwrap();
+        drop(connection);
+        let session = parse(&path).unwrap();
+        assert_eq!(
+            session.messages.iter().map(|message| message.text.as_str()).collect::<Vec<_>>(),
+            ["context summary", "question", "answer"]
+        );
+    }
+
+    #[test]
+    fn invalid_active_roots_do_not_fall_back_to_all_blobs() {
+        for root in [&b"\x0a\x20short"[..], &b"\x00"[..], &b"\x0a\x01x"[..]] {
+            let (_home, path) = fixture(
+                Some(r#"{"latestRootBlobId":"synthetic-root"}"#),
+                &[br#"{"role":"user","content":"unreferenced sentinel"}"#],
+                None,
+            );
+            let connection = Connection::open(&path).unwrap();
+            connection.execute("INSERT INTO blobs VALUES('synthetic-root', ?1)", [root]).unwrap();
+            drop(connection);
+            assert!(parse(&path).is_err());
+        }
+        let (_home, path) = fixture(Some(r#"{"latestRootBlobId":"missing-root"}"#), &[], None);
+        assert!(parse(&path).is_err());
+        assert!(root_message_references(&[10, 32].into_iter().chain([7; 32]).collect::<Vec<_>>()).is_ok());
+        assert!(read_varint(&mut &[255; 10][..]).is_err());
+    }
     use super::*;
     use rusqlite::{Connection, params};
     use tempfile::TempDir;
@@ -570,6 +712,39 @@ mod tests {
         );
         let session = parse(&path).unwrap();
         assert_eq!(session.hints.model.as_deref(), Some("cursor-model"));
+    }
+
+    #[test]
+    fn native_metadata_creation_time_is_used_without_sidecar() {
+        let (_home, path) = fixture(
+            Some(r#"{"agentId":"id","createdAt":1767225600000}"#),
+            &[],
+            None,
+        );
+        let session = parse(&path).unwrap();
+        assert_eq!(
+            session.start_timestamp.as_deref(),
+            Some("2026-01-01T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn structured_tool_result_images_are_preserved_without_duplicate_text() {
+        let blob = br#"{"role":"tool","content":[{"type":"tool-result","toolCallId":"call","result":"image description","experimental_content":[{"type":"text","text":"image description"},{"type":"image","mimeType":"image/png","data":"c3ludGhldGlj"}]}]}"#;
+        let (_home, path) = fixture(None, &[blob], None);
+        let session = parse(&path).unwrap();
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].parts.len(), 2);
+        assert!(matches!(
+            &session.messages[0].parts[0],
+            ContentPart::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "call" && content == "image description"
+        ));
+        assert!(matches!(
+            &session.messages[0].parts[1],
+            ContentPart::Image { mime_type, data }
+                if mime_type.as_deref() == Some("image/png") && data == "c3ludGhldGlj"
+        ));
     }
 
     #[test]

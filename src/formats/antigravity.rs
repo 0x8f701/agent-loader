@@ -6,6 +6,11 @@
 //! directory named `conversations` also registers that one conversation in
 //! the parent summary database and continue-cache; any other parent is a
 //! standalone export and only receives the adjacent brain directory.
+//!
+//! Portable projection keeps user/planner text, planner thinking (including
+//! signature-only blocks), inline media, calls and generic result text. Native
+//! bookkeeping, per-call signatures, structured/binary result payloads and
+//! executor state are not portable; numeric model enums remain `model-N` hints.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -373,7 +378,7 @@ fn planner_step(session: &Session, id: &str, trajectory: &str, index: i64, turn:
     }).collect::<Vec<_>>().join("\n\n");
     wire::string_field(&mut body, 1, &text);
     let (thinking, signature) = combined_thinking(&parts);
-    if !thinking.is_empty() {
+    if !thinking.is_empty() || signature.is_some() {
         wire::string_field(&mut body, 3, &thinking);
         if let Some(signature) = signature {
             if let Some(binary) = signature.strip_prefix(wire::BASE64_PREFIX) {
@@ -553,13 +558,14 @@ fn push_unique(parts: &mut Vec<ContentPart>, seen: &mut std::collections::HashSe
 fn planner_message(payload: &[Field], timestamp: Option<String>) -> Result<Option<Message>> {
     let planner = wire::message(payload, 20)?;
     let mut parts = Vec::new();
-    let thinking = wire::text(&planner, 3)?.or(wire::text(&planner, 16)?).filter(|text| !text.trim().is_empty());
-    if let Some(text) = thinking {
-        let signature = match wire::bytes(&planner, 14) {
-            Some(bytes) => Some(format!("{}{}", wire::BASE64_PREFIX, wire::base64_encode(bytes))),
-            None => wire::text(&planner, 4)?,
-        };
-        parts.push(ContentPart::Thinking { text, signature });
+    let thinking = wire::text(&planner, 3)?.filter(|text| !text.trim().is_empty())
+        .or(wire::text(&planner, 16)?.filter(|text| !text.trim().is_empty()));
+    let signature = match wire::bytes(&planner, 14) {
+        Some(bytes) => Some(format!("{}{}", wire::BASE64_PREFIX, wire::base64_encode(bytes))),
+        None => wire::text(&planner, 4)?,
+    };
+    if thinking.is_some() || signature.is_some() {
+        parts.push(ContentPart::Thinking { text: thinking.unwrap_or_default(), signature });
     }
     if let Some(text) = wire::text(&planner, 1)?.or(wire::text(&planner, 8)?).filter(|text| !text.trim().is_empty()) {
         parts.push(ContentPart::Text(text));
@@ -1151,6 +1157,46 @@ mod tests {
         assert_eq!(workspaces[1], extra.as_slice());
         assert!(std::str::from_utf8(workspaces[0]).unwrap().contains("/moved"));
         assert_eq!(wire::all_bytes(&fields, 7)[1], b"file:///extra".as_slice());
+    }
+
+    #[test]
+    fn signature_only_thinking_survives_native_round_trip() {
+        let root = TempDir::new().unwrap();
+        let id = "99999999-9999-4999-8999-999999999999";
+        let path = root.path().join("exports").join(format!("{id}.db"));
+        let mut source = session("signature");
+        let signature = format!("{}{}", wire::BASE64_PREFIX, wire::base64_encode(&[0xff, 0, 0x80]));
+        source.messages[1].parts = vec![
+            ContentPart::Thinking { text: String::new(), signature: Some(signature.clone()) },
+            ContentPart::Text("answer".to_owned()),
+        ];
+        write(&source, &path, id).unwrap();
+        let parsed = parse(&path).unwrap();
+        assert!(parsed.messages.iter().flat_map(|message| &message.parts).any(|part| matches!(part,
+            ContentPart::Thinking { text, signature: Some(value) } if text.is_empty() && value == &signature)));
+    }
+
+    #[test]
+    fn empty_display_thinking_falls_back_to_raw_thinking() {
+        let mut planner = Vec::new();
+        wire::bytes_field(&mut planner, 3, b"");
+        wire::string_field(&mut planner, 16, "raw thinking");
+        let payload = envelope(STEP_PLANNER, STATUS_DONE, &[], 20, &planner);
+        let message = planner_message(&wire::decode(&payload).unwrap(), None).unwrap().unwrap();
+        assert!(matches!(&message.parts[0], ContentPart::Thinking { text, .. } if text == "raw thinking"));
+    }
+
+    #[test]
+    fn summary_lineage_distinguishes_subagents_from_user_forks() {
+        let root = TempDir::new().unwrap();
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let path = root.path().join("conversations").join(format!("{id}.db"));
+        write(&session("lineage"), &path, id).unwrap();
+        let summaries = Connection::open(root.path().join("conversation_summaries.db")).unwrap();
+        summaries.execute("UPDATE conversation_summaries SET parent_conversation_id='parent', agent_name='worker', nesting_depth=0 WHERE conversation_id=?1", params![id]).unwrap();
+        assert_eq!(parse(&path).unwrap().hints.session_kind, None);
+        summaries.execute("UPDATE conversation_summaries SET nesting_depth=1 WHERE conversation_id=?1", params![id]).unwrap();
+        assert_eq!(parse(&path).unwrap().hints.session_kind.as_deref(), Some("subagent:worker"));
     }
 
 }
