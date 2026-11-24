@@ -439,12 +439,15 @@ fn keep_once(options: &KeepOptions) -> Result<()> {
     };
     let mut scanned = false;
     let mut any = false;
+    let mut scan_error: Option<String> = None;
+    let mut resolve_error: Option<String> = None;
     for host in &hosts {
         let host = if host == "local" { "local" } else { host.as_str() };
         let agents = match scan_host(host, GitMode::Off) {
             Ok(agents) => agents,
             Err(error) => {
                 println!("al supervise  keep  scan {host}  {error}");
+                scan_error.get_or_insert_with(|| format!("scan {host}: {error}"));
                 continue;
             }
         };
@@ -457,6 +460,7 @@ fn keep_once(options: &KeepOptions) -> Result<()> {
             Ok(selected) => selected,
             Err(error) => {
                 println!("al supervise  keep  {host}  {error}");
+                resolve_error.get_or_insert_with(|| format!("{host}: {error}"));
                 continue;
             }
         };
@@ -469,6 +473,19 @@ fn keep_once(options: &KeepOptions) -> Result<()> {
                 );
             }
         }
+    }
+    keep_outcome(options, scanned, any, resolve_error.or(scan_error))
+}
+
+fn keep_outcome(
+    options: &KeepOptions,
+    scanned: bool,
+    any: bool,
+    first_error: Option<String>,
+) -> Result<()> {
+    if !any && has_keep_selector(options) {
+        let detail = first_error.unwrap_or_else(|| "no live agents".to_owned());
+        bail!("selection matched no live agent ({detail})");
     }
     if scanned && !any {
         println!("al supervise  keep  no live agents");
@@ -3955,6 +3972,63 @@ Markdown table cells no longer split short ASCII tokens like P0.\n\
             interval: 5,
             max_ticks: None,
         }));
+    }
+
+    fn keep_opts(target: Option<&str>, session: Option<&str>) -> KeepOptions {
+        KeepOptions {
+            hosts: vec!["local".to_owned()],
+            target: target.map(str::to_owned),
+            session: session.map(str::to_owned),
+            message: DEFAULT_KEEP_MESSAGE.to_owned(),
+            interval: 5,
+            max_ticks: None,
+        }
+    }
+
+    #[test]
+    fn keep_errors_when_selector_matches_nowhere() {
+        let agents = [live("omp", AgentState::Idle, "/workspace/demo")];
+
+        // Missing session/target resolve nowhere on any host -> error, not exit 0.
+        let err = keep_outcome(
+            &keep_opts(None, Some("no-such")),
+            true,
+            false,
+            Some("local: no live agent in tmux session \"no-such\"".to_owned()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no-such"), "{err}");
+
+        let err = keep_outcome(
+            &keep_opts(Some("missing"), None),
+            true,
+            false,
+            Some("local: no live agent matches \"missing\"".to_owned()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
+
+        // A selector still errors when every host failed to scan; keep scan detail.
+        let err = keep_outcome(
+            &keep_opts(Some("missing"), None),
+            false,
+            false,
+            Some("scan local: tmux unavailable".to_owned()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tmux unavailable"), "{err}");
+
+        // A selector matching any host stays a success even if others had none.
+        assert!(keep_outcome(&keep_opts(Some("demo"), None), true, true, None).is_ok());
+
+        // Selector matching agents that all resolve (skipped ones still count).
+        assert_eq!(
+            resolve_keep_agents(&agents, Some("omp"), None).unwrap().len(),
+            1
+        );
+
+        // Bare supervise with no agents remains a non-error monitor tick.
+        assert!(keep_outcome(&keep_opts(None, None), true, false, None).is_ok());
     }
 
     #[test]
