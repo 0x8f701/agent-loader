@@ -77,6 +77,7 @@ pub enum LauncherKind {
     Codex,
     Claude,
     Agent,
+    Antigravity,
 }
 
 impl LauncherKind {
@@ -90,13 +91,14 @@ impl LauncherKind {
             Self::Codex => "colo",
             Self::Claude => "cclo",
             Self::Agent => "agentlo",
+            Self::Antigravity => "agyo",
         }
     }
 
     const fn argument_error_code(self) -> i32 {
         match self {
             Self::Grok | Self::Claude => 2,
-            Self::Omp | Self::Pi | Self::Rpi | Self::Droid | Self::Codex | Self::Agent => 1,
+            Self::Omp | Self::Pi | Self::Rpi | Self::Droid | Self::Codex | Self::Agent | Self::Antigravity => 1,
         }
     }
 
@@ -213,6 +215,12 @@ pub enum LauncherError {
     },
     #[error("agentlo: Agent sessions are read-only and cannot be forked")]
     AgentForkRejected,
+    #[error("{launcher}: {message}")]
+    Failed {
+        launcher: &'static str,
+        message: String,
+        code: i32,
+    },
     #[error("failed to execute {program:?}: {source}")]
     Execute {
         program: OsString,
@@ -237,6 +245,7 @@ impl LauncherError {
             | Self::InvalidRemotePathMapPath { code, .. } => *code,
             Self::MissingExecutable { .. } => 127,
             Self::AgentForkRejected => 2,
+            Self::Failed { code, .. } => *code,
             Self::Execute { source, .. } => match source.kind() {
                 io::ErrorKind::NotFound => 127,
                 io::ErrorKind::PermissionDenied => 126,
@@ -280,6 +289,9 @@ pub fn native_resume(
                 os(session_id),
             ],
         ),
+        TargetTool::Antigravity => {
+            command("agy", [os("--conversation"), os(session_id)])
+        }
     }
 }
 
@@ -308,6 +320,9 @@ pub fn native_fork(
             [os("--fork-session"), os("--resume"), os(session_id)],
         ),
         TargetTool::Agent => unreachable!("Agent fork is rejected before launcher dispatch"),
+        TargetTool::Antigravity => {
+            command("agy", [os("--conversation"), os(session_id)])
+        }
     }
 }
 
@@ -322,6 +337,7 @@ pub fn resolve_tool_executable(target: TargetTool, home: &Path) -> Result<OsStri
         TargetTool::Claude => OsString::from("claude"),
         TargetTool::Grok => OsString::from("grok"),
         TargetTool::Agent => OsString::from("agent"),
+        TargetTool::Antigravity => OsString::from("agy"),
     };
     resolve_executable(&program)
         .map(PathBuf::into_os_string)
@@ -705,6 +721,7 @@ fn build_local(
         LauncherKind::Codex => build_codex(args),
         LauncherKind::Claude => build_claude(args),
         LauncherKind::Agent => build_agent(args),
+        LauncherKind::Antigravity => build_antigravity(args, home, cwd),
     }
     .map(|mut plan| {
         if let LaunchPlan::Command(command) = &mut plan {
@@ -797,7 +814,10 @@ fn build_pi_family(
         let session = match session {
             Some(session) => session.clone(),
             None => {
-                let root = pi_session_root(home);
+                let root = match kind {
+                    LauncherKind::Rpi => home.join(".rpi/sessions"),
+                    _ => pi_session_root(home),
+                };
                 let path = latest_jsonl(&root, true).ok_or_else(|| LauncherError::NoSession {
                     launcher: kind.as_str(),
                     root: root.clone(),
@@ -872,8 +892,12 @@ fn build_droid(args: &[OsString], home: &Path, repo_root: Option<&Path>) -> Resu
     ];
     let command = if args.is_empty() {
         command_with_tail("droid", base, &[os("--resume")])
-    } else if args[0] == "--resume" {
-        let id = required_selector(LauncherKind::Droid, args, "--resume")?;
+    } else if args[0] == "--resume" || args[0] == "--session" {
+        // `droid` has no `--session` flag: the common selector maps to
+        // native `--resume ID` (and `--fork ID` after `--fork`), with the
+        // caller's option name preserved in errors.
+        let option = if args[0] == "--resume" { "--resume" } else { "--session" };
+        let id = required_selector(LauncherKind::Droid, args, option)?;
         let remaining = &args[2..];
         if remaining
             .first()
@@ -1036,6 +1060,164 @@ fn build_agent(args: &[OsString]) -> Result<LaunchPlan> {
         command_with_tail("agent", prefix, args)
     };
     Ok(LaunchPlan::Command(command))
+}
+
+/// Build the raw, native argv for Antigravity's `agy` CLI.
+///
+/// With no tool args the launcher runs `agy --continue` to resume the last
+/// conversation directly. A `--session ID` selector (normalized by
+/// `parse_common` from `--session ID` or `--session=ID`) maps to
+/// `--conversation ID`; everything else — native options and subcommands —
+/// is forwarded verbatim. `agy` is resolved through `PATH` at execution time.
+///
+/// `agy` has no native fork flag, so `--fork` (optionally selecting a
+/// conversation ID, or the conversation cached for the current workspace)
+/// and `--session ID --fork` clone the native conversation by re-emitting a
+/// fresh carrier with a new conversation ID, then resume that ID.
+fn build_antigravity(args: &[OsString], home: &Path, cwd: &Path) -> Result<LaunchPlan> {
+    let command = if args.is_empty() {
+        command("agy", [os("--continue")])
+    } else if args[0] == "--session" {
+        let id = required_selector(LauncherKind::Antigravity, args, "--session")?;
+        let remaining = &args[2..];
+        if remaining
+            .first()
+            .is_some_and(|arg| arg == "--fork" || arg == "fork")
+        {
+            let new_id = fork_antigravity(home, Some(id.as_os_str()), cwd)?;
+            command_with_tail(
+                "agy",
+                [os("--conversation"), os(&new_id)],
+                &remaining[1..],
+            )
+        } else {
+            command_with_tail("agy", [os("--conversation"), id.clone()], remaining)
+        }
+    } else if args[0] == "--fork" || args[0] == "fork" {
+        let (selector, tail) = optional_selector(args, 1);
+        let new_id = fork_antigravity(home, selector.map(OsString::as_os_str), cwd)?;
+        command_with_tail("agy", [os("--conversation"), os(&new_id)], tail)
+    } else {
+        command("agy", args.iter().cloned())
+    };
+    Ok(LaunchPlan::Command(command))
+}
+
+/// Clone a native Antigravity conversation into a fresh carrier and return the
+/// new conversation ID. `selector` is a conversation ID; without one the
+/// conversation cached for `cwd` in `cache/last_conversations.json` is used.
+/// Emission writes a new UUID `.db` under `conversations/` with its sibling
+/// `brain/<uuid>/` so native resume finds a real conversation.
+fn fork_antigravity(home: &Path, selector: Option<&OsStr>, cwd: &Path) -> Result<String> {
+    let root = home.join(".gemini/antigravity-cli");
+    let conversations = root.join("conversations");
+    let source = match selector {
+        Some(selector) => {
+            let id = selector.to_str().ok_or_else(|| LauncherError::NonUtf8Path {
+                launcher: LauncherKind::Antigravity.as_str(),
+                path: PathBuf::from(selector),
+                code: 1,
+            })?;
+            if !crate::domain::is_canonical_uuid(id) {
+                return Err(LauncherError::OptionValue {
+                    launcher: LauncherKind::Antigravity.as_str(),
+                    option: "--fork",
+                    code: LauncherKind::Antigravity.argument_error_code(),
+                });
+            }
+            conversations.join(format!("{id}.db"))
+        }
+        None => antigravity_cached_conversation(&root, cwd).map(|id| {
+            conversations.join(format!("{id}.db"))
+        })?,
+    };
+    if !source.is_file() {
+        return Err(LauncherError::NoSession {
+            launcher: LauncherKind::Antigravity.as_str(),
+            root: conversations,
+            code: 1,
+        });
+    }
+    let session = crate::formats::antigravity::parse(&source).map_err(|error| {
+        LauncherError::Failed {
+            launcher: LauncherKind::Antigravity.as_str(),
+            message: format!("cannot read Antigravity conversation {}: {error}", source.display()),
+            code: 1,
+        }
+    })?;
+    let emitted = crate::emit::emit_default(&session, TargetTool::Antigravity, home).map_err(
+        |error| LauncherError::Failed {
+            launcher: LauncherKind::Antigravity.as_str(),
+            message: format!("cannot emit the Antigravity conversation fork: {error}"),
+            code: 1,
+        },
+    )?;
+    Ok(emitted.session_id)
+}
+
+/// Read `cache/last_conversations.json` for the conversation `agy --continue`
+/// would pick for `cwd`. The cache maps absolute workspace paths to
+/// conversation UUIDs; cached IDs are validated like explicit selectors so a
+/// corrupted or hostile cache cannot escape the conversations root.
+fn antigravity_cached_conversation(root: &Path, cwd: &Path) -> Result<String> {
+    let cache_path = root.join("cache/last_conversations.json");
+    let bytes = match fs::read(&cache_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(LauncherError::NoSession {
+                launcher: LauncherKind::Antigravity.as_str(),
+                root: cache_path,
+                code: 1,
+            });
+        }
+        Err(error) => {
+            return Err(LauncherError::Failed {
+                launcher: LauncherKind::Antigravity.as_str(),
+                message: format!(
+                    "cannot read Antigravity conversation cache {}: {error}",
+                    cache_path.display()
+                ),
+                code: 1,
+            });
+        }
+    };
+    let payload: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        LauncherError::Failed {
+            launcher: LauncherKind::Antigravity.as_str(),
+            message: format!(
+                "cannot parse Antigravity conversation cache {}: {error}",
+                cache_path.display()
+            ),
+            code: 1,
+        }
+    })?;
+    let key = fs::canonicalize(cwd)
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let Some(id) = payload
+        .get(&key)
+        .or_else(|| payload.get(cwd.to_string_lossy().as_ref()))
+        .and_then(|value| value.as_str())
+        .filter(|id| !id.is_empty())
+    else {
+        return Err(LauncherError::NoSession {
+            launcher: LauncherKind::Antigravity.as_str(),
+            root: cache_path,
+            code: 1,
+        });
+    };
+    if !crate::domain::is_canonical_uuid(id) {
+        return Err(LauncherError::Failed {
+            launcher: LauncherKind::Antigravity.as_str(),
+            message: format!(
+                "invalid Antigravity conversation id {id:?} in {}",
+                cache_path.display()
+            ),
+            code: 1,
+        });
+    }
+    Ok(id.to_owned())
 }
 
 fn required_selector<'a>(
@@ -1671,6 +1853,10 @@ mod tests {
                 ]),
             )
         );
+        assert_eq!(
+            native_resume(TargetTool::Antigravity, path, "conv-id", home),
+            command("agy", strings(&["--conversation", "conv-id"]))
+        );
     }
 
     #[test]
@@ -1692,6 +1878,10 @@ mod tests {
         assert_eq!(
             native_fork(TargetTool::Rpi, path, "ignored", home),
             command("rpi", strings(&["--fork", "/tmp/session.jsonl"]))
+        );
+        assert_eq!(
+            native_fork(TargetTool::Antigravity, path, "conv-id", home),
+            command("agy", strings(&["--conversation", "conv-id"]))
         );
     }
 
@@ -1776,7 +1966,7 @@ mod tests {
     fn rpilo_implicit_fork_uses_latest_session_path() {
         let temp = TempDir::new().unwrap();
         let rpi = temp.path().join("managed-rpi/bin/rpi");
-        let session = temp.path().join(".pi/agent/sessions/project/session.jsonl");
+        let session = temp.path().join(".rpi/sessions/project/session.jsonl");
         fs::create_dir_all(session.parent().unwrap()).unwrap();
         fs::write(&session, "{}\n").unwrap();
 
@@ -2150,6 +2340,321 @@ mod tests {
             strings(&["al", "agentlo", "--session", "chat-7", "prompt"]),
         );
     }
+    #[test]
+    fn agyo_bare_continues_last_conversation() {
+        let command = assert_command(
+            build_launcher(LauncherKind::Antigravity, &[], &test_home(), Path::new("/tmp"))
+                .unwrap(),
+        );
+        assert_eq!(command.program, "agy");
+        assert_eq!(command.args, strings(&["--continue"]));
+    }
+
+    #[test]
+    fn agyo_tmux_wraps_continue_command() {
+        let plan = build_launcher(
+            LauncherKind::Antigravity,
+            &strings(&["--tmux"]),
+            &test_home(),
+            Path::new("/tmp/project"),
+        )
+        .unwrap();
+        let LaunchPlan::Tmux {
+            session,
+            command,
+            fallback,
+        } = plan
+        else {
+            panic!("expected tmux plan")
+        };
+        assert_eq!(session, "agyo-project");
+        assert_eq!(command.program, "agy");
+        assert_eq!(command.args, strings(&["--continue"]));
+        assert!(fallback.is_none());
+    }
+
+    #[test]
+    fn agyo_session_maps_to_conversation_with_remaining_tail() {
+        for args in [
+            strings(&["--session", "conv-1", "fix it"]),
+            strings(&["--session=conv-1", "fix it"]),
+        ] {
+            let command = assert_command(
+                build_launcher(LauncherKind::Antigravity, &args, &test_home(), Path::new("/tmp"))
+                    .unwrap(),
+            );
+            assert_eq!(command.program, "agy");
+            assert_eq!(
+                command.args,
+                strings(&["--conversation", "conv-1", "fix it"]),
+            );
+        }
+    }
+
+    #[test]
+    fn agyo_session_without_id_errors_with_normal_exit_code() {
+        for args in [
+            vec![os("--session")],
+            strings(&["--session="]),
+            strings(&["--session", "--model"]),
+        ] {
+            let error = build_launcher(
+                LauncherKind::Antigravity,
+                &args,
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 1, "{args:?} exits 1");
+        }
+    }
+
+    #[test]
+    fn agyo_native_args_and_subcommands_forward_verbatim() {
+        for args in [
+            strings(&["--conversation", "conv-9"]),
+            strings(&["--model", "gemini-3-pro", "prompt"]),
+            strings(&["models"]),
+            strings(&["mcp", "list"]),
+            strings(&["--help"]),
+        ] {
+            let command = assert_command(
+                build_launcher(LauncherKind::Antigravity, &args, &test_home(), Path::new("/tmp"))
+                    .unwrap(),
+            );
+            assert_eq!(command.program, "agy");
+            assert_eq!(command.args, args, "verbatim forwarding for {args:?}");
+        }
+    }
+
+    fn antigravity_fixture(home: &Path, conversation_id: &str, cwd: &Path) {
+        let path = home
+            .join(".gemini/antigravity-cli/conversations")
+            .join(format!("{conversation_id}.db"));
+        let session = crate::domain::Session {
+            tool: crate::domain::SourceTool::Antigravity,
+            session_id: conversation_id.to_owned(),
+            cwd: cwd.to_path_buf(),
+            start_timestamp: Some("2026-07-30T10:11:12.123Z".to_owned()),
+            summary: "Antigravity conversation".to_owned(),
+            messages: vec![crate::domain::Message {
+                role: crate::domain::Role::User,
+                text: "inspect the launcher".to_owned(),
+                timestamp: None,
+                parts: Vec::new(),
+            }],
+            path: path.clone(),
+            modified_epoch: None,
+            hints: crate::domain::SessionHints::default(),
+        };
+        crate::formats::antigravity::write(&session, &path, conversation_id).unwrap();
+    }
+
+    fn conversation_id(command: &CommandSpec) -> String {
+        assert_eq!(command.program, "agy");
+        assert_eq!(command.args.first().unwrap(), "--conversation");
+        command.args[1].to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn agyo_fork_emits_fresh_conversation_and_resumes_it() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let cwd = home.join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let source_id = "00000000-0000-4000-8000-000000000001";
+        antigravity_fixture(home, source_id, &cwd);
+
+        for args in [
+            strings(&["--fork", source_id]),
+            strings(&["--session", source_id, "--fork"]),
+        ] {
+            let command = assert_command(
+                build_launcher(LauncherKind::Antigravity, &args, home, &cwd).unwrap(),
+            );
+            assert_eq!(command.program, "agy");
+            assert_eq!(command.args.len(), 2);
+            let new_id = conversation_id(&command);
+            assert_ne!(new_id, source_id);
+            assert!(crate::domain::is_canonical_uuid(&new_id));
+            let carrier = home
+                .join(".gemini/antigravity-cli/conversations")
+                .join(format!("{new_id}.db"));
+            assert!(carrier.is_file(), "fork carrier missing: {}", carrier.display());
+        }
+    }
+
+    #[test]
+    fn agyo_bare_fork_uses_workspace_cache_and_errors_without_one() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let cwd = home.join("project");
+        fs::create_dir_all(&cwd).unwrap();
+
+        // No cache entry: a readable NoSession instead of guessing a global newest.
+        let error = build_launcher(
+            LauncherKind::Antigravity,
+            &strings(&["--fork"]),
+            home,
+            &cwd,
+        )
+        .unwrap_err();
+        assert!(matches!(error, LauncherError::NoSession { .. }));
+
+        let source_id = "00000000-0000-4000-8000-000000000002";
+        antigravity_fixture(home, source_id, &cwd);
+        let cache = home.join(".gemini/antigravity-cli/cache");
+        fs::create_dir_all(&cache).unwrap();
+        let key = fs::canonicalize(&cwd).unwrap().to_string_lossy().into_owned();
+        fs::write(
+            cache.join("last_conversations.json"),
+            serde_json::json!({ key: source_id }).to_string(),
+        )
+        .unwrap();
+
+        let command = assert_command(
+            build_launcher(LauncherKind::Antigravity, &strings(&["--fork"]), home, &cwd)
+                .unwrap(),
+        );
+        let new_id = conversation_id(&command);
+        assert_ne!(new_id, source_id);
+        assert!(crate::domain::is_canonical_uuid(&new_id));
+    }
+
+    #[test]
+    fn agyo_fork_missing_conversation_errors_readably() {
+        let temp = TempDir::new().unwrap();
+        let error = build_launcher(
+            LauncherKind::Antigravity,
+            &strings(&["--fork", "00000000-0000-4000-8000-000000000099"]),
+            temp.path(),
+            temp.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, LauncherError::NoSession { .. }));
+    }
+
+    #[test]
+    fn agyo_fork_rejects_non_uuid_selector_and_hostile_cache() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let cwd = home.join("project");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let error = build_launcher(
+            LauncherKind::Antigravity,
+            &strings(&["--fork", "../../escape"]),
+            home,
+            &cwd,
+        )
+        .unwrap_err();
+        assert!(matches!(error, LauncherError::OptionValue { .. }));
+
+        let cache = home.join(".gemini/antigravity-cli/cache");
+        fs::create_dir_all(&cache).unwrap();
+        let key = fs::canonicalize(&cwd).unwrap().to_string_lossy().into_owned();
+        fs::write(
+            cache.join("last_conversations.json"),
+            serde_json::json!({ key: "../../outside" }).to_string(),
+        )
+        .unwrap();
+        let error = build_launcher(
+            LauncherKind::Antigravity,
+            &strings(&["--fork"]),
+            home,
+            &cwd,
+        )
+        .unwrap_err();
+        assert!(matches!(error, LauncherError::Failed { .. }));
+
+        fs::write(cache.join("last_conversations.json"), b"not json").unwrap();
+        let error = build_launcher(
+            LauncherKind::Antigravity,
+            &strings(&["--fork"]),
+            home,
+            &cwd,
+        )
+        .unwrap_err();
+        assert!(matches!(error, LauncherError::Failed { .. }));
+    }
+
+    #[test]
+    fn rpilo_bare_fork_searches_rpi_sessions_not_pi() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let rpi_dir = home.join(".rpi/sessions/proj");
+        let pi_dir = home.join(".pi/agent/sessions/proj");
+        fs::create_dir_all(&rpi_dir).unwrap();
+        fs::create_dir_all(&pi_dir).unwrap();
+        let rpi = rpi_dir.join("b.jsonl");
+        let pi = pi_dir.join("a.jsonl");
+        fs::write(&rpi, b"{}\n").unwrap();
+        fs::write(&pi, b"{}\n").unwrap();
+
+        let fork = build_pi_family(LauncherKind::Rpi, os("rpi"), &strings(&["--fork"]), home)
+            .unwrap();
+        assert_eq!(fork.args, vec![os("--fork"), rpi.into_os_string()]);
+
+        let fork = build_pi_family(LauncherKind::Pi, os("pi"), &strings(&["--fork"]), home)
+            .unwrap();
+        assert_eq!(fork.args, vec![os("--fork"), pi.into_os_string()]);
+    }
+
+    #[test]
+    fn agyo_protected_tail_forwards_controls_as_tool_args() {
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::Antigravity,
+                &strings(&["--session", "conv-2", "--", "--tmux", "--host", "x"]),
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            command.args,
+            strings(&["--conversation", "conv-2", "--tmux", "--host", "x"]),
+        );
+    }
+
+    #[test]
+    fn agyo_remote_argv_retains_agyo_subcommand() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join(".git")).unwrap();
+        let plan = build_launcher(
+            LauncherKind::Antigravity,
+            &strings(&[
+                "--host",
+                "host-a",
+                "--tmux",
+                "--wt",
+                "feat",
+                "--session",
+                "conv-7",
+                "prompt",
+            ]),
+            &test_home(),
+            temp.path(),
+        )
+        .unwrap();
+        let LaunchPlan::Remote {
+            host,
+            worktree,
+            argv,
+            ..
+        } = plan
+        else {
+            panic!("expected remote plan, got {plan:?}");
+        };
+        assert_eq!(host, "host-a");
+        assert_eq!(worktree, Some(os("feat")));
+        assert_eq!(
+            argv,
+            strings(&[
+                "al", "agyo", "--tmux", "--session", "conv-7", "prompt"
+            ]),
+        );
+    }
 
     #[test]
     fn dash_dash_stops_option_parsing_for_every_launcher() {
@@ -2162,6 +2667,7 @@ mod tests {
             LauncherKind::Codex,
             LauncherKind::Claude,
             LauncherKind::Agent,
+            LauncherKind::Antigravity,
         ] {
             let plan = build_launcher(
                 kind,
@@ -2201,6 +2707,7 @@ mod tests {
             LauncherKind::Codex,
             LauncherKind::Claude,
             LauncherKind::Agent,
+            LauncherKind::Antigravity,
         ] {
             let plan = build_launcher(
                 kind,
@@ -2240,6 +2747,7 @@ mod tests {
             LauncherKind::Codex,
             LauncherKind::Claude,
             LauncherKind::Agent,
+            LauncherKind::Antigravity,
         ] {
             let error = build_launcher(kind, &[os("--host=")], &test_home(), Path::new("/tmp"))
                 .unwrap_err();
@@ -2763,6 +3271,54 @@ mod tests {
     }
 
     #[test]
+    fn dolo_session_maps_to_resume_and_session_fork() {
+        let home = test_home();
+        let base = vec![
+            os("--settings"),
+            home.join(".factory").join("settings.json").into_os_string(),
+            os("--auto"),
+            os("high"),
+        ];
+
+        for args in [
+            strings(&["--session", "sid", "prompt"]),
+            strings(&["--session=sid", "prompt"]),
+        ] {
+            let command = assert_command(
+                build_launcher(LauncherKind::Droid, &args, &home, Path::new("/tmp"))
+                    .unwrap(),
+            );
+            let mut expected = base.clone();
+            expected.extend(strings(&["--resume", "sid", "prompt"]));
+            assert_eq!(command.program, "droid");
+            assert_eq!(command.args, expected, "{args:?}");
+        }
+
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::Droid,
+                &strings(&["--session", "sid", "--fork"]),
+                &home,
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        let mut expected = base.clone();
+        expected.extend(strings(&["--fork", "sid"]));
+        assert_eq!(command.args, expected);
+
+        for args in [
+            vec![os("--session")],
+            strings(&["--session="]),
+            strings(&["--session", "--model"]),
+        ] {
+            let error = build_launcher(LauncherKind::Droid, &args, &home, Path::new("/tmp"))
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 1, "{args:?} exits 1");
+        }
+    }
+
+    #[test]
     fn colo_session_fork_forks_the_session() {
         let command = assert_command(
             build_launcher(
@@ -2982,6 +3538,7 @@ mod tests {
                     | TargetTool::Claude
                     | TargetTool::Grok
                     | TargetTool::Agent => home.join("bin").join(target.as_str()).into_os_string(),
+                    TargetTool::Antigravity => home.join("bin").join("agy").into_os_string(),
                     TargetTool::Rpi => home.join(".rpi/bin/rpi").into_os_string(),
                 };
                 assert_eq!(
@@ -2999,7 +3556,7 @@ mod tests {
         let home = temp.path();
         let bin = home.join("bin");
         fs::create_dir(&bin).unwrap();
-        for program in ["pi", "omp", "droid", "codex", "claude", "grok", "agent"] {
+        for program in ["pi", "omp", "droid", "codex", "claude", "grok", "agent", "agy"] {
             let executable = bin.join(program);
             fs::write(&executable, b"#!/bin/sh\n").unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();

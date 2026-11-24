@@ -16,6 +16,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::Value;
+#[cfg(unix)]
+use agent_loader::domain::{Message, Role, Session, SessionHints, SourceTool, TargetTool};
+#[cfg(unix)]
+use agent_loader::emit::{EmitContext, emit};
+#[cfg(unix)]
+use agent_loader::sessions::Catalog;
 use tempfile::TempDir;
 
 /// Path to the compiled `al` binary, resolved at compile time by cargo.
@@ -1320,6 +1326,327 @@ fn agentlo_protected_tail_survives_without_shell_reparsing() {
         recorded,
         format!("<--force>\n<--trust>\n<--approve-mcps>\n<--resume>\n<{payload}>\n")
     );
+}
+/// Record every argument of one fake tool. `INVOKED` marks the process
+/// start so an empty argv is still observable. The script never claims the
+/// real tool loaded a session; it only preserves the argv contract.
+#[cfg(unix)]
+fn recording_tool_script() -> &'static str {
+    "#!/bin/sh\nprintf 'INVOKED\\n' >> \"$AL_TOOL_LOG\"\nfor a in \"$@\"; do printf '<%s>\\n' \"$a\" >> \"$AL_TOOL_LOG\"; done\nexit \"${AL_TOOL_EXIT:-0}\"\n"
+}
+
+#[cfg(unix)]
+fn bracketed(args: &[String]) -> String {
+    let mut recorded = String::from("INVOKED\n");
+    for arg in args {
+        recorded.push('<');
+        recorded.push_str(arg);
+        recorded.push_str(">\n");
+    }
+    recorded
+}
+
+#[cfg(unix)]
+fn run_recorded_launcher(
+    alias: &str,
+    binary: &str,
+    args: &[&str],
+    exit_code: i32,
+) -> (Output, String, PathBuf) {
+    let home = TempDir::new().unwrap();
+    let bin = home.path().join("bin");
+    let log = home.path().join("tool-log");
+    write_fake_tool(&bin, binary, recording_tool_script());
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let mut command = vec![alias];
+    command.extend_from_slice(args);
+    let output = run_with_env(
+        home.path(),
+        &command,
+        &[
+            ("PATH", path.as_os_str()),
+            ("AL_TOOL_LOG", log.as_os_str()),
+            (
+                "AL_TOOL_EXIT",
+                OsStr::new(if exit_code == 0 { "0" } else { "17" }),
+            ),
+        ],
+    );
+    let recorded = fs::read_to_string(&log).unwrap_or_default();
+    (output, recorded, home.path().to_path_buf())
+}
+
+#[cfg(unix)]
+fn droid_prefix(home: &Path) -> Vec<String> {
+    vec![
+        "--settings".to_owned(),
+        home.join(".factory/settings.json").display().to_string(),
+        "--auto".to_owned(),
+        "high".to_owned(),
+    ]
+}
+
+#[cfg(unix)]
+fn codex_prefix() -> Vec<String> {
+    [
+        "-c",
+        "check_for_update_on_startup=false",
+        "--ask-for-approval",
+        "never",
+        "--sandbox",
+        "danger-full-access",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+#[cfg(unix)]
+fn claude_prefix() -> Vec<String> {
+    vec!["--dangerously-skip-permissions".to_owned()]
+}
+
+#[cfg(unix)]
+fn agent_prefix() -> Vec<String> {
+    ["--force", "--trust", "--approve-mcps"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Expected tool argv for one launcher alias. `mode` is `empty`, `session`,
+/// or `tail`. Claude's bare and protected-tail forms stay on the continue
+/// primary when that primary exits 0, so the tail is intentionally absent.
+#[cfg(unix)]
+fn expected_launcher_args(alias: &str, mode: &str, home: &Path, token: &str) -> Vec<String> {
+    let mut droid = droid_prefix(home);
+    let mut codex = codex_prefix();
+    let mut claude = claude_prefix();
+    let mut agent = agent_prefix();
+    match (alias, mode) {
+        ("omlo", "empty") => vec!["--continue".to_owned()],
+        ("pilo" | "rpilo" | "agyo", "empty") => vec!["--continue".to_owned()],
+        ("grolo", "empty") => Vec::new(),
+        ("dolo", "empty") => {
+            droid.push("--resume".to_owned());
+            droid
+        }
+        ("colo", "empty") => {
+            codex.extend(["resume".to_owned(), "--last".to_owned()]);
+            codex
+        }
+        ("cclo", "empty" | "tail") => {
+            claude.push("-c".to_owned());
+            claude
+        }
+        ("agentlo", "empty") => {
+            agent.push("--continue".to_owned());
+            agent
+        }
+        ("omlo", "session" | "tail") => vec!["--resume".to_owned(), token.to_owned()],
+        ("pilo" | "rpilo", "session" | "tail") => {
+            vec!["--session".to_owned(), token.to_owned()]
+        }
+        ("grolo", "session") => vec!["--resume".to_owned(), token.to_owned()],
+        ("grolo", "tail") => vec![token.to_owned()],
+        ("dolo", "session" | "tail") => {
+            droid.extend(["--resume".to_owned(), token.to_owned()]);
+            droid
+        }
+        ("colo", "session" | "tail") => {
+            codex.extend(["resume".to_owned(), token.to_owned()]);
+            codex
+        }
+        ("cclo", "session") => {
+            claude.extend(["--resume".to_owned(), token.to_owned()]);
+            claude
+        }
+        ("agentlo", "session" | "tail") => {
+            agent.extend(["--resume".to_owned(), token.to_owned()]);
+            agent
+        }
+        ("agyo", "session") => vec!["--conversation".to_owned(), token.to_owned()],
+        ("agyo", "tail") => vec![token.to_owned()],
+        _ => panic!("unexpected launcher case {alias} {mode}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn every_launcher_alias_keeps_its_exact_argv() {
+    let aliases = [
+        ("omlo", "omp"),
+        ("pilo", "pi"),
+        ("rpilo", "rpi"),
+        ("grolo", "grok"),
+        ("dolo", "droid"),
+        ("colo", "codex"),
+        ("cclo", "claude"),
+        ("agentlo", "agent"),
+        ("agyo", "agy"),
+    ];
+    assert_eq!(aliases.len(), 9, "launcher argv matrix must cover every alias");
+    let session = "11111111-1111-4111-8111-111111111111";
+    let payload = "arg with $HOME; echo pwned --continue";
+    for (alias, binary) in aliases {
+        for (mode, args) in [
+            ("empty", Vec::new()),
+            ("session", vec!["--session", session]),
+            ("tail", vec!["--", payload]),
+        ] {
+            let (output, recorded, home) = run_recorded_launcher(alias, binary, &args, 0);
+            assert!(
+                output.status.success(),
+                "{alias} {mode} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let token = if mode == "session" { session } else { payload };
+            let expected = bracketed(&expected_launcher_args(alias, mode, &home, token));
+            assert_eq!(recorded, expected, "{alias} {mode} argv drifted");
+            if alias == "cclo" && mode == "tail" {
+                assert!(
+                    !recorded.contains(payload),
+                    "claude continue success must not receive the protected tail"
+                );
+            }
+            if alias == "grolo" && mode == "empty" {
+                assert!(
+                    !recorded.contains("--continue"),
+                    "grok with no cached session must start a new chat"
+                );
+            }
+        }
+    }
+}
+
+/// Emit a real Antigravity conversation `.db` through the production emitter
+/// so list/search/open/fork exercise the native store, not a hand-built file.
+#[cfg(unix)]
+fn write_antigravity_conversation(home: &Path, needle: &str) -> (PathBuf, String, Vec<u8>) {
+    let session = Session {
+        tool: SourceTool::Claude,
+        session_id: "ag-native-src".to_owned(),
+        cwd: home.to_path_buf(),
+        start_timestamp: Some("2026-09-04T10:00:00.000Z".to_owned()),
+        summary: "antigravity source".to_owned(),
+        messages: vec![
+            Message::plain(
+                Role::User,
+                needle,
+                Some("2026-09-04T10:00:01.000Z".to_owned()),
+            ),
+            Message::plain(
+                Role::Assistant,
+                "antigravity answer",
+                Some("2026-09-04T10:00:02.000Z".to_owned()),
+            ),
+        ],
+        path: home.join("ag-source.jsonl"),
+        modified_epoch: None,
+        hints: SessionHints::default(),
+    };
+    let context = EmitContext::new(home).with_session_id(
+        "eeeeeeee-0000-4000-8000-0000000000a9".to_owned(),
+    );
+    let emitted = emit(&session, TargetTool::Antigravity, &context)
+        .expect("production Antigravity emitter");
+    let bytes = fs::read(&emitted.path).expect("read emitted conversation");
+    (emitted.path, emitted.session_id, bytes)
+}
+
+/// A native Antigravity conversation is listed and searched only under
+/// `--temporary` (its fixture cwd is the generated temp home), reopens as
+/// `agy --conversation <id>`, and forks by emitting a fresh carrier while the
+/// source database stays byte-identical.
+#[cfg(unix)]
+#[test]
+fn antigravity_sessions_list_search_open_and_fork_use_native_conversations() {
+    let home = TempDir::new().unwrap();
+    let needle = "antigravity unique needle";
+    let (source, session_id, before) =
+        write_antigravity_conversation(home.path(), needle);
+
+    for args in [
+        vec!["sessions", "--all", "--temporary", "--paths"],
+        vec!["sessions", "search", "--temporary", needle],
+    ] {
+        let output = run(home.path(), &args);
+        assert!(
+            output.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains(&session_id),
+            "{args:?} did not surface the Antigravity conversation: {stdout}"
+        );
+    }
+
+    let output = run(
+        home.path(),
+        &[
+            "sessions",
+            "open",
+            source.to_str().unwrap(),
+            "antigravity",
+            "--print-command",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "open --print-command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        format!("'agy' '--conversation' '{session_id}'")
+    );
+    assert_eq!(fs::read(&source).unwrap(), before, "open mutated source db");
+
+    let output = run(
+        home.path(),
+        &[
+            "sessions",
+            "fork",
+            source.to_str().unwrap(),
+            "antigravity",
+            "--print-command",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "fork --print-command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let carrier = PathBuf::from(lines.next().expect("fork prints the new carrier path"));
+    assert_ne!(carrier, source, "fork reused the source db path");
+    assert!(carrier.is_file(), "fork carrier was not emitted: {}", carrier.display());
+    assert_eq!(
+        carrier.extension().and_then(|ext| ext.to_str()),
+        Some("db"),
+        "fork carrier is not a native conversation db"
+    );
+    let new_id = carrier
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("conversation db stem");
+    assert_eq!(
+        lines.next().map(str::trim_end),
+        Some(format!("'agy' '--conversation' '{new_id}'").as_str()),
+        "fork did not resume the fresh conversation id"
+    );
+    let parsed = Catalog::new(home.path())
+        .parse(SourceTool::Antigravity, &carrier)
+        .expect("parse forked carrier");
+    assert!(
+        parsed.messages.iter().any(|message| message.text.contains(needle)),
+        "fork carrier lost conversation content"
+    );
+    assert_eq!(fs::read(&source).unwrap(), before, "fork mutated source db");
 }
 
 #[cfg(unix)]

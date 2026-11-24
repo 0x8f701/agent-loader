@@ -19,6 +19,31 @@ pub mod agent {
         anyhow::bail!("Agent session parsing requires the `catalog` feature")
     }
 }
+#[cfg(feature = "catalog")]
+pub mod antigravity;
+#[cfg(feature = "catalog")]
+mod antigravity_wire;
+#[cfg(not(feature = "catalog"))]
+pub mod antigravity {
+    use std::path::Path;
+
+    use anyhow::Result;
+
+    use crate::domain::Session;
+
+    pub fn parse(_path: &Path) -> Result<Session> {
+        anyhow::bail!("Antigravity session parsing requires the `catalog` feature")
+    }
+
+    pub fn write(_session: &Session, _path: &Path, _id: &str) -> Result<()> {
+        anyhow::bail!("Antigravity session writing requires the `catalog` feature")
+    }
+
+    pub(crate) fn rewrite_workspace(_path: &Path, _cwd: &Path) -> Result<()> {
+        anyhow::bail!("Antigravity workspace rewrite requires the `catalog` feature")
+    }
+}
+pub(crate) mod antigravity_transfer;
 pub mod claude;
 pub mod codex;
 pub mod droid;

@@ -58,8 +58,9 @@ pub fn parse_launcher_tool(value: &str) -> Result<LauncherKind, String> {
         "colo" | "codex" => Ok(LauncherKind::Codex),
         "cclo" | "claude" => Ok(LauncherKind::Claude),
         "agentlo" | "agent" => Ok(LauncherKind::Agent),
+        "agyo" | "agy" | "antigravity" => Ok(LauncherKind::Antigravity),
         _ => Err(format!(
-            "unsupported tool {value:?}; expected omlo, pilo, rpilo, grolo, dolo, colo, cclo, or agentlo"
+            "unsupported tool {value:?}; expected omlo, pilo, rpilo, grolo, dolo, colo, cclo, agentlo, or agyo"
         )),
     }
 }
@@ -727,6 +728,10 @@ fn launch_argv(tool: Option<LauncherKind>) -> Vec<OsString> {
             OsString::from("--trust"),
             OsString::from("--approve-mcps"),
         ],
+        Some(LauncherKind::Antigravity) => vec![
+            OsString::from("agy"),
+            OsString::from("--dangerously-skip-permissions"),
+        ],
     }
 }
 
@@ -793,7 +798,7 @@ fn write_role_files(spec: &NewProject, destination: &Path) -> Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GoalRecipe {
-    /// `/goal <objective>` then submit (grok, claude).
+    /// `/goal <objective>` then submit (grok, claude, agy).
     Inline,
     /// `/goal` submit, then type the objective and submit (pi, omp).
     PromptThen,
@@ -801,7 +806,9 @@ enum GoalRecipe {
 
 fn goal_recipe(tool: LauncherKind) -> Option<GoalRecipe> {
     match tool {
-        LauncherKind::Grok | LauncherKind::Claude => Some(GoalRecipe::Inline),
+        LauncherKind::Grok | LauncherKind::Claude | LauncherKind::Antigravity => {
+            Some(GoalRecipe::Inline)
+        }
         LauncherKind::Pi | LauncherKind::Rpi | LauncherKind::Omp => Some(GoalRecipe::PromptThen),
         LauncherKind::Droid | LauncherKind::Codex | LauncherKind::Agent => None,
     }
@@ -1340,9 +1347,33 @@ mod tests {
         assert_eq!(parse_launcher_tool("pilo").unwrap(), LauncherKind::Pi);
         assert_eq!(parse_launcher_tool("pi").unwrap(), LauncherKind::Pi);
         assert_eq!(parse_launcher_tool("grolo").unwrap(), LauncherKind::Grok);
+        assert_eq!(
+            parse_launcher_tool("agyo").unwrap(),
+            LauncherKind::Antigravity
+        );
+        assert_eq!(parse_launcher_tool("agy").unwrap(), LauncherKind::Antigravity);
+        assert_eq!(
+            parse_launcher_tool("antigravity").unwrap(),
+            LauncherKind::Antigravity
+        );
         assert!(parse_launcher_tool("hyper").is_err());
         assert!(parse_launcher_tool("hyperlo").is_err());
         assert!(parse_launcher_tool("sks").is_err());
+    }
+
+    #[test]
+    fn agyo_fresh_argv_skips_continue_and_sends_inline_goal() {
+        assert_eq!(
+            launch_argv(Some(LauncherKind::Antigravity)),
+            vec![
+                OsString::from("agy"),
+                OsString::from("--dangerously-skip-permissions"),
+            ]
+        );
+        assert_eq!(
+            goal_recipe(LauncherKind::Antigravity),
+            Some(GoalRecipe::Inline)
+        );
     }
 
     #[test]
@@ -1671,6 +1702,10 @@ mod tests {
         );
         assert_eq!(goal_recipe(LauncherKind::Grok), Some(GoalRecipe::Inline));
         assert_eq!(goal_recipe(LauncherKind::Claude), Some(GoalRecipe::Inline));
+        assert_eq!(
+            goal_recipe(LauncherKind::Antigravity),
+            Some(GoalRecipe::Inline)
+        );
         assert_eq!(goal_recipe(LauncherKind::Omp), Some(GoalRecipe::PromptThen));
         assert_eq!(goal_recipe(LauncherKind::Pi), Some(GoalRecipe::PromptThen));
         assert_eq!(goal_recipe(LauncherKind::Rpi), Some(GoalRecipe::PromptThen));

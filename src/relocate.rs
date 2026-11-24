@@ -201,7 +201,7 @@ fn native_session_path(catalog: &Catalog, session: &Session, cwd: &Path) -> Resu
         SourceTool::Droid | SourceTool::Claude => root
             .join(crate::emit::encode_single_dash_cwd(cwd_text))
             .join(name),
-        SourceTool::Codex => session.path.clone(),
+        SourceTool::Codex | SourceTool::Antigravity => session.path.clone(),
         SourceTool::Grok => root
             .join(crate::emit::encode_grok_cwd(cwd_text))
             .join(grok_session_dir_name(session)?)
@@ -214,6 +214,26 @@ fn native_session_path(catalog: &Catalog, session: &Session, cwd: &Path) -> Resu
 fn validate_destinations(planned: &[PlannedMove]) -> Result<()> {
     let mut seen = HashSet::new();
     for plan in planned {
+        if plan.session.tool == SourceTool::Antigravity {
+            crate::formats::antigravity_transfer::check_path(&plan.session.path)?;
+            crate::formats::antigravity_transfer::check_path(&plan.destination)?;
+            for carrier in [&plan.session.path, &plan.destination] {
+                crate::formats::antigravity_transfer::check_path(&crate::formats::antigravity_transfer::brain_path(carrier)?)?;
+                if carrier == &plan.destination && !same_resolved(&plan.session.path, &plan.destination) {
+                    let brain = crate::formats::antigravity_transfer::brain_path(carrier)?;
+                    if brain.try_exists()? { bail!("destination brain directory already exists: {}", brain.display()); }
+                }
+                for suffix in ["-wal", "-shm"] {
+                    let mut sidecar = carrier.as_os_str().to_owned();
+                    sidecar.push(suffix);
+                    let sidecar = PathBuf::from(sidecar);
+                    crate::formats::antigravity_transfer::check_path(&sidecar)?;
+                    if sidecar.exists() {
+                        bail!("stop Antigravity and checkpoint its SQLite database before moving: {}", carrier.display());
+                    }
+                }
+            }
+        }
         let removal = source_removal_path(&plan.session);
         if destination_overlaps_source(&removal, &plan.destination)
             && !same_resolved(&plan.session.path, &plan.destination)
@@ -256,6 +276,9 @@ fn validate_destinations(planned: &[PlannedMove]) -> Result<()> {
 }
 
 fn execute_move(plan: &PlannedMove, from: &Path, to: &Path) -> Result<()> {
+    if plan.session.tool == SourceTool::Antigravity {
+        return move_antigravity(plan, from, to);
+    }
     let source = &plan.session.path;
     if plan.rewrite_cwd {
         write_rewritten(&plan.session, &plan.destination, from, to)?;
@@ -266,6 +289,62 @@ fn execute_move(plan: &PlannedMove, from: &Path, to: &Path) -> Result<()> {
         relocate_companions(&plan.session, &plan.destination)?;
         remove_source_session(&plan.session)?;
     }
+    Ok(())
+}
+
+fn move_antigravity(plan: &PlannedMove, from: &Path, to: &Path) -> Result<()> {
+    use crate::formats::antigravity_transfer::{brain_path, check_path, snapshot};
+    check_path(&plan.session.path)?;
+    check_path(&plan.destination)?;
+    let source_brain = brain_path(&plan.session.path)?;
+    let destination_brain = brain_path(&plan.destination)?;
+    check_path(&source_brain)?;
+    check_path(&destination_brain)?;
+    if !same_resolved(&plan.session.path, &plan.destination) && destination_brain.try_exists()? {
+        bail!("destination brain directory already exists: {}", destination_brain.display());
+    }
+    let in_place = same_resolved(&plan.session.path, &plan.destination);
+    if in_place {
+        if !destination_brain.exists() { fs::create_dir_all(&destination_brain)?; }
+        if plan.rewrite_cwd {
+            let cwd = if cwd_is_under(&plan.session.cwd, from) { rewrite_cwd_path(&plan.session.cwd, from, to)? } else { to.to_path_buf() };
+            crate::formats::antigravity::rewrite_workspace(&plan.session.path, &cwd)?;
+        }
+        return Ok(());
+    }
+    snapshot(&plan.session.path, &plan.destination)?;
+    let mut created_brain = false;
+    let copied = (|| -> Result<()> {
+        if plan.rewrite_cwd {
+            let cwd = if cwd_is_under(&plan.session.cwd, from) { rewrite_cwd_path(&plan.session.cwd, from, to)? } else { to.to_path_buf() };
+            crate::formats::antigravity::rewrite_workspace(&plan.destination, &cwd)?;
+        }
+        fs::create_dir_all(destination_brain.parent().context("missing brain parent")?)?;
+        fs::create_dir(&destination_brain)?;
+        created_brain = true;
+        if source_brain.exists() { copy_tree(&source_brain, &destination_brain)?; }
+        #[cfg(feature = "catalog")]
+        if plan.destination.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("conversations")) {
+            crate::formats::antigravity::register_native(&plan.destination)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = copied {
+        remove_path_nofollow(&plan.destination).context("cleaning failed Antigravity snapshot")?;
+        if created_brain { remove_path_nofollow(&destination_brain).context("cleaning failed brain transfer")?; }
+        return Err(error);
+    }
+    // A live native writer must be stopped before relocation: snapshotting is safe,
+    // but deleting an open SQLite carrier cannot migrate its future writes.
+    fs::remove_file(&plan.session.path)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = plan.session.path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        check_path(&sidecar)?;
+        if sidecar.exists() { fs::remove_file(sidecar)?; }
+    }
+    if source_brain.exists() { remove_path_nofollow(&source_brain)?; }
     Ok(())
 }
 
@@ -303,6 +382,14 @@ fn companion_pairs(session: &Session, destination: &Path) -> Vec<(PathBuf, PathB
                     let name = format!("{stem}{suffix}");
                     pairs.push((src_parent.join(&name), dst_parent.join(&name)));
                 }
+            }
+        }
+        SourceTool::Antigravity => {
+            if let (Ok(source), Ok(dest)) = (
+                crate::formats::antigravity_transfer::brain_path(&session.path),
+                crate::formats::antigravity_transfer::brain_path(destination),
+            ) {
+                pairs.push((source, dest));
             }
         }
         SourceTool::Grok | SourceTool::Codex | SourceTool::Claude | SourceTool::Agent => {}
@@ -467,7 +554,10 @@ fn copy_regular_file(source: &Path, destination: &Path) -> Result<()> {
     if destination.exists() {
         bail!("destination already exists: {}", destination.display());
     }
-    fs::copy(source, destination)
+    let mut input = fs::File::open(source).with_context(|| format!("reading {}", source.display()))?;
+    let mut output = fs::OpenOptions::new().write(true).create_new(true).open(destination)
+        .with_context(|| format!("creating exclusive destination {}", destination.display()))?;
+    std::io::copy(&mut input, &mut output)
         .with_context(|| format!("copying {} to {}", source.display(), destination.display()))?;
     Ok(())
 }

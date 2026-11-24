@@ -39,6 +39,8 @@ const KEEP_FOOTER_LINES: usize = 6;
 const AGENT_ALIASES: &[(&str, &str)] = &[
     ("agent", "agent"),
     ("agentlo", "agent"),
+    ("agy", "antigravity"),
+    ("agyo", "antigravity"),
     ("cclo", "claude"),
     ("claude", "claude"),
     ("claude-code", "claude"),
@@ -62,6 +64,7 @@ const AGENT_ALIASES: &[(&str, &str)] = &[
 
 const NAME_PREFIXES: &[(&str, &str)] = &[
     ("agentlo-", "agent"),
+    ("agyo-", "antigravity"),
     ("cclo-", "claude"),
     ("colo-", "codex"),
     ("dolo-", "droid"),
@@ -3074,6 +3077,34 @@ mod tests {
             Some("omp")
         );
         assert_eq!(
+            identify_agent(&[process(12, "agy", &["agy", "--continue"])], Some(12)).as_deref(),
+            Some("antigravity")
+        );
+        assert_eq!(
+            identify_agent(&[process(13, "agyo", &["agyo"])], Some(13)).as_deref(),
+            Some("antigravity")
+        );
+        assert_eq!(
+            identify_agent(
+                &[process(14, "bash", &["bash", "-c", "exec agy --continue"])],
+                Some(14)
+            )
+            .as_deref(),
+            Some("antigravity")
+        );
+        assert_eq!(
+            identify_agent(
+                &[process(15, "node", &["node", "/opt/bin/agy"])],
+                Some(15)
+            )
+            .as_deref(),
+            Some("antigravity")
+        );
+        assert_eq!(
+            identify_agent(&[process(16, "antigravity", &["antigravity"])], Some(16)),
+            None
+        );
+        assert_eq!(
             identify_agent(
                 &[process(
                     9,
@@ -3107,6 +3138,12 @@ mod tests {
         assert_eq!(agent_from_tmux_name("omlo-sample-app"), Some("omp"));
         assert_eq!(agent_from_tmux_name("pilo-sample-app"), Some("pi"));
         assert_eq!(agent_from_tmux_name("notes"), None);
+        assert_eq!(
+            agent_from_tmux_name("agyo-sample-app"),
+            Some("antigravity")
+        );
+        assert_eq!(agent_from_tmux_name("agy-sample-app"), None);
+        assert_eq!(agent_from_tmux_name("antigravity-sample-app"), None);
     }
 
     #[test]

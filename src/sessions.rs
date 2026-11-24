@@ -16,8 +16,8 @@ use anyhow::{Context, Result, bail};
 use chrono::{Local, TimeZone};
 use walkdir::WalkDir;
 
-use crate::domain::{Session, SessionRow, SourceTool};
-use crate::formats::{agent, claude, codex, droid, grok, omp, pi};
+use crate::domain::{Session, SessionRow, SourceTool, is_canonical_uuid};
+use crate::formats::{agent, antigravity, claude, codex, droid, grok, omp, pi};
 use crate::fs::{is_agent_store, is_grok_summary, is_tree_top_level_session, path_under_root};
 
 pub const DEFAULT_RECENT_COUNT: usize = 5;
@@ -182,6 +182,7 @@ impl Catalog {
             }
             SourceTool::Grok => is_grok_summary(path, &root),
             SourceTool::Agent => is_agent_store(path, &root),
+            SourceTool::Antigravity => is_antigravity_conversation(path, &root),
             SourceTool::Droid | SourceTool::Codex | SourceTool::Claude => true,
         }
     }
@@ -195,6 +196,7 @@ impl Catalog {
             SourceTool::Claude => claude::parse(path),
             SourceTool::Grok => grok::parse(path, &self.root_for_tool(SourceTool::Grok).path),
             SourceTool::Agent => agent::parse(path),
+            SourceTool::Antigravity => antigravity::parse(path),
         }
         .with_context(|| format!("parsing {tool} session {}", path.display()))?;
         session.tool = tool;
@@ -659,6 +661,7 @@ fn root_spec(tool: SourceTool) -> (&'static Path, &'static str) {
         SourceTool::Claude => (Path::new(".claude/projects"), "*.jsonl"),
         SourceTool::Grok => (Path::new(".grok/sessions"), "summary.json"),
         SourceTool::Agent => (Path::new(".cursor/chats"), "store.db"),
+        SourceTool::Antigravity => (Path::new(".gemini/antigravity-cli/conversations"), "*.db"),
     }
 }
 
@@ -701,7 +704,31 @@ fn matches_pattern(tool: SourceTool, path: &Path) -> bool {
         }
         SourceTool::Grok => file_name == OsStr::new("summary.json"),
         SourceTool::Agent => file_name == OsStr::new("store.db"),
+        SourceTool::Antigravity => path.extension() == Some(OsStr::new("db")),
     }
+}
+
+/// Validates an Antigravity conversation database at `root/<session-uuid>.db`.
+///
+/// Only a canonical-UUID `.db` directly inside the conversations root is a
+/// session file — the surrounding `antigravity-cli` directory also holds
+/// auth/settings state that must never be treated as a session. The final
+/// `path_under_root` check applies the shared symlink/path-escape rules.
+fn is_antigravity_conversation(path: &Path, root: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let (Some(Component::Normal(file_name)), None) = (components.next(), components.next()) else {
+        return false;
+    };
+    let name = Path::new(file_name);
+    let valid_name = name.extension() == Some(OsStr::new("db"))
+        && name
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .is_some_and(is_canonical_uuid);
+    valid_name && path_under_root(path, root)
 }
 
 fn contains_rsync_partial(path: &Path, root: &Path) -> bool {
@@ -752,16 +779,29 @@ fn missing_user_home_message() -> &'static str {
     }
 }
 
+/// Catalog row stats for a session file. The SQLite stores (Agent store.db,
+/// Antigravity <uuid>.db) also count their WAL/SHM siblings and Cursor's
+/// meta.json sidecar — an uncheckpointed write changes those without touching
+/// the main file, and they're physically part of the store's footprint.
 fn session_file_stats(tool: SourceTool, path: &Path, metadata: &Metadata) -> (f64, u64) {
-    if tool != SourceTool::Agent {
+    let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
         return (metadata_epoch(metadata), metadata.len());
-    }
+    };
+    let siblings: Vec<String> = match tool {
+        SourceTool::Agent => vec![
+            "store.db-wal".to_owned(),
+            "store.db-shm".to_owned(),
+            "meta.json".to_owned(),
+        ],
+        SourceTool::Antigravity => vec![format!("{file_name}-wal"), format!("{file_name}-shm")],
+        _ => return (metadata_epoch(metadata), metadata.len()),
+    };
     let mut modified = metadata_epoch(metadata);
     let mut size = metadata.len();
     let Some(directory) = path.parent() else {
         return (modified, size);
     };
-    for name in ["store.db-wal", "store.db-shm", "meta.json"] {
+    for name in siblings {
         if let Ok(metadata) = std::fs::symlink_metadata(directory.join(name)) {
             if metadata.is_file() && !metadata.file_type().is_symlink() {
                 modified = modified.max(metadata_epoch(&metadata));
@@ -1033,6 +1073,67 @@ mod tests {
                 .join("project/linked.jsonl");
             symlink(&external_path, &linked).expect("create symlink");
             assert!(!catalog.discover(SourceTool::Pi).contains(&linked));
+        }
+    }
+
+    #[test]
+    fn antigravity_discovery_accepts_only_depth_one_uuid_dbs() {
+        let (_home, catalog) = catalog();
+        let root = catalog.root_for_tool(SourceTool::Antigravity).path;
+        assert_eq!(
+            root.file_name().and_then(OsStr::to_str),
+            Some("conversations"),
+            "antigravity root should be the conversations directory"
+        );
+        let uuid = "6f9619ff-8b86-d011-b42d-00c04fc964ff";
+        let valid = root.join(format!("{uuid}.db"));
+        fs::create_dir_all(&root).expect("create conversations root");
+        fs::write(&valid, "").expect("write conversation db");
+        // Same-name shapes that must never be treated as sessions:
+        // non-UUID names, wrong extension, wrong depth.
+        let rejected = [
+            root.join("auth.db"),
+            root.join("settings.db"),
+            root.join(format!("{uuid}.jsonl")),
+            root.join(format!("{uuid}0.db")),
+            root.join("nested").join(format!("{uuid}.db")),
+        ];
+        fs::create_dir_all(root.join("nested")).expect("create nested dir");
+        for path in &rejected {
+            fs::write(path, "").expect("write rejected file");
+        }
+        // Auth/settings siblings live next to conversations, not inside it.
+        let sibling = root
+            .parent()
+            .expect("parent")
+            .join("auth")
+            .join(format!("{uuid}.db"));
+        fs::create_dir_all(sibling.parent().expect("parent")).expect("create auth dir");
+        fs::write(&sibling, "").expect("write auth sibling");
+
+        assert_eq!(
+            catalog.discover(SourceTool::Antigravity),
+            vec![valid.clone()]
+        );
+        assert!(catalog.is_session_path(SourceTool::Antigravity, &valid));
+        for path in rejected.iter().chain(std::iter::once(&sibling)) {
+            assert!(
+                !catalog.is_session_path(SourceTool::Antigravity, path),
+                "{} should not be a session path",
+                path.display()
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let external = TempDir::new().expect("external directory");
+            let external_path = external.path().join("outside.db");
+            fs::write(&external_path, "").expect("write external");
+            let linked = root.join("6f9619ff-8b86-d011-b42d-00c04fc964aa.db");
+            symlink(&external_path, &linked).expect("create symlink");
+            assert!(!catalog.discover(SourceTool::Antigravity).contains(&linked));
+            assert!(!catalog.is_session_path(SourceTool::Antigravity, &linked));
         }
     }
 

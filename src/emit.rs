@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -116,6 +117,7 @@ pub struct TargetRoots {
     pub codex: PathBuf,
     pub claude: PathBuf,
     pub grok: PathBuf,
+    pub antigravity: PathBuf,
 }
 
 impl TargetRoots {
@@ -128,6 +130,7 @@ impl TargetRoots {
             codex: home.join(".codex/sessions"),
             claude: home.join(".claude/projects"),
             grok: home.join(".grok/sessions"),
+            antigravity: home.join(".gemini/antigravity-cli/conversations"),
         }
     }
 }
@@ -402,7 +405,7 @@ pub fn emit_with_defaults<D: EmitDefaults>(
             session.path.display()
         );
     }
-    let session_id = context
+    let mut session_id = context
         .session_id
         .clone()
         .unwrap_or_else(|| defaults.next_uuid().to_string());
@@ -414,7 +417,7 @@ pub fn emit_with_defaults<D: EmitDefaults>(
         .ok_or_else(|| anyhow!("session cwd is not valid UTF-8: {}", session.cwd.display()))?;
     let grok_cwd = target.uses_grok_storage().then(|| encode_grok_cwd(cwd));
     let output = match &context.output {
-        Some(output) => normalize_output_path(target, output),
+        Some(output) => normalize_output_path(target, output, &session_id),
         None => target_path(
             target,
             cwd,
@@ -424,6 +427,23 @@ pub fn emit_with_defaults<D: EmitDefaults>(
             context,
         )?,
     };
+    if target == TargetTool::Antigravity {
+        // The native carrier name is the conversation identity: an explicit
+        // filename derives the id, and an explicit id must match the filename.
+        let stem = output
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(session_id.as_str());
+        if stem != session_id && context.session_id.is_some() {
+            bail!(
+                "Antigravity conversation id {session_id:?} does not match output filename {stem:?}"
+            );
+        }
+        if !crate::domain::is_canonical_uuid(stem) {
+            bail!("Antigravity conversation id must be a canonical UUID: {stem:?}");
+        }
+        session_id = stem.to_owned();
+    }
 
     match target {
         TargetTool::Pi | TargetTool::Rpi => {
@@ -468,6 +488,9 @@ pub fn emit_with_defaults<D: EmitDefaults>(
                 .unwrap_or_else(|| defaults.grok_model());
             let bundle = emit_grok(session, cwd, &session_id, start, &model);
             write_grok_bundle(&output, cwd, &bundle, defaults)?;
+        }
+        TargetTool::Antigravity => {
+            crate::formats::antigravity::write(session, &output, &session_id)?;
         }
         TargetTool::Agent => unreachable!("Agent emission rejected before materialization"),
     }
@@ -1144,9 +1167,11 @@ fn emit_grok(
     }
 }
 
-fn normalize_output_path(target: TargetTool, output: &Path) -> PathBuf {
+fn normalize_output_path(target: TargetTool, output: &Path, session_id: &str) -> PathBuf {
     if target.uses_grok_storage() && output.file_name().is_none_or(|name| name != "summary.json") {
         output.join("summary.json")
+    } else if target == TargetTool::Antigravity && output.extension() != Some(OsStr::new("db")) {
+        output.join(format!("{session_id}.db"))
     } else {
         output.to_path_buf()
     }
@@ -1221,6 +1246,10 @@ fn target_path(
             .join(grok_cwd.expect("Grok cwd computed before target path"))
             .join(session_id)
             .join("summary.json"),
+        TargetTool::Antigravity => context
+            .roots
+            .antigravity
+            .join(format!("{session_id}.db")),
         TargetTool::Agent => unreachable!("Agent emission rejected before path selection"),
     };
     Ok(path)
@@ -2509,7 +2538,7 @@ mod tests {
             .filter(|target| *target != TargetTool::Agent)
         {
             let context = EmitContext::new(home).with_session_id(format!(
-                "00000000-0000-4000-8000-0000000000{}",
+                "00000000-0000-4000-8000-{:012x}",
                 target as u8
             ));
             let emitted =
@@ -2523,6 +2552,8 @@ mod tests {
             let name = emitted.path.file_name().unwrap().to_str().unwrap();
             if target.uses_grok_storage() {
                 assert_eq!(name, "summary.json");
+            } else if target == TargetTool::Antigravity {
+                assert_eq!(name, format!("{}.db", emitted.session_id));
             } else if matches!(target, TargetTool::Droid | TargetTool::Claude) {
                 assert_eq!(name, format!("{}.jsonl", emitted.session_id));
             } else if target.uses_pi_storage() || matches!(target, TargetTool::Omp) {
@@ -2547,6 +2578,104 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("cannot be emitted"));
         assert!(!temporary.path().join(".cursor").exists());
+    }
+
+    #[test]
+    fn antigravity_defaults_into_native_conversations_db() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let emitted = emit_with_defaults(
+            &fixture(home),
+            TargetTool::Antigravity,
+            &EmitContext::new(home),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            emitted.path,
+            home.join(".gemini/antigravity-cli/conversations")
+                .join(format!("{}.db", emitted.session_id))
+        );
+        assert!(emitted.path.is_file());
+        assert!(crate::domain::is_canonical_uuid(&emitted.session_id));
+    }
+
+    #[test]
+    fn antigravity_explicit_directory_appends_session_db() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let output_dir = home.join("chosen-dir");
+        let context = EmitContext::new(home)
+            .with_output(&output_dir)
+            .with_session_id("00000000-0000-4000-8000-000000000001");
+        let emitted = emit_with_defaults(
+            &fixture(home),
+            TargetTool::Antigravity,
+            &context,
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            emitted.path,
+            output_dir.join("00000000-0000-4000-8000-000000000001.db")
+        );
+        assert!(emitted.path.is_file());
+    }
+
+    #[test]
+    fn antigravity_explicit_db_filename_derives_session_id() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let output = home.join("11111111-2222-4333-8444-555555555555.db");
+        let context = EmitContext::new(home).with_output(&output);
+        let emitted = emit_with_defaults(
+            &fixture(home),
+            TargetTool::Antigravity,
+            &context,
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        assert_eq!(emitted.session_id, "11111111-2222-4333-8444-555555555555");
+        assert_eq!(emitted.path, output);
+        assert!(emitted.path.is_file());
+    }
+
+    #[test]
+    fn antigravity_rejects_identity_mismatch_and_non_uuid_names() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+
+        let mismatched = EmitContext::new(home)
+            .with_output(home.join("11111111-2222-4333-8444-555555555555.db"))
+            .with_session_id("00000000-0000-4000-8000-000000000001");
+        let error = emit_with_defaults(
+            &fixture(home),
+            TargetTool::Antigravity,
+            &mismatched,
+            &mut FixedDefaults::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match output filename"));
+
+        let non_uuid = EmitContext::new(home).with_output(home.join("notes.db"));
+        let error = emit_with_defaults(
+            &fixture(home),
+            TargetTool::Antigravity,
+            &non_uuid,
+            &mut FixedDefaults::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("canonical UUID"));
+
+        let bad_id = EmitContext::new(home).with_session_id("not-a-uuid");
+        let error = emit_with_defaults(
+            &fixture(home),
+            TargetTool::Antigravity,
+            &bad_id,
+            &mut FixedDefaults::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("canonical UUID"));
     }
 
     #[cfg(unix)]

@@ -56,6 +56,7 @@ pub fn tool_color(tool: SourceTool) -> &'static str {
         SourceTool::Claude => "\x1b[93m",
         SourceTool::Grok => "\x1b[95m",
         SourceTool::Agent => "\x1b[97m",
+        SourceTool::Antigravity => "\x1b[36m",
     }
 }
 
@@ -245,7 +246,8 @@ pub fn format_picker_line(row: &SessionRow, use_color: bool) -> Option<Vec<u8>> 
 
 /// Build the ordered list of compatible targets for a source. Agent stores are
 /// undocumented and can only reopen natively, so Agent is the sole target for
-/// Agent sessions and is not offered for other sources.
+/// Agent sessions and is not offered for other sources. Every other source,
+/// Antigravity included, can convert to all non-Agent targets.
 pub fn target_tools_for_source(source: SourceTool) -> Vec<TargetTool> {
     let mut tools = match source {
         SourceTool::Grok => vec![TargetTool::Grok],
@@ -262,6 +264,7 @@ pub fn target_tools_for_source(source: SourceTool) -> Vec<TargetTool> {
         TargetTool::Grok,
         TargetTool::Pi,
         TargetTool::Droid,
+        TargetTool::Antigravity,
     ] {
         if !tools.contains(&candidate) {
             tools.push(candidate);
@@ -280,6 +283,7 @@ const fn source_to_target(source: SourceTool) -> TargetTool {
         SourceTool::Claude => TargetTool::Claude,
         SourceTool::Grok => TargetTool::Grok,
         SourceTool::Agent => TargetTool::Agent,
+        SourceTool::Antigravity => TargetTool::Antigravity,
     }
 }
 
@@ -791,6 +795,8 @@ mod tests {
         assert_eq!(tool_color(SourceTool::Codex), "\x1b[92m");
         assert_eq!(tool_color(SourceTool::Claude), "\x1b[93m");
         assert_eq!(tool_color(SourceTool::Grok), "\x1b[95m");
+        assert_eq!(tool_color(SourceTool::Agent), "\x1b[97m");
+        assert_eq!(tool_color(SourceTool::Antigravity), "\x1b[36m");
     }
 
     // -- sanitize_tsv_field --
@@ -1085,7 +1091,7 @@ mod tests {
     fn target_tools_grok_prefers_native_first() {
         let tools = target_tools_for_source(SourceTool::Grok);
         assert_eq!(tools[0], TargetTool::Grok);
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
     }
 
     #[test]
@@ -1093,7 +1099,7 @@ mod tests {
         let tools = target_tools_for_source(SourceTool::Pi);
         assert_eq!(tools[0], TargetTool::Rpi);
         assert_eq!(tools[1], TargetTool::Pi);
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
     }
 
     #[test]
@@ -1161,8 +1167,28 @@ mod tests {
                 TargetTool::Grok,
                 TargetTool::Pi,
                 TargetTool::Droid,
+                TargetTool::Antigravity,
             ]
         );
+    }
+
+    #[test]
+    fn target_tools_antigravity_ordering() {
+        let tools = target_tools_for_source(SourceTool::Antigravity);
+        assert_eq!(
+            tools,
+            vec![
+                TargetTool::Antigravity,
+                TargetTool::Rpi,
+                TargetTool::Omp,
+                TargetTool::Codex,
+                TargetTool::Claude,
+                TargetTool::Grok,
+                TargetTool::Pi,
+                TargetTool::Droid,
+            ]
+        );
+        assert!(!tools.contains(&TargetTool::Agent));
     }
 
     #[test]
@@ -1178,6 +1204,7 @@ mod tests {
                 TargetTool::Claude,
                 TargetTool::Pi,
                 TargetTool::Droid,
+                TargetTool::Antigravity,
             ]
         );
     }
@@ -1189,7 +1216,7 @@ mod tests {
             .filter(|source| *source != SourceTool::Agent)
         {
             let tools = target_tools_for_source(source);
-            assert_eq!(tools.len(), 7, "wrong count for {source:?}");
+            assert_eq!(tools.len(), 8, "wrong count for {source:?}");
             let set: HashSet<TargetTool> = tools.iter().copied().collect();
             assert!(set.contains(&TargetTool::Pi));
             assert!(set.contains(&TargetTool::Rpi));
@@ -1198,6 +1225,7 @@ mod tests {
             assert!(set.contains(&TargetTool::Codex));
             assert!(set.contains(&TargetTool::Claude));
             assert!(set.contains(&TargetTool::Grok));
+            assert!(set.contains(&TargetTool::Antigravity));
             assert!(!set.contains(&TargetTool::Agent));
         }
     }

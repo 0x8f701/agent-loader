@@ -18,10 +18,11 @@ pub enum SourceTool {
     Claude,
     Grok,
     Agent,
+    Antigravity,
 }
 
 impl SourceTool {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Pi,
         Self::Rpi,
         Self::Omp,
@@ -30,6 +31,7 @@ impl SourceTool {
         Self::Claude,
         Self::Grok,
         Self::Agent,
+        Self::Antigravity,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -42,6 +44,7 @@ impl SourceTool {
             Self::Claude => "claude",
             Self::Grok => "grok",
             Self::Agent => "agent",
+            Self::Antigravity => "antigravity",
         }
     }
 
@@ -70,6 +73,7 @@ impl FromStr for SourceTool {
             "claude" => Ok(Self::Claude),
             "grok" => Ok(Self::Grok),
             "agent" => Ok(Self::Agent),
+            "antigravity" | "agy" => Ok(Self::Antigravity),
             _ => Err(ToolParseError(value.to_owned())),
         }
     }
@@ -86,10 +90,11 @@ pub enum TargetTool {
     Grok,
     Rpi,
     Agent,
+    Antigravity,
 }
 
 impl TargetTool {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Pi,
         Self::Omp,
         Self::Droid,
@@ -98,6 +103,7 @@ impl TargetTool {
         Self::Grok,
         Self::Rpi,
         Self::Agent,
+        Self::Antigravity,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -110,6 +116,7 @@ impl TargetTool {
             Self::Grok => "grok",
             Self::Rpi => "rpi",
             Self::Agent => "agent",
+            Self::Antigravity => "antigravity",
         }
     }
 
@@ -123,6 +130,7 @@ impl TargetTool {
             Self::Grok => Some(SourceTool::Grok),
             Self::Agent => Some(SourceTool::Agent),
             Self::Rpi => Some(SourceTool::Rpi),
+            Self::Antigravity => Some(SourceTool::Antigravity),
         }
     }
 
@@ -154,6 +162,7 @@ impl FromStr for TargetTool {
             "grok" => Ok(Self::Grok),
             "rpi" => Ok(Self::Rpi),
             "agent" => Ok(Self::Agent),
+            "antigravity" | "agy" => Ok(Self::Antigravity),
             _ => Err(ToolParseError(value.to_owned())),
         }
     }
@@ -416,7 +425,7 @@ fn is_generated_temporary_name(name: &str) -> bool {
 /// hyphens. Hex case is insensitive, so upper and lower case both match. The
 /// canonical form is rendered into a stack buffer and compared without heap
 /// allocation.
-fn is_canonical_uuid(text: &str) -> bool {
+pub(crate) fn is_canonical_uuid(text: &str) -> bool {
     if text.len() != 36 {
         return false;
     }
@@ -521,6 +530,10 @@ mod tests {
             let parsed: SourceTool = tool.as_str().parse().expect("valid spelling");
             assert_eq!(parsed, tool);
         }
+        assert_eq!(
+            "agy".parse::<SourceTool>().expect("agy alias"),
+            SourceTool::Antigravity
+        );
         let error = "hyper".parse::<SourceTool>().expect_err("invalid tool");
         assert_eq!(error.to_string(), "unsupported tool: hyper");
     }
@@ -531,8 +544,32 @@ mod tests {
             let parsed: TargetTool = tool.as_str().parse().expect("valid spelling");
             assert_eq!(parsed, tool);
         }
+        assert_eq!(
+            "agy".parse::<TargetTool>().expect("agy alias"),
+            TargetTool::Antigravity
+        );
         let error = "hyper".parse::<TargetTool>().expect_err("invalid tool");
         assert_eq!(error.to_string(), "unsupported tool: hyper");
+    }
+
+    #[test]
+    fn tool_serde_uses_canonical_antigravity_spelling() {
+        assert_eq!(
+            serde_json::to_value(SourceTool::Antigravity).unwrap(),
+            json!("antigravity")
+        );
+        assert_eq!(
+            serde_json::to_value(TargetTool::Antigravity).unwrap(),
+            json!("antigravity")
+        );
+        assert_eq!(
+            serde_json::from_value::<SourceTool>(json!("antigravity")).unwrap(),
+            SourceTool::Antigravity
+        );
+        assert_eq!(
+            serde_json::from_value::<TargetTool>(json!("antigravity")).unwrap(),
+            TargetTool::Antigravity
+        );
     }
 
     #[test]
@@ -608,6 +645,10 @@ mod tests {
         assert_eq!(TargetTool::Claude.source(), Some(SourceTool::Claude));
         assert_eq!(TargetTool::Grok.source(), Some(SourceTool::Grok));
         assert_eq!(TargetTool::Agent.source(), Some(SourceTool::Agent));
+        assert_eq!(
+            TargetTool::Antigravity.source(),
+            Some(SourceTool::Antigravity)
+        );
         assert_eq!(TargetTool::Rpi.source(), Some(SourceTool::Rpi));
     }
 

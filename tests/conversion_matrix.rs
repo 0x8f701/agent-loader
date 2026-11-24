@@ -1,9 +1,11 @@
 //! Source × target conversion matrix.
 //!
-//! Every convertible source, including Agent, is emitted to every target except
-//! Agent. The portable conversation must keep user/assistant text, thinking,
-//! tool ids, tool arguments, and tool results that the target can represent.
-//! Fields a target cannot store are reported as representability losses.
+//! Every convertible source, including Agent and Antigravity, is emitted to
+//! every target except Agent. The portable conversation must keep user and
+//! assistant text, thinking, tool ids, tool arguments, and tool results that
+//! the target can represent. Fields a target cannot store are reported as
+//! representability losses. Antigravity rows go through the production
+//! SQLite/protobuf emitter and parser, not a hand-built database.
 use std::fs;
 use std::path::Path;
 
@@ -160,19 +162,33 @@ fn emit_context(home: &Path) -> EmitContext {
 }
 
 fn parse_emitted(catalog: &Catalog, target: TargetTool, path: &Path) -> Session {
-    let source = match target {
-        TargetTool::Pi => SourceTool::Pi,
-        TargetTool::Rpi => SourceTool::Rpi,
-        TargetTool::Omp => SourceTool::Omp,
-        TargetTool::Droid => SourceTool::Droid,
-        TargetTool::Codex => SourceTool::Codex,
-        TargetTool::Claude => SourceTool::Claude,
-        TargetTool::Grok => SourceTool::Grok,
-        TargetTool::Agent => panic!("agent is not a conversion target"),
-    };
+    let source = target
+        .source()
+        .unwrap_or_else(|| panic!("{target} is not a conversion target"));
+    assert_ne!(source, SourceTool::Agent, "agent is not a conversion target");
     catalog
         .parse(source, path)
         .unwrap_or_else(|error| panic!("reparse {target} at {}: {error}", path.display()))
+}
+
+/// Non-Agent targets. Adding a tool without updating this count fails the
+/// matrix instead of silently shrinking coverage.
+fn convertible_targets() -> Vec<TargetTool> {
+    let targets: Vec<TargetTool> = TargetTool::ALL
+        .into_iter()
+        .filter(|target| *target != TargetTool::Agent)
+        .collect();
+    assert_eq!(
+        targets.len(),
+        TargetTool::ALL.len() - 1,
+        "exactly one target (Agent) is excluded from conversion"
+    );
+    assert_eq!(targets.len(), 8, "expected 8 non-Agent conversion targets");
+    assert!(
+        targets.contains(&TargetTool::Antigravity),
+        "Antigravity must be a conversion target"
+    );
+    targets
 }
 
 #[test]
@@ -184,10 +200,9 @@ fn every_target_keeps_text_thinking_and_tools() {
     let source = rich_session(&cwd);
     let catalog = Catalog::new(home);
 
-    for target in TargetTool::ALL
-        .into_iter()
-        .filter(|target| *target != TargetTool::Agent)
-    {
+    let targets = convertible_targets();
+    assert_eq!(targets.len(), 8);
+    for target in targets {
         let context = emit_context(home).with_session_id(format!(
             "00000000-0000-4000-8000-0000000000{:02}",
             target as u8
@@ -225,21 +240,31 @@ fn every_target_keeps_text_thinking_and_tools() {
             "{target} dropped thinking: {:?}",
             parsed.messages
         );
-        assert!(
-            has_image(&parsed, "iVBORw0KGgo="),
-            "{target} dropped image: {:?}",
-            parsed.messages
-        );
+        if represents_user_image(target) {
+            assert!(
+                has_image(&parsed, "iVBORw0KGgo="),
+                "{target} dropped user image: {:?}",
+                parsed.messages
+            );
+        }
         assert!(
             has_note(&parsed, "prior context") || contains_text(&parsed, "prior context"),
             "{target} dropped compaction note: {:?}",
             parsed.messages
         );
-        assert_eq!(
-            parsed.hints.model.as_deref(),
-            Some("source-model"),
-            "{target} dropped model hint"
-        );
+        if represents_foreign_model(target) {
+            assert_eq!(
+                parsed.hints.model.as_deref(),
+                Some("source-model"),
+                "{target} dropped model hint"
+            );
+        } else if target == TargetTool::Antigravity {
+            assert!(
+                parsed.hints.model.is_none(),
+                "{target} invented a native model enum from {:?}",
+                parsed.hints.model
+            );
+        }
         if keeps_compaction_hint(target) {
             assert_eq!(
                 parsed.hints.compaction_summary.as_deref(),
@@ -247,11 +272,19 @@ fn every_target_keeps_text_thinking_and_tools() {
                 "{target} dropped compaction hint"
             );
         }
-        assert_eq!(
-            parsed.hints.thinking_level,
-            Some(ThinkingLevel::High),
-            "{target} dropped thinking level"
-        );
+        if target == TargetTool::Antigravity {
+            assert_eq!(
+                parsed.hints.thinking_level,
+                None,
+                "{target} invented a thinking level from a hint it cannot store"
+            );
+        } else {
+            assert_eq!(
+                parsed.hints.thinking_level,
+                Some(ThinkingLevel::High),
+                "{target} dropped thinking level"
+            );
+        }
     }
 }
 
@@ -268,7 +301,8 @@ fn convert_native(home: &Path, source: SourceTool, input: &Path, target: TargetT
         .parse(source, input)
         .unwrap_or_else(|error| panic!("parse {source}: {error}"));
     let context = emit_context(home).with_session_id(format!(
-        "{source}-{target}-00000000-0000-4000-8000-000000000099"
+        "00000000-0000-4000-8000-{:06x}{:06x}",
+        source as u32, target as u32
     ));
     let emitted = emit(&session, target, &context)
         .unwrap_or_else(|error| panic!("emit {source}->{target}: {error}"));
@@ -326,7 +360,7 @@ fn native_sources_convert_to_every_target() {
             r#"{"type":"user","uuid":"c0","parentUuid":"cb","timestamp":"2026-09-04T10:00:00.500Z","sessionId":"claude-src","cwd":"/workspace/project","isCompactSummary":true,"message":{"role":"user","content":"prior context"}}"#,
             r#"{"type":"user","uuid":"u1","parentUuid":"c0","timestamp":"2026-09-04T10:00:01.000Z","sessionId":"claude-src","cwd":"/workspace/project","message":{"role":"user","content":[{"type":"text","text":"list the file"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}}"#,
             r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-09-04T10:00:02.000Z","sessionId":"claude-src","cwd":"/workspace/project","effort":"high","message":{"role":"assistant","model":"source-model","content":[{"type":"thinking","thinking":"I should read it","signature":""},{"type":"text","text":"reading now"},{"type":"tool_use","id":"call-1","name":"Read","input":{"path":"src/lib.rs"}}]}}"#,
-            r#"{"type":"user","uuid":"t1","parentUuid":"a1","timestamp":"2026-09-04T10:00:03.000Z","sessionId":"claude-src","cwd":"/workspace/project","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":[{"type":"text","text":"fn main() {}"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"toolImgData"}}],"is_error":false}]}}"#,
+            r#"{"type":"user","uuid":"t1","parentUuid":"a1","timestamp":"2026-09-04T10:00:03.000Z","sessionId":"claude-src","cwd":"/workspace/project","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":[{"type":"text","text":"fn main() {}"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"dG9vbEltZ0RhdGE="}}],"is_error":false}]}}"#,
             r#"{"type":"assistant","uuid":"a2","parentUuid":"t1","timestamp":"2026-09-04T10:00:04.000Z","sessionId":"claude-src","cwd":"/workspace/project","message":{"role":"assistant","content":[{"type":"text","text":"the file starts with fn main"},{"type":"document","title":"spec.pdf","source":{"media_type":"application/pdf"}},{"type":"search_result","title":"Example","url":"https://example.test","snippet":"excerpt"}]}}"#,
             r#"{"type":"last-prompt","lastPrompt":"list the file","leafUuid":"a2","sessionId":"claude-src"}"#,
         ],
@@ -381,7 +415,7 @@ fn native_sources_convert_to_every_target() {
             "\n",
             r#"{"type":"assistant","content":"reading now","tool_calls":[{"id":"call-1","name":"Read","arguments":"{\"path\":\"src/lib.rs\"}"}]}"#,
             "\n",
-            r#"{"type":"tool_result","tool_call_id":"call-1","content":"fn main() {}","images":[{"type":"image","url":"toolImgData"}]}"#,
+            r#"{"type":"tool_result","tool_call_id":"call-1","content":"fn main() {}","images":[{"type":"image","url":"dG9vbEltZ0RhdGE="}]}"#,
             "\n",
             r#"{"type":"backend_tool_call","kind":{"tool_type":"web_search","id":"ws_1","action":{"type":"search","query":"capybaras"}}}"#,
             "\n",
@@ -393,6 +427,7 @@ fn native_sources_convert_to_every_target() {
     let grok = grok_dir.join("summary.json");
 
     let agent = write_agent_store(home);
+    let antigravity = write_antigravity_fixture(home);
 
     let sources = [
         (SourceTool::Pi, pi),
@@ -403,13 +438,17 @@ fn native_sources_convert_to_every_target() {
         (SourceTool::Codex, codex),
         (SourceTool::Grok, grok),
         (SourceTool::Agent, agent),
+        (SourceTool::Antigravity, antigravity),
     ];
+    assert_eq!(
+        sources.len(),
+        SourceTool::ALL.len(),
+        "native matrix must cover every source, including Antigravity"
+    );
 
     for (source, input) in sources {
-        for target in TargetTool::ALL
-            .into_iter()
-            .filter(|target| *target != TargetTool::Agent)
-        {
+        let targets = convertible_targets();
+        for target in targets {
             let parsed = convert_native(home, source, &input, target);
             let before = catalog_parse(home, source, &input);
             assert!(
@@ -436,15 +475,47 @@ fn native_sources_convert_to_every_target() {
                 has_thinking(&parsed, "I should read it"),
                 "{source}->{target} dropped thinking"
             );
-            assert!(
-                has_image(&parsed, "iVBORw0KGgo="),
-                "{source}->{target} dropped image"
-            );
-            assert_eq!(
-                parsed.hints.model.as_deref(),
-                Some("source-model"),
-                "{source}->{target} dropped model hint"
-            );
+            if represents_user_image(target) {
+                assert!(
+                    has_image(&parsed, "iVBORw0KGgo="),
+                    "{source}->{target} dropped user image"
+                );
+            }
+            if let Some(model) = before.hints.model.as_deref() {
+                if represents_foreign_model(target) {
+                    assert_eq!(
+                        parsed.hints.model.as_deref(),
+                        Some(model),
+                        "{source}->{target} dropped model hint"
+                    );
+                } else if target == TargetTool::Antigravity {
+                    assert!(
+                        parsed
+                            .hints
+                            .model
+                            .as_deref()
+                            .is_none_or(|value| value == model),
+                        "{source}->{target} invented a native model enum from {:?}",
+                        parsed.hints.model
+                    );
+                }
+            } else if source == SourceTool::Antigravity {
+                // No model hint on the AG source: each target applies its own
+                // fallback — the configured conversion runtime for OMP/Codex/
+                // Grok, the converted-from label for tree/Claude formats, and
+                // nothing for formats with no model slot.
+                let expected = match target {
+                    TargetTool::Omp | TargetTool::Codex => Some("native-model"),
+                    TargetTool::Grok => Some("grok-4.5"),
+                    TargetTool::Droid | TargetTool::Antigravity => None,
+                    _ => Some("converted-from-antigravity"),
+                };
+                assert_eq!(
+                    parsed.hints.model.as_deref(),
+                    expected,
+                    "{source}->{target} drifted from its no-hint model contract"
+                );
+            }
             if matches!(
                 source,
                 SourceTool::Pi | SourceTool::Rpi | SourceTool::Omp | SourceTool::Codex
@@ -467,7 +538,7 @@ fn native_sources_convert_to_every_target() {
                     "{source}->{target} dropped representable provider"
                 );
             }
-            if source == SourceTool::Agent {
+            if matches!(source, SourceTool::Agent | SourceTool::Antigravity) {
                 assert_eq!(
                     before.hints.thinking_level,
                     None,
@@ -480,11 +551,18 @@ fn native_sources_convert_to_every_target() {
                     "{source} parser dropped thinking level"
                 );
             }
-            if before.hints.thinking_level.is_some() {
+            if before.hints.thinking_level.is_some() && target != TargetTool::Antigravity {
                 assert_eq!(
                     parsed.hints.thinking_level,
                     before.hints.thinking_level,
                     "{source}->{target} dropped thinking level"
+                );
+            }
+            if before.hints.thinking_level.is_some() && target == TargetTool::Antigravity {
+                assert_eq!(
+                    parsed.hints.thinking_level,
+                    None,
+                    "{source}->{target} invented a thinking level"
                 );
             }
             assert!(
@@ -510,12 +588,38 @@ fn native_sources_convert_to_every_target() {
             }
             if matches!(source, SourceTool::Claude | SourceTool::Grok | SourceTool::Agent) {
                 assert!(
-                    has_image(&before, "toolImgData"),
+                    has_image(&before, "dG9vbEltZ0RhdGE="),
                     "{source} parser dropped nested tool-result image"
                 );
+                if represents_user_image(target) {
+                    assert!(
+                        has_image(&parsed, "dG9vbEltZ0RhdGE="),
+                        "{source}->{target} dropped nested tool-result image"
+                    );
+                }
+            }
+            if source == SourceTool::Antigravity {
                 assert!(
-                    has_image(&parsed, "toolImgData"),
-                    "{source}->{target} dropped nested tool-result image"
+                    has_image(&before, "dG9vbEltZ0RhdGE="),
+                    "{source} parser dropped tool-result image"
+                );
+                if represents_user_image(target) {
+                    assert!(
+                        has_image(&parsed, "dG9vbEltZ0RhdGE="),
+                        "{source}->{target} dropped tool-result image"
+                    );
+                }
+            }
+            if represents_assistant_image(source) {
+                assert!(
+                    has_image(&before, "YVNzaXN0YW50SW1n"),
+                    "{source} parser dropped assistant image"
+                );
+            }
+            if represents_assistant_image(source) && represents_assistant_image_target(target) {
+                assert!(
+                    has_image(&parsed, "YVNzaXN0YW50SW1n"),
+                    "{source}->{target} dropped representable assistant image"
                 );
             }
             if matches!(source, SourceTool::Pi | SourceTool::Rpi) {
@@ -561,8 +665,20 @@ fn native_sources_convert_to_every_target() {
                     "{source}->{target} dropped search_result block"
                 );
             }
-
+            if source == SourceTool::Antigravity {
+                assert!(
+                    has_thinking_signature(&before, "think-sig"),
+                    "{source} parser dropped thinking signature"
+                );
+                if represents_thinking_signature(target) {
+                    assert!(
+                        has_thinking_signature(&parsed, "think-sig"),
+                        "{source}->{target} dropped thinking signature"
+                    );
+                }
+            }
         }
+
     }
 }
 
@@ -592,7 +708,7 @@ fn write_agent_store(home: &Path) -> std::path::PathBuf {
     let blobs: [&[u8]; 4] = [
         br#"{"role":"user","content":[{"type":"text","text":"list the file"},{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}]}"#,
         br#"{"role":"assistant","content":[{"type":"redacted-reasoning","data":"opaque"},{"type":"thinking","thinking":"I should read it","signature":"think-sig"},{"type":"text","text":"reading now"},{"type":"tool-call","toolCallId":"call-1","toolName":"Read","args":{"path":"src/lib.rs"}}]}"#,
-        br#"{"role":"tool","content":[{"type":"tool-result","toolCallId":"call-1","result":[{"type":"text","text":"fn main() {}"},{"type":"image","data":"toolImgData","mimeType":"image/png"}],"isError":false}]}"#,
+        br#"{"role":"tool","content":[{"type":"tool-result","toolCallId":"call-1","result":[{"type":"text","text":"fn main() {}"},{"type":"image","data":"dG9vbEltZ0RhdGE=","mimeType":"image/png"}],"isError":false}]}"#,
         br#"{"role":"assistant","content":"the file starts with fn main"}"#,
     ];
     for (index, blob) in blobs.iter().enumerate() {
@@ -641,6 +757,161 @@ fn keeps_compaction_hint(target: TargetTool) -> bool {
             | TargetTool::Codex
             | TargetTool::Droid
     )
+}
+
+/// Native user-image slots exist on every current target, including
+/// Antigravity user media. A future target that flattens images must be
+/// listed here as a loss instead of being asserted as preserved.
+fn represents_user_image(target: TargetTool) -> bool {
+    !matches!(target, TargetTool::Agent)
+}
+
+/// Current Antigravity planner media stores assistant images. Older upstream
+/// claims of no assistant slot are obsolete and must not hide a drop.
+fn represents_assistant_image(source: SourceTool) -> bool {
+    source == SourceTool::Antigravity
+}
+
+fn represents_assistant_image_target(target: TargetTool) -> bool {
+    matches!(
+        target,
+        TargetTool::Pi
+            | TargetTool::Rpi
+            | TargetTool::Omp
+            | TargetTool::Claude
+            | TargetTool::Droid
+            | TargetTool::Grok
+            | TargetTool::Antigravity
+    )
+}
+
+/// A foreign display name is not a native numeric model enum. Antigravity
+/// must leave the hint unset rather than invent `model-N`.
+fn represents_foreign_model(target: TargetTool) -> bool {
+    target != TargetTool::Antigravity && target != TargetTool::Agent
+}
+
+fn represents_thinking_signature(target: TargetTool) -> bool {
+    matches!(
+        target,
+        TargetTool::Pi
+            | TargetTool::Rpi
+            | TargetTool::Omp
+            | TargetTool::Claude
+            | TargetTool::Antigravity
+    )
+}
+
+fn has_thinking_signature(session: &Session, needle: &str) -> bool {
+    session.messages.iter().any(|message| {
+        message.parts.iter().any(|part| {
+            matches!(
+                part,
+                ContentPart::Thinking {
+                    signature: Some(signature),
+                    ..
+                } if signature.contains(needle)
+            )
+        })
+    })
+}
+
+/// Emit one native Antigravity conversation through the production writer,
+/// then hand the carrier path to the catalog parser. The schema is whatever
+/// `emit` writes.
+fn write_antigravity_fixture(home: &Path) -> std::path::PathBuf {
+    let cwd = home.join("workspace/project");
+    fs::create_dir_all(&cwd).unwrap();
+    let session = Session {
+        tool: SourceTool::Claude,
+        session_id: "antigravity-source".to_owned(),
+        cwd: cwd.clone(),
+        start_timestamp: Some("2026-09-04T10:00:00.000Z".to_owned()),
+        summary: "read the file".to_owned(),
+        messages: vec![
+            Message::from_parts(
+                Role::User,
+                vec![
+                    ContentPart::Text("list the file".to_owned()),
+                    ContentPart::Image {
+                        mime_type: Some("image/png".to_owned()),
+                        data: "iVBORw0KGgo=".to_owned(),
+                    },
+                ],
+                Some("2026-09-04T10:00:01.000Z".to_owned()),
+            ),
+            Message::from_parts(
+                Role::Assistant,
+                vec![
+                    ContentPart::Thinking {
+                        text: "I should read it".to_owned(),
+                        signature: Some("think-sig".to_owned()),
+                    },
+                    ContentPart::Text("reading now".to_owned()),
+                    ContentPart::Image {
+                        mime_type: Some("image/png".to_owned()),
+                        data: "YVNzaXN0YW50SW1n".to_owned(),
+                    },
+                    ContentPart::ToolUse {
+                        id: "call-1".to_owned(),
+                        name: "Read".to_owned(),
+                        input: json!({"path": "src/lib.rs"}),
+                    },
+                ],
+                Some("2026-09-04T10:00:02.000Z".to_owned()),
+            ),
+            Message::from_parts(
+                Role::Tool,
+                vec![
+                    ContentPart::ToolResult {
+                        tool_use_id: "call-1".to_owned(),
+                        content: "fn main() {}".to_owned(),
+                        is_error: false,
+                    },
+                    ContentPart::Image {
+                        mime_type: Some("image/png".to_owned()),
+                        data: "dG9vbEltZ0RhdGE=".to_owned(),
+                    },
+                ],
+                Some("2026-09-04T10:00:03.000Z".to_owned()),
+            ),
+            Message::plain(
+                Role::Assistant,
+                "the file starts with fn main",
+                Some("2026-09-04T10:00:04.000Z".to_owned()),
+            ),
+        ],
+        path: cwd.join("source.jsonl"),
+        modified_epoch: None,
+        hints: SessionHints {
+            model: Some("source-model".to_owned()),
+            provider: Some("source-provider".to_owned()),
+            thinking_level: Some(ThinkingLevel::High),
+            ..SessionHints::default()
+        },
+    };
+    let context = emit_context(home).with_session_id(
+        "00000000-0000-4000-8000-0000000000a9".to_owned(),
+    );
+    let emitted = emit(&session, TargetTool::Antigravity, &context)
+        .expect("production Antigravity emitter");
+    assert!(
+        emitted
+            .path
+            .starts_with(home.join(".gemini/antigravity-cli/conversations")),
+        "Antigravity fixture landed outside the native root: {}",
+        emitted.path.display()
+    );
+    assert_eq!(emitted.path.extension().and_then(|ext| ext.to_str()), Some("db"));
+    assert!(
+        emitted
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|root| root.join("brain").join(&emitted.session_id).is_dir()),
+        "production emitter did not create the sibling brain directory"
+    );
+    emitted.path
 }
 
 fn has_object_tool_input(session: &Session, key: &str, value: &str) -> bool {

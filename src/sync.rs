@@ -354,7 +354,7 @@ pub fn sync<E: CommandExecutor>(
 
     for tool in selected {
         let root = catalog.root_for_tool(tool).path;
-        let report = if !rsync_available && tool != SourceTool::Codex {
+        let report = if !rsync_available && !matches!(tool, SourceTool::Codex | SourceTool::Antigravity) {
             Err(SyncError::MissingRsync)
         } else {
             sync_tool(src, dst, options, tool, root.clone(), home, executor)
@@ -418,6 +418,9 @@ fn sync_tool<E: CommandExecutor>(
     home: &Path,
     executor: &mut E,
 ) -> Result<ToolSyncReport> {
+    if tool == SourceTool::Antigravity {
+        return sync_antigravity(src, dst, options, root, executor);
+    }
     let source_root_exists = directory_exists(src, &root, executor)?;
     let mut messages = Vec::new();
     if !source_root_exists {
@@ -557,6 +560,94 @@ fn sync_tool<E: CommandExecutor>(
         messages,
         error: None,
     })
+}
+
+fn append_hex(encoded: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+}
+
+fn antigravity_command(endpoint: &Endpoint, operation: &str, root: &Path, files: &[SyncRelativePath]) -> Result<CommandSpec> {
+    let mut args = vec![OsString::from("-c"), OsString::from(crate::formats::antigravity_transfer::SYNC_PROGRAM), OsString::from(operation), root.as_os_str().to_owned()];
+    args.extend(files.iter().map(|file| file.as_path().as_os_str().to_owned()));
+    match endpoint {
+        Endpoint::Local => Ok(CommandSpec::new("python3", args)),
+        Endpoint::Remote(host) => {
+            // Only hex and fixed Python syntax cross the remote login shell.
+            let mut bootstrap = String::from("import os,sys;sys.argv=[\"-c\"");
+            for arg in args.iter().skip(2) {
+                bootstrap.push_str(",os.fsdecode(bytes.fromhex(\"");
+                append_hex(&mut bootstrap, os_bytes(arg)?);
+                bootstrap.push_str("\"))");
+            }
+            bootstrap.push_str("];exec(bytes.fromhex(\"");
+            append_hex(&mut bootstrap, crate::formats::antigravity_transfer::SYNC_PROGRAM.as_bytes());
+            bootstrap.push_str("\"))");
+            let mut command = OsString::from("python3 -c ");
+            command.push(quote_posix(OsStr::new(&bootstrap))?);
+            let (program, args) = crate::remote::argv_os(OsStr::new(host), command, false);
+            Ok(CommandSpec::new(program, args))
+        }
+    }
+}
+
+fn antigravity_inventory<E: CommandExecutor>(endpoint: &Endpoint, root: &Path, executor: &mut E) -> Result<Option<BTreeSet<SyncRelativePath>>> {
+    let output = execute(executor, &antigravity_command(endpoint, "inventory", root, &[])?, "Antigravity inventory (requires python3 sqlite3)")?;
+    if output.status == 3 {
+        return Ok(None);
+    }
+    if output.status != 0 {
+        return Err(command_failed("Antigravity inventory (requires python3 sqlite3)", output.status, &output.stderr));
+    }
+    let mut files = BTreeSet::new();
+    for raw in output.stdout.split(|byte| *byte == 0).filter(|raw| !raw.is_empty()) {
+        if raw.contains(&b'\\') || raw.contains(&b':') {
+            return Err(SyncError::InvalidInventory { tool: SourceTool::Antigravity, path: PathBuf::from(os_string_from_bytes(raw.to_vec())?) });
+        }
+        let path = PathBuf::from(os_string_from_bytes(raw.to_vec())?);
+        let relative = SyncRelativePath::parse(path.clone())?;
+        let components: Vec<_> = path.components().collect();
+        let allowed = match components.as_slice() {
+            [Component::Normal(folder), Component::Normal(name)] if *folder == OsStr::new("conversations") => {
+                let name = Path::new(name);
+                name.extension() == Some(OsStr::new("db")) && name.file_stem().and_then(OsStr::to_str).is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+            }
+            [Component::Normal(folder), Component::Normal(id), ..] if *folder == OsStr::new("brain") && components.len() >= 3 => {
+                id.to_str().is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(SyncError::InvalidInventory { tool: SourceTool::Antigravity, path });
+        }
+        files.insert(relative);
+    }
+    Ok(Some(files))
+}
+
+fn sync_antigravity<E: CommandExecutor>(src: &Endpoint, dst: &Endpoint, options: &SyncOptions, conversations: PathBuf, executor: &mut E) -> Result<ToolSyncReport> {
+    let root = conversations.parent().ok_or_else(|| SyncError::UnsafeRoot(conversations.clone()))?;
+    let source = antigravity_inventory(src, root, executor)?;
+    let mut report = ToolSyncReport { tool: SourceTool::Antigravity, root: conversations.clone(), status: ToolSyncStatus::SourceAbsent, missing_files: 0, transferred_files: 0, codex_history_added: None, messages: Vec::new(), error: None };
+    let Some(source) = source else {
+        report.messages.push("skip antigravity: source conversations directory does not exist".into());
+        return Ok(report);
+    };
+    let destination = antigravity_inventory(dst, root, executor)?.unwrap_or_default();
+    let missing: Vec<_> = source.difference(&destination).cloned().collect();
+    report.missing_files = missing.len();
+    report.status = if options.dry_run { ToolSyncStatus::WouldCopy } else if missing.is_empty() { ToolSyncStatus::NothingToDo } else { ToolSyncStatus::Copied };
+    if !options.dry_run && !missing.is_empty() {
+        let producer = antigravity_command(src, "export", root, &missing)?;
+        let consumer = antigravity_command(dst, "install", root, &missing)?;
+        ensure_pipeline_success("Antigravity SQLite snapshot transfer", &pipeline(executor, &producer, &consumer, "Antigravity SQLite snapshot transfer")?)?;
+        report.transferred_files = missing.len();
+    }
+    report.messages.push(format!("{} missing antigravity native files from {} to {}: {} files (python3 sqlite3 required; SQLite WAL snapshots and brain companions only)", if options.dry_run { "would sync" } else { "synced" }, src.label(), dst.label(), missing.len()));
+    Ok(report)
 }
 
 fn validate_request(src: &Endpoint, dst: &Endpoint) -> Result<()> {
@@ -798,6 +889,7 @@ fn matches_tool_path(tool: SourceTool, path: &Path) -> bool {
             path.extension() == Some(OsStr::new("jsonl")) && os_starts_with(name, b"rollout-")
         }
         SourceTool::Grok => depth == 3 && !os_ends_with(name, b".lock"),
+        SourceTool::Antigravity => depth == 1 && path.extension() == Some(OsStr::new("db")),
         SourceTool::Agent => false,
     }
 }
@@ -820,6 +912,7 @@ fn remote_inventory_script(tool: SourceTool, root: &Path) -> Result<OsString> {
         SourceTool::Droid | SourceTool::Claude => "-type f -name '*.jsonl'",
         SourceTool::Codex => "-type f -name 'rollout-*.jsonl'",
         SourceTool::Grok => "-mindepth 3 -maxdepth 3 -type f ! -name '*.lock'",
+        SourceTool::Antigravity => "-mindepth 1 -maxdepth 1 -type f -name '*.db'",
         SourceTool::Agent => "-false",
     });
     script.push(" -not -path '*/.rsync-partial/*' -printf '%P\\0'");
@@ -1548,6 +1641,74 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_remote_command_preserves_paths_in_fish_and_bash() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("space ' quote \\ slash $literal");
+        fs::create_dir_all(root.join("conversations")).unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        fs::write(root.join(format!("conversations/{id}.db")), b"inventory only").unwrap();
+        let command = antigravity_command(&Endpoint::Remote("unused".into()), "inventory", &root, &[]).unwrap();
+        let remote = command.args.last().unwrap();
+        for shell in ["fish", "bash"] {
+            if resolve_program(OsStr::new(shell)).is_none() { continue; }
+            let output = std::process::Command::new(shell).arg("-c").arg(remote).output().unwrap();
+            assert!(output.status.success(), "{shell}: {}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(output.stdout, format!("conversations/{id}.db\0").as_bytes());
+        }
+    }
+
+    #[test]
+    fn antigravity_sync_all_endpoint_directions_use_snapshot_pipeline() {
+        let temporary = tempdir().unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let inventory = format!("conversations/{id}.db\0brain/{id}/note.md\0");
+        for (source, destination) in [
+            (Endpoint::Local, Endpoint::Remote("target".into())),
+            (Endpoint::Remote("source".into()), Endpoint::Local),
+            (Endpoint::Remote("source".into()), Endpoint::Remote("target".into())),
+        ] {
+            let mut executor = FakeExecutor::default();
+            executor.output(0, inventory.as_bytes(), b"");
+            executor.output(3, b"", b"");
+            executor.pipeline_outputs.push_back(PipelineOutput::success());
+            let report = sync(&source, &destination, &SyncOptions { tools: vec![SourceTool::Antigravity], dry_run: false }, temporary.path(), &mut executor).unwrap();
+            assert!(report.is_success());
+            assert_eq!(report.tools[0].transferred_files, 2);
+            assert_eq!(executor.pipelines.len(), 1);
+            for command in [&executor.pipelines[0].0, &executor.pipelines[0].1] {
+                let text = command_text(command);
+                assert!(text.contains("python3") || command.program == OsStr::new("python3"));
+                assert!(text.contains("source.backup(destination)") || text.contains("bytes.fromhex"));
+                assert!(!text.contains("auth.json"));
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_dry_run_counts_missing_companions_without_pipeline() {
+        let temporary = tempdir().unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut executor = FakeExecutor::default();
+        executor.output(0, format!("conversations/{id}.db\0brain/{id}/note.md\0").as_bytes(), b"");
+        executor.output(0, format!("conversations/{id}.db\0").as_bytes(), b"");
+        let report = sync(&Endpoint::Remote("source".into()), &Endpoint::Local, &SyncOptions { tools: vec![SourceTool::Antigravity], dry_run: true }, temporary.path(), &mut executor).unwrap();
+        assert_eq!(report.tools[0].missing_files, 1);
+        assert_eq!(report.tools[0].transferred_files, 0);
+        assert!(executor.pipelines.is_empty());
+    }
+
+    #[test]
+    fn antigravity_inventory_rejects_root_credentials() {
+        let temporary = tempdir().unwrap();
+        let mut executor = FakeExecutor::default();
+        executor.output(0, b"auth.json\0", b"");
+        let report = sync(&Endpoint::Remote("source".into()), &Endpoint::Local, &SyncOptions { tools: vec![SourceTool::Antigravity], dry_run: true }, temporary.path(), &mut executor).unwrap();
+        assert_eq!(report.tools[0].status, ToolSyncStatus::Failed);
+        assert!(executor.pipelines.is_empty());
+    }
 
     #[derive(Default)]
     struct FakeExecutor {
@@ -2517,7 +2678,6 @@ mod tests {
             other => panic!("expected UnsafeHistory, got {other:?}"),
         }
 
-        let mut executor = FakeExecutor::default();
         let error = append_history_local(
             &history,
             b"{\"session_id\":\"y\",\"ts\":2,\"text\":\"y\"}\n",

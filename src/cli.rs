@@ -43,6 +43,7 @@ fn restore_raw_tail(cli: &mut Cli, arguments: &[OsString]) {
             | "colo"
             | "cclo"
             | "agentlo"
+            | "agyo"
     ) {
         return;
     }
@@ -54,7 +55,8 @@ fn restore_raw_tail(cli: &mut Cli, arguments: &[OsString]) {
         | Some(Command::Dolo(tail))
         | Some(Command::Colo(tail))
         | Some(Command::Cclo(tail))
-        | Some(Command::Agentlo(tail)) => tail,
+        | Some(Command::Agentlo(tail))
+        | Some(Command::Agyo(tail)) => tail,
         _ => return,
     };
     tail.argv = arguments[2..].to_vec();
@@ -70,6 +72,7 @@ pub enum Command {
     Colo(RawTail),
     Cclo(RawTail),
     Agentlo(RawTail),
+    Agyo(RawTail),
     /// Create or update a git project, optionally make a worktree, then open it.
     New(NewProjectArgs),
     /// List live tmux coding-agent panes, not saved sessions.
@@ -479,6 +482,9 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Agentlo(args) => {
             dispatch_launcher(crate::launcher::LauncherKind::Agent, args.argv)
         }
+        Command::Agyo(args) => {
+            dispatch_launcher(crate::launcher::LauncherKind::Antigravity, args.argv)
+        }
         Command::New(args) => dispatch_new(args),
         Command::List(args) => dispatch_live_list(args),
         Command::Attach(args) => dispatch_attach(args),
@@ -866,11 +872,17 @@ fn dispatch_session_launch(
                 }
                 TargetTool::Claude => unreachable!(),
                 TargetTool::Agent => unreachable!("Agent cross-format launch rejected"),
+                TargetTool::Antigravity => {
+                    vec![OsString::from("--session"), OsString::from(&session_id)]
+                }
             };
             crate::launcher::build_launcher(kind, &args, &home, &std::env::current_dir()?)?
         }
     } else {
-        let command = if fork {
+        // Antigravity forks arrive through an emitted clone with a fresh ID and
+        // resume it; every other tool keeps its native fork flag, including on
+        // rematerialized legacy copies.
+        let command = if fork && target != TargetTool::Antigravity {
             crate::launcher::native_fork(target, &path, &session_id, &home)
         } else {
             crate::launcher::native_resume(target, &path, &session_id, &home)
@@ -918,7 +930,9 @@ fn prepare_session_launch(
             _ => false,
         };
 
-    if same_format && !rematerialize_legacy {
+    // Antigravity has no native fork flag: a same-format fork emits a cloned
+    // conversation with a fresh ID, then resumes it like any emitted copy.
+    if same_format && !rematerialize_legacy && !(fork && target == TargetTool::Antigravity) {
         return Ok((session.path.clone(), session.session_id.clone(), None));
     }
     if !fork {
@@ -979,6 +993,7 @@ fn launcher_kind_for_target(target: TargetTool) -> crate::launcher::LauncherKind
         TargetTool::Claude => crate::launcher::LauncherKind::Claude,
         TargetTool::Grok => crate::launcher::LauncherKind::Grok,
         TargetTool::Agent => crate::launcher::LauncherKind::Agent,
+        TargetTool::Antigravity => crate::launcher::LauncherKind::Antigravity,
     }
 }
 
@@ -1608,6 +1623,30 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_parses_as_session_target_with_alias() {
+        for spelling in ["antigravity", "agy"] {
+            let parsed = Cli::try_parse_from(["al", "sessions", "open", "ref", spelling]).unwrap();
+            let Some(Command::Sessions(sessions)) = parsed.command else {
+                panic!("expected sessions command");
+            };
+            let Some(SessionsCommand::Open(open)) = sessions.command else {
+                panic!("expected open");
+            };
+            assert_eq!(open.target_tool, TargetTool::Antigravity);
+
+            let parsed =
+                Cli::try_parse_from(["al", "sessions", "fork", "ref", spelling]).unwrap();
+            let Some(Command::Sessions(sessions)) = parsed.command else {
+                panic!("expected sessions command");
+            };
+            let Some(SessionsCommand::Fork(fork)) = sessions.command else {
+                panic!("expected fork");
+            };
+            assert_eq!(fork.target_tool, TargetTool::Antigravity);
+        }
+    }
+
+    #[test]
     fn sync_accepts_exactly_one_or_two_hosts() {
         for hosts in [&["host-a"][..], &["host-a", "local"][..]] {
             let mut argv = vec!["al", "sessions", "sync"];
@@ -1650,7 +1689,7 @@ mod tests {
     #[test]
     fn compatibility_command_spellings_parse() {
         let cases = [
-            "omlo", "pilo", "rpilo", "grolo", "dolo", "colo", "cclo", "agentlo",
+            "omlo", "pilo", "rpilo", "grolo", "dolo", "colo", "cclo", "agentlo", "agyo",
         ];
         for spelling in cases {
             let parsed = Cli::try_parse_from(["al", spelling, "--unknown", "value"]).unwrap();
@@ -1662,7 +1701,8 @@ mod tests {
                 | Command::Dolo(tail)
                 | Command::Colo(tail)
                 | Command::Cclo(tail)
-                | Command::Agentlo(tail) => tail.argv,
+                | Command::Agentlo(tail)
+                | Command::Agyo(tail) => tail.argv,
                 other => panic!("unexpected command: {other:?}"),
             };
             assert_eq!(argv, [OsString::from("--unknown"), OsString::from("value")]);
@@ -1705,6 +1745,33 @@ mod tests {
                 OsString::from("--"),
                 OsString::from("--host"),
                 OsString::from("tool-host"),
+            ]
+        );
+    }
+
+    #[test]
+    fn agyo_tail_restores_full_argv_including_controls() {
+        let parsed = Cli::try_parse_from([
+            "al",
+            "agyo",
+            "--tmux",
+            "--session=conv-1",
+            "--",
+            "--host",
+            "literal",
+        ])
+        .unwrap();
+        let Some(Command::Agyo(tail)) = parsed.command else {
+            panic!("expected agyo command");
+        };
+        assert_eq!(
+            tail.argv,
+            [
+                OsString::from("--tmux"),
+                OsString::from("--session=conv-1"),
+                OsString::from("--"),
+                OsString::from("--host"),
+                OsString::from("literal"),
             ]
         );
     }
