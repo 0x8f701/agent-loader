@@ -57,6 +57,7 @@ pub fn tool_color(tool: SourceTool) -> &'static str {
         SourceTool::Grok => "\x1b[95m",
         SourceTool::Agent => "\x1b[97m",
         SourceTool::Antigravity => "\x1b[36m",
+        SourceTool::OpenCode => "\x1b[34m",
     }
 }
 
@@ -265,6 +266,7 @@ pub fn target_tools_for_source(source: SourceTool) -> Vec<TargetTool> {
         TargetTool::Pi,
         TargetTool::Droid,
         TargetTool::Antigravity,
+        TargetTool::OpenCode,
     ] {
         if !tools.contains(&candidate) {
             tools.push(candidate);
@@ -284,6 +286,7 @@ const fn source_to_target(source: SourceTool) -> TargetTool {
         SourceTool::Grok => TargetTool::Grok,
         SourceTool::Agent => TargetTool::Agent,
         SourceTool::Antigravity => TargetTool::Antigravity,
+        SourceTool::OpenCode => TargetTool::OpenCode,
     }
 }
 
@@ -797,6 +800,7 @@ mod tests {
         assert_eq!(tool_color(SourceTool::Grok), "\x1b[95m");
         assert_eq!(tool_color(SourceTool::Agent), "\x1b[97m");
         assert_eq!(tool_color(SourceTool::Antigravity), "\x1b[36m");
+        assert_eq!(tool_color(SourceTool::OpenCode), "\x1b[34m");
     }
 
     // -- sanitize_tsv_field --
@@ -1091,7 +1095,7 @@ mod tests {
     fn target_tools_grok_prefers_native_first() {
         let tools = target_tools_for_source(SourceTool::Grok);
         assert_eq!(tools[0], TargetTool::Grok);
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
     }
 
     #[test]
@@ -1099,7 +1103,7 @@ mod tests {
         let tools = target_tools_for_source(SourceTool::Pi);
         assert_eq!(tools[0], TargetTool::Rpi);
         assert_eq!(tools[1], TargetTool::Pi);
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
     }
 
     #[test]
@@ -1168,6 +1172,7 @@ mod tests {
                 TargetTool::Pi,
                 TargetTool::Droid,
                 TargetTool::Antigravity,
+                TargetTool::OpenCode,
             ]
         );
     }
@@ -1186,6 +1191,7 @@ mod tests {
                 TargetTool::Grok,
                 TargetTool::Pi,
                 TargetTool::Droid,
+                TargetTool::OpenCode,
             ]
         );
         assert!(!tools.contains(&TargetTool::Agent));
@@ -1205,9 +1211,31 @@ mod tests {
                 TargetTool::Pi,
                 TargetTool::Droid,
                 TargetTool::Antigravity,
+                TargetTool::OpenCode,
             ]
         );
     }
+
+    #[test]
+    fn target_tools_opencode_ordering() {
+        let tools = target_tools_for_source(SourceTool::OpenCode);
+        assert_eq!(
+            tools,
+            vec![
+                TargetTool::OpenCode,
+                TargetTool::Rpi,
+                TargetTool::Omp,
+                TargetTool::Codex,
+                TargetTool::Claude,
+                TargetTool::Grok,
+                TargetTool::Pi,
+                TargetTool::Droid,
+                TargetTool::Antigravity,
+            ]
+        );
+        assert!(!tools.contains(&TargetTool::Agent));
+    }
+
 
     #[test]
     fn target_tools_non_agent_sources_keep_all_conversion_targets() {
@@ -1216,7 +1244,7 @@ mod tests {
             .filter(|source| *source != SourceTool::Agent)
         {
             let tools = target_tools_for_source(source);
-            assert_eq!(tools.len(), 8, "wrong count for {source:?}");
+            assert_eq!(tools.len(), 9, "wrong count for {source:?}");
             let set: HashSet<TargetTool> = tools.iter().copied().collect();
             assert!(set.contains(&TargetTool::Pi));
             assert!(set.contains(&TargetTool::Rpi));
@@ -1226,6 +1254,7 @@ mod tests {
             assert!(set.contains(&TargetTool::Claude));
             assert!(set.contains(&TargetTool::Grok));
             assert!(set.contains(&TargetTool::Antigravity));
+            assert!(set.contains(&TargetTool::OpenCode));
             assert!(!set.contains(&TargetTool::Agent));
         }
     }

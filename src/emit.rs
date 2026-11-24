@@ -118,6 +118,8 @@ pub struct TargetRoots {
     pub claude: PathBuf,
     pub grok: PathBuf,
     pub antigravity: PathBuf,
+    /// Physical OpenCode database, not a per-session export directory.
+    pub opencode: PathBuf,
 }
 
 impl TargetRoots {
@@ -131,6 +133,7 @@ impl TargetRoots {
             claude: home.join(".claude/projects"),
             grok: home.join(".grok/sessions"),
             antigravity: home.join(".gemini/antigravity-cli/conversations"),
+            opencode: home.join(".local/share/opencode/opencode.db"),
         }
     }
 }
@@ -405,16 +408,19 @@ pub fn emit_with_defaults<D: EmitDefaults>(
             session.path.display()
         );
     }
+    let cwd = session
+        .cwd
+        .to_str()
+        .ok_or_else(|| anyhow!("session cwd is not valid UTF-8: {}", session.cwd.display()))?;
+    if target == TargetTool::OpenCode {
+        return emit_opencode(session, cwd, context, defaults);
+    }
     let mut session_id = context
         .session_id
         .clone()
         .unwrap_or_else(|| defaults.next_uuid().to_string());
     validate_component("session id", &session_id)?;
     let start = fallback_time(session, context, defaults);
-    let cwd = session
-        .cwd
-        .to_str()
-        .ok_or_else(|| anyhow!("session cwd is not valid UTF-8: {}", session.cwd.display()))?;
     let grok_cwd = target.uses_grok_storage().then(|| encode_grok_cwd(cwd));
     let output = match &context.output {
         Some(output) => normalize_output_path(target, output, &session_id),
@@ -493,6 +499,7 @@ pub fn emit_with_defaults<D: EmitDefaults>(
             crate::formats::antigravity::write(session, &output, &session_id)?;
         }
         TargetTool::Agent => unreachable!("Agent emission rejected before materialization"),
+        TargetTool::OpenCode => unreachable!("OpenCode emission returns before materialization"),
     }
 
     Ok(EmittedSession {
@@ -500,6 +507,57 @@ pub fn emit_with_defaults<D: EmitDefaults>(
         session_id,
     })
 }
+
+/// Explicit `--output` is a no-overwrite portable JSON export. The default
+/// path imports into the target database and returns its virtual session ref.
+/// Official import can upsert and is not one transaction: a fresh id is
+/// preflighted, and a failed import may leave a partial session in place.
+fn emit_opencode<D: EmitDefaults>(
+    session: &Session,
+    cwd: &str,
+    context: &EmitContext,
+    defaults: &mut D,
+) -> Result<EmittedSession> {
+    let session_id = match &context.session_id {
+        Some(id) => {
+            if !is_opencode_id(id) {
+                bail!(
+                    "OpenCode session id must start with ses and use native-safe characters: {id:?}"
+                );
+            }
+            id.clone()
+        }
+        None => fresh_opencode_id(defaults.next_uuid()),
+    };
+    if let Some(output) = &context.output {
+        // An explicit output is a portable export file only: pure JSON at the
+        // requested path, never a database import and no filename-derived id.
+        // A directory receives `<session-id>.json`; an existing file is not replaced.
+        let path = if output.extension() == Some(OsStr::new("json")) {
+            output.clone()
+        } else {
+            output.join(format!("{session_id}.json"))
+        };
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("creating output directory {}", parent.display())
+            })?;
+        }
+        crate::formats::opencode::write_export(session, &path, &session_id)?;
+        return Ok(EmittedSession { path, session_id });
+    }
+
+    let database = context.roots.opencode.clone();
+    // Stage the portable export in a private system tempdir; the adapter
+    // validates the document and creates the store directory securely before
+    // running `opencode import`.
+    let staging = tempfile::tempdir().context("creating private OpenCode export directory")?;
+    let export = staging.path().join("session.json");
+    crate::formats::opencode::write_export(session, &export, &session_id)?;
+    let path = crate::formats::opencode::import_export(&export, Path::new(cwd), &database)?;
+    Ok(EmittedSession { path, session_id })
+}
+
 
 fn emit_pi<D: EmitDefaults>(
     session: &Session,
@@ -1250,6 +1308,9 @@ fn target_path(
             .antigravity
             .join(format!("{session_id}.db")),
         TargetTool::Agent => unreachable!("Agent emission rejected before path selection"),
+        TargetTool::OpenCode => {
+            unreachable!("OpenCode native import resolves before path selection")
+        }
     };
     Ok(path)
 }
@@ -2329,6 +2390,19 @@ fn compact_id(uuid: Uuid, length: usize) -> String {
     uuid.simple().to_string().chars().take(length).collect()
 }
 
+/// Native OpenCode session identity grammar (`ses` prefix, alphanumeric/`_`).
+fn is_opencode_id(id: &str) -> bool {
+    id.starts_with("ses")
+        && id.len() > "ses_".len()
+        && id.len() <= 128
+        && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Fresh `ses_` id with a native-shaped 26-char suffix derived from a UUID.
+fn fresh_opencode_id(uuid: Uuid) -> String {
+    format!("ses_{}", compact_id(uuid, 26))
+}
+
 fn zero_usage() -> Value {
     json!({
         "input": 0,
@@ -2599,10 +2673,9 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let home = temporary.path();
         let session = fixture(home);
-        for target in TargetTool::ALL
-            .into_iter()
-            .filter(|target| *target != TargetTool::Agent)
-        {
+        for target in TargetTool::ALL.into_iter().filter(|target| {
+            !matches!(target, TargetTool::Agent | TargetTool::OpenCode)
+        }) {
             let context = EmitContext::new(home).with_session_id(format!(
                 "00000000-0000-4000-8000-{:012x}",
                 target as u8
@@ -2645,6 +2718,40 @@ mod tests {
         assert!(error.to_string().contains("cannot be emitted"));
         assert!(!temporary.path().join(".cursor").exists());
     }
+    #[test]
+    fn opencode_explicit_output_is_exclusive_json_without_a_database() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path();
+        let session_id = "ses_0123456789abcdef0123456789";
+        let output = home.join(format!("{session_id}.json"));
+        let emitted = emit_with_defaults(
+            &fixture(home),
+            TargetTool::OpenCode,
+            &EmitContext::new(home)
+                .with_session_id(session_id)
+                .with_output(&output),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap();
+        assert_eq!(emitted.path, output);
+        assert_eq!(emitted.session_id, session_id);
+        assert!(output.is_file());
+        assert!(!home.join(".local/share/opencode/opencode.db").exists());
+
+        let error = emit_with_defaults(
+            &fixture(home),
+            TargetTool::OpenCode,
+            &EmitContext::new(home)
+                .with_session_id(session_id)
+                .with_output(&output),
+            &mut FixedDefaults::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing"), "{error}");
+        let document: Value = serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+        assert_eq!(document["info"]["id"], session_id);
+    }
+
 
     #[test]
     fn antigravity_defaults_into_native_conversations_db() {
@@ -3697,13 +3804,14 @@ mod tests {
         let session = fixture(home);
         for (index, target) in TargetTool::ALL
             .into_iter()
-            .filter(|target| *target != TargetTool::Agent)
+            .filter(|target| !matches!(target, TargetTool::Agent | TargetTool::OpenCode))
             .enumerate()
         {
             let session_id = format!("00000000-0000-4000-8000-{index:012x}");
             let output = match target {
                 TargetTool::Grok => home.join(format!("existing-{session_id}")),
                 TargetTool::Antigravity => home.join(format!("{session_id}.db")),
+                TargetTool::OpenCode => unreachable!("OpenCode export is covered separately"),
                 _ => home.join(format!("{session_id}.jsonl")),
             };
             if target.uses_grok_storage() {

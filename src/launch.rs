@@ -241,7 +241,7 @@ mod tests {
     fn fresh_commands_reuse_new_arguments_without_resume() {
         for tool in [LauncherKind::Claude, LauncherKind::Codex, LauncherKind::Omp,
             LauncherKind::Pi, LauncherKind::Rpi, LauncherKind::Droid, LauncherKind::Grok,
-            LauncherKind::Agent, LauncherKind::Antigravity] {
+            LauncherKind::Agent, LauncherKind::Antigravity, LauncherKind::OpenCode] {
             let (spec, fallback) = commands(tool, false, Path::new("fixture-home"), Path::new("fixture-project")).unwrap();
             let expected = crate::new::launch_argv(Some(tool));
             assert_eq!(spec.program, expected[0]);

@@ -53,6 +53,7 @@ const AGENT_ALIASES: &[(&str, &str)] = &[
     ("grolo", "grok"),
     ("omp", "omp"),
     ("omlo", "omp"),
+    ("oclo", "opencode"),
     ("open-code", "opencode"),
     ("opencode", "opencode"),
     ("opencode2", "opencode"),
@@ -70,6 +71,7 @@ const NAME_PREFIXES: &[(&str, &str)] = &[
     ("dolo-", "droid"),
     ("grolo-", "grok"),
     ("omlo-", "omp"),
+    ("oclo-", "opencode"),
     ("pilo-", "pi"),
     ("rpilo-", "rpi"),
 ];
@@ -3102,6 +3104,16 @@ mod tests {
             Some("antigravity")
         );
         assert_eq!(
+            identify_agent(&[process(17, "oclo", &["oclo", "--continue"])], Some(17))
+                .as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(
+            identify_agent(&[process(18, "opencode", &["opencode"])], Some(18))
+                .as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(
             identify_agent(
                 &[process(14, "bash", &["bash", "-c", "exec agy --continue"])],
                 Some(14)
@@ -3159,6 +3171,7 @@ mod tests {
             agent_from_tmux_name("agyo-sample-app"),
             Some("antigravity")
         );
+        assert_eq!(agent_from_tmux_name("oclo-sample-app"), Some("opencode"));
         assert_eq!(agent_from_tmux_name("agy-sample-app"), None);
         assert_eq!(agent_from_tmux_name("antigravity-sample-app"), None);
     }

@@ -59,8 +59,9 @@ pub fn parse_launcher_tool(value: &str) -> Result<LauncherKind, String> {
         "cclo" | "claude" => Ok(LauncherKind::Claude),
         "agentlo" | "agent" => Ok(LauncherKind::Agent),
         "agyo" | "agy" | "antigravity" => Ok(LauncherKind::Antigravity),
+        "oclo" | "opencode" => Ok(LauncherKind::OpenCode),
         _ => Err(format!(
-            "unsupported tool {value:?}; expected omlo, pilo, rpilo, grolo, dolo, colo, cclo, agentlo, or agyo"
+            "unsupported tool {value:?}; expected omlo, pilo, rpilo, grolo, dolo, colo, cclo, agentlo, agyo, or oclo"
         )),
     }
 }
@@ -734,6 +735,7 @@ pub(crate) fn launch_argv(tool: Option<LauncherKind>) -> Vec<OsString> {
             OsString::from("agy"),
             OsString::from("--dangerously-skip-permissions"),
         ],
+        Some(LauncherKind::OpenCode) => vec![OsString::from("opencode")],
     }
 }
 
@@ -812,7 +814,7 @@ fn goal_recipe(tool: LauncherKind) -> Option<GoalRecipe> {
             Some(GoalRecipe::Inline)
         }
         LauncherKind::Pi | LauncherKind::Rpi | LauncherKind::Omp => Some(GoalRecipe::PromptThen),
-        LauncherKind::Droid | LauncherKind::Codex | LauncherKind::Agent => None,
+        LauncherKind::Droid | LauncherKind::Codex | LauncherKind::Agent | LauncherKind::OpenCode => None,
     }
 }
 
@@ -1358,6 +1360,8 @@ mod tests {
             parse_launcher_tool("antigravity").unwrap(),
             LauncherKind::Antigravity
         );
+        assert_eq!(parse_launcher_tool("oclo").unwrap(), LauncherKind::OpenCode);
+        assert_eq!(parse_launcher_tool("opencode").unwrap(), LauncherKind::OpenCode);
         assert!(parse_launcher_tool("hyper").is_err());
         assert!(parse_launcher_tool("hyperlo").is_err());
         assert!(parse_launcher_tool("sks").is_err());

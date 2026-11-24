@@ -354,7 +354,9 @@ pub fn sync<E: CommandExecutor>(
 
     for tool in selected {
         let root = catalog.root_for_tool(tool).path;
-        let report = if !rsync_available && !matches!(tool, SourceTool::Codex | SourceTool::Antigravity) {
+        let report = if tool == SourceTool::OpenCode {
+            Ok(opencode_sync_report(src, dst, &options.tools, root.clone()))
+        } else if !rsync_available && !matches!(tool, SourceTool::Codex | SourceTool::Antigravity) {
             Err(SyncError::MissingRsync)
         } else {
             sync_tool(src, dst, options, tool, root.clone(), home, executor)
@@ -418,6 +420,9 @@ fn sync_tool<E: CommandExecutor>(
     home: &Path,
     executor: &mut E,
 ) -> Result<ToolSyncReport> {
+    if tool == SourceTool::OpenCode {
+        return Ok(opencode_sync_report(src, dst, &options.tools, root));
+    }
     if tool == SourceTool::Antigravity {
         return sync_antigravity(src, dst, options, root, executor);
     }
@@ -680,6 +685,40 @@ fn selected_tools(requested: &[SourceTool]) -> Vec<SourceTool> {
         .filter(|tool| requested.is_empty() || requested.contains(tool))
         .collect()
 }
+fn opencode_sync_report(
+    src: &Endpoint,
+    dst: &Endpoint,
+    requested: &[SourceTool],
+    root: PathBuf,
+) -> ToolSyncReport {
+    let explicit = requested.contains(&SourceTool::OpenCode);
+    let reason =
+        "OpenCode sessions cannot be synced: the shared SQLite store is not a per-session file";
+    let message = if explicit {
+        format!(
+            "failed to sync opencode sessions from {} to {}: {reason}",
+            src.label(),
+            dst.label()
+        )
+    } else {
+        format!("skip opencode: {reason}")
+    };
+    ToolSyncReport {
+        tool: SourceTool::OpenCode,
+        root,
+        status: if explicit {
+            ToolSyncStatus::Failed
+        } else {
+            ToolSyncStatus::SourceAbsent
+        },
+        missing_files: 0,
+        transferred_files: 0,
+        codex_history_added: None,
+        messages: vec![message],
+        error: explicit.then(|| reason.to_owned()),
+    }
+}
+
 
 fn directory_exists<E: CommandExecutor>(
     endpoint: &Endpoint,
@@ -890,7 +929,7 @@ fn matches_tool_path(tool: SourceTool, path: &Path) -> bool {
         }
         SourceTool::Grok => depth == 3 && !os_ends_with(name, b".lock"),
         SourceTool::Antigravity => depth == 1 && path.extension() == Some(OsStr::new("db")),
-        SourceTool::Agent => false,
+        SourceTool::Agent | SourceTool::OpenCode => false,
     }
 }
 
@@ -913,7 +952,7 @@ fn remote_inventory_script(tool: SourceTool, root: &Path) -> Result<OsString> {
         SourceTool::Codex => "-type f -name 'rollout-*.jsonl'",
         SourceTool::Grok => "-mindepth 3 -maxdepth 3 -type f ! -name '*.lock'",
         SourceTool::Antigravity => "-mindepth 1 -maxdepth 1 -type f -name '*.db'",
-        SourceTool::Agent => "-false",
+        SourceTool::Agent | SourceTool::OpenCode => "-false",
     });
     script.push(" -not -path '*/.rsync-partial/*' -printf '%P\\0'");
     Ok(script)
@@ -2858,4 +2897,46 @@ mod tests {
         assert!(message.contains("boom: tar failed"));
         assert_eq!(executor.pipelines.len(), 1);
     }
+    #[test]
+    fn opencode_sync_is_rejected_without_transfer_commands() {
+        let temporary = tempdir().unwrap();
+        let database = temporary.path().join(".local/share/opencode/opencode.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"shared-store").unwrap();
+        let mut executor = FakeExecutor::with_rsync();
+        let explicit = sync(
+            &Endpoint::Local,
+            &Endpoint::Remote("destination".into()),
+            &SyncOptions {
+                tools: vec![SourceTool::OpenCode],
+                dry_run: false,
+            },
+            temporary.path(),
+            &mut executor,
+        )
+        .unwrap();
+        assert_eq!(explicit.tools[0].status, ToolSyncStatus::Failed);
+        assert!(explicit.messages[0].contains("failed to sync opencode sessions"));
+        assert!(executor.commands.is_empty());
+        assert!(executor.pipelines.is_empty());
+        assert_eq!(fs::read(&database).unwrap(), b"shared-store");
+
+        let mut executor = FakeExecutor::with_rsync();
+        executor.program_exists = false;
+        let skipped = sync(
+            &Endpoint::Local,
+            &Endpoint::Remote("destination".into()),
+            &SyncOptions {
+                tools: vec![SourceTool::Pi],
+                dry_run: true,
+            },
+            temporary.path(),
+            &mut executor,
+        )
+        .unwrap();
+        assert_eq!(skipped.tools.len(), 1);
+        assert_eq!(skipped.tools[0].tool, SourceTool::Pi);
+        assert!(executor.commands.is_empty());
+    }
+
 }

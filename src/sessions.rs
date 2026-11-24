@@ -17,7 +17,7 @@ use chrono::{Local, TimeZone};
 use walkdir::WalkDir;
 
 use crate::domain::{Session, SessionRow, SourceTool, is_canonical_uuid};
-use crate::formats::{agent, antigravity, claude, codex, droid, grok, omp, pi};
+use crate::formats::{agent, antigravity, claude, codex, droid, grok, omp, opencode, pi};
 use crate::fs::{is_agent_store, is_grok_summary, is_tree_top_level_session, path_under_root};
 
 pub const DEFAULT_RECENT_COUNT: usize = 5;
@@ -33,6 +33,11 @@ pub struct SessionRoot {
 pub struct Catalog {
     sessions_home: PathBuf,
     user_home: PathBuf,
+    /// XDG-style OpenCode data root holding `opencode*.db` stores.
+    opencode_root: PathBuf,
+    /// `OPENCODE_DB` override: `Some(stores)` replaces root enumeration
+    /// entirely; `Some([])` (for example `:memory:`) means no local store.
+    opencode_stores: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -67,11 +72,8 @@ impl Catalog {
     /// This is the hermetic entry point for callers and tests. In normal CLI
     /// operation, use `from_env` so `SESSIONS_HOME` can override `HOME`.
     pub fn new(home: impl Into<PathBuf>) -> Self {
-        let home = make_absolute(home.into());
-        Self {
-            sessions_home: home.clone(),
-            user_home: home,
-        }
+        let home = home.into();
+        Self::with_homes(home.clone(), home)
     }
 
     pub fn from_env() -> Result<Self> {
@@ -79,15 +81,20 @@ impl Catalog {
             env::var_os("SESSIONS_HOME"),
             env::var_os("HOME"),
             user_home_fallback(),
+            env::var_os("XDG_DATA_HOME"),
+            env::var_os("OPENCODE_DB"),
         )
     }
 
     pub fn with_homes(sessions_home: impl Into<PathBuf>, user_home: impl Into<PathBuf>) -> Self {
         let user_home = make_absolute(user_home.into());
         let sessions_home = expand_tilde(&sessions_home.into(), &user_home);
+        let sessions_home = make_absolute(sessions_home);
         Self {
-            sessions_home: make_absolute(sessions_home),
+            sessions_home: sessions_home.clone(),
             user_home,
+            opencode_root: sessions_home.join(".local/share/opencode"),
+            opencode_stores: None,
         }
     }
 
@@ -95,12 +102,39 @@ impl Catalog {
         sessions_home: Option<OsString>,
         home: Option<OsString>,
         home_fallback: Option<OsString>,
+        xdg_data_home: Option<OsString>,
+        opencode_db: Option<OsString>,
     ) -> Result<Self> {
         let home = nonempty_os_path(home)
             .or_else(|| nonempty_os_path(home_fallback))
             .ok_or_else(|| anyhow::anyhow!(missing_user_home_message()))?;
-        let sessions_home = nonempty_os_path(sessions_home).unwrap_or_else(|| home.clone());
-        Ok(Self::with_homes(sessions_home, home))
+        // `SESSIONS_HOME` is hermetic: a real `XDG_DATA_HOME`/`OPENCODE_DB`
+        // environment must not leak into it, so those overrides are ignored.
+        match nonempty_os_path(sessions_home) {
+            Some(sessions_home) => Ok(Self::with_homes(sessions_home, home)),
+            None => {
+                let mut catalog = Self::with_homes(home.clone(), home);
+                if let Some(data_home) = nonempty_os_path(xdg_data_home) {
+                    catalog.opencode_root =
+                        make_absolute(expand_tilde(&data_home, &catalog.user_home))
+                            .join("opencode");
+                }
+                catalog.opencode_stores = match opencode_db.as_deref() {
+                    None => None,
+                    Some(value) if value == OsStr::new(":memory:") => Some(Vec::new()),
+                    Some(value) => {
+                        let path = expand_tilde(Path::new(value), &catalog.user_home);
+                        let path = if path.is_absolute() {
+                            path
+                        } else {
+                            catalog.opencode_root.join(path)
+                        };
+                        Some(vec![path])
+                    }
+                };
+                Ok(catalog)
+            }
+        }
     }
 
     pub fn sessions_home(&self) -> &Path {
@@ -113,6 +147,22 @@ impl Catalog {
 
     pub fn absolute_path(&self, path: impl AsRef<Path>) -> PathBuf {
         make_absolute(expand_tilde(path.as_ref(), &self.user_home))
+    }
+
+    /// Physical store an OpenCode native import should target.
+    ///
+    /// An explicit `OPENCODE_DB` override wins; otherwise the released-channel
+    /// `opencode.db` inside this catalog's data root (channel variants are
+    /// discovery inputs, never emission targets). Errors when the override
+    /// resolved to `:memory:` — an in-memory store has no filesystem target.
+    pub fn opencode_database(&self) -> Result<PathBuf> {
+        match &self.opencode_stores {
+            Some(stores) => stores
+                .first()
+                .cloned()
+                .context("OpenCode store is :memory:; no filesystem database target"),
+            None => Ok(self.opencode_root.join("opencode.db")),
+        }
     }
 
     pub fn root_for_tool(&self, tool: SourceTool) -> SessionRoot {
@@ -137,6 +187,9 @@ impl Catalog {
     /// the exact-depth validators in `fs`; every source rejects symlinks,
     /// special files, escapes, and rsync partial state.
     pub fn discover(&self, tool: SourceTool) -> Vec<PathBuf> {
+        if tool == SourceTool::OpenCode {
+            return self.discover_opencode();
+        }
         let root = self.root_for_tool(tool);
         let mut paths = Vec::new();
         if !root.path.is_dir() {
@@ -171,7 +224,141 @@ impl Catalog {
         paths
     }
 
+    /// Enumerate OpenCode session references: one virtual
+    /// `database/<session-id>` per row across the catalog's physical stores.
+    ///
+    /// The data root is scanned only for the two real store shapes —
+    /// `opencode.db` and `opencode-<channel>.db` regular non-symlink files
+    /// directly inside it (never an arbitrary user directory). An explicit
+    /// `OPENCODE_DB` override list replaces enumeration; `:memory:` already
+    /// resolved to an empty list. Stores that fail the adapter's read-only
+    /// schema validation are isolated, like corrupt files for other tools.
+    fn discover_opencode(&self) -> Vec<PathBuf> {
+        let mut refs = Vec::new();
+        for database in self.opencode_databases() {
+            match opencode::discover(&database) {
+                Ok(database_refs) => refs.extend(database_refs),
+                Err(error) => {
+                    log::debug!(
+                        "skip OpenCode store {}: {}",
+                        database.display(),
+                        error.root_cause()
+                    );
+                }
+            }
+        }
+        refs.sort();
+        refs
+    }
+
+    /// Physical OpenCode stores visible to this catalog.
+    fn opencode_databases(&self) -> Vec<PathBuf> {
+        if let Some(stores) = &self.opencode_stores {
+            return stores.clone();
+        }
+        let mut databases = Vec::new();
+        let entries = match fs::read_dir(&self.opencode_root) {
+            Ok(entries) => entries,
+            Err(_) => return databases,
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_file())
+                && is_opencode_database_name(&entry.file_name())
+            {
+                databases.push(entry.path());
+            }
+        }
+        databases.sort();
+        databases
+    }
+
+    /// Whether `store` is a physical store this catalog enumerates.
+    fn is_opencode_store(&self, store: &Path) -> bool {
+        match &self.opencode_stores {
+            // Explicit overrides are user-pinned; the adapter re-validates the
+            // store on every discovery/parse before opening it read-only.
+            Some(stores) => stores.iter().any(|path| path == store),
+            None => {
+                store.parent() == Some(self.opencode_root.as_path())
+                    && store.file_name().is_some_and(is_opencode_database_name)
+                    && path_under_root(store, &self.opencode_root)
+                    && std::fs::symlink_metadata(store)
+                        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            }
+        }
+    }
+
+    /// Resolve an OpenCode selector before any filesystem `is_file` check:
+    /// a virtual `database/<session-id>` reference, a bare physical store,
+    /// or a managed export file. Returns `None` when the input is not an
+    /// OpenCode-shaped selector.
+    fn resolve_opencode_reference(&self, candidate: &Path) -> Option<Result<PathBuf>> {
+        if self.is_opencode_store(candidate) {
+            return Some(Err(anyhow::anyhow!(
+                "an OpenCode database is not a session: {}\n\
+                 pass a session id or a <database>/<session-id> reference such as {}",
+                candidate.display(),
+                candidate.join("<session-id>").display()
+            )));
+        }
+        if candidate
+            .parent()
+            .is_some_and(|parent| self.is_opencode_store(parent))
+        {
+            let (database, reference) = match opencode::native_reference(candidate) {
+                Ok(Some((database, _))) => (database, candidate.to_path_buf()),
+                Ok(None) => {
+                    return Some(Err(anyhow::anyhow!(
+                        "invalid OpenCode session reference: {}",
+                        candidate.display()
+                    )));
+                }
+                Err(error) => return Some(Err(error)),
+            };
+            match opencode::discover(&database) {
+                Ok(refs) if refs.contains(&reference) => return Some(Ok(reference)),
+                Ok(_) => {}
+                Err(error) => {
+                    return Some(Err(error.context(format!(
+                        "reading OpenCode store {}",
+                        database.display()
+                    ))));
+                }
+            }
+            let session_id = candidate.file_name().map(OsStr::to_string_lossy);
+            return Some(Err(anyhow::anyhow!(
+                "session not found for opencode: {}",
+                session_id.unwrap_or_default()
+            )));
+        }
+        None
+    }
+
+    /// `is_session_path` for OpenCode: a validated virtual reference
+    /// whose parent is an enumerated store, or an explicit `.json` regular
+    /// non-symlink file that structurally parses as an official export.
+    /// Explicit exports may live anywhere — managed `al-exports` files too —
+    /// so this check runs before the generic root-containment rule.
+    fn is_opencode_session_path(&self, path: &Path) -> bool {
+        if path
+            .parent()
+            .is_some_and(|parent| self.is_opencode_store(parent))
+            && matches!(opencode::native_reference(path), Ok(Some(_)))
+        {
+            return true;
+        }
+        path.extension() == Some(OsStr::new("json"))
+            && std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            && opencode::is_export(path)
+    }
+
     pub fn is_session_path(&self, tool: SourceTool, path: &Path) -> bool {
+        if tool == SourceTool::OpenCode {
+            // Virtual refs never exist on disk and explicit exports may live
+            // outside the data root, so this runs before the root gate.
+            return self.is_opencode_session_path(path);
+        }
         let root = self.root_for_tool(tool).path;
         if contains_rsync_partial(path, &root) || !path_under_root(path, &root) {
             return false;
@@ -184,6 +371,7 @@ impl Catalog {
             SourceTool::Agent => is_agent_store(path, &root),
             SourceTool::Antigravity => is_antigravity_conversation(path, &root),
             SourceTool::Droid | SourceTool::Codex | SourceTool::Claude => true,
+            SourceTool::OpenCode => unreachable!(),
         }
     }
 
@@ -197,6 +385,7 @@ impl Catalog {
             SourceTool::Grok => grok::parse(path, &self.root_for_tool(SourceTool::Grok).path),
             SourceTool::Agent => agent::parse(path),
             SourceTool::Antigravity => antigravity::parse(path),
+            SourceTool::OpenCode => opencode::parse(path),
         }
         .with_context(|| format!("parsing {tool} session {}", path.display()))?;
         session.tool = tool;
@@ -251,6 +440,11 @@ impl Catalog {
     ) -> Result<PathBuf> {
         let input = input.as_ref();
         let candidate = self.input_path(input);
+        if tool == SourceTool::OpenCode {
+            if let Some(resolution) = self.resolve_opencode_reference(&candidate) {
+                return resolution;
+            }
+        }
         if candidate.is_file() {
             if self.is_session_path(tool, &candidate) {
                 return Ok(candidate);
@@ -280,6 +474,9 @@ impl Catalog {
     pub fn resolve_any_path(&self, input: impl AsRef<OsStr>) -> Result<(SourceTool, PathBuf)> {
         let input = input.as_ref();
         let candidate = self.input_path(input);
+        if let Some(resolution) = self.resolve_opencode_reference(&candidate) {
+            return resolution.map(|path| (SourceTool::OpenCode, path));
+        }
         if candidate.is_file() {
             for tool in SourceTool::ALL {
                 if self.is_session_path(tool, &candidate) {
@@ -330,7 +527,17 @@ impl Catalog {
         let mut rows = Vec::new();
         for tool in selected_tools(tools) {
             for path in self.discover(tool) {
-                let metadata = match std::fs::symlink_metadata(&path) {
+                // OpenCode refs are virtual (database/<session-id>): stat the
+                // physical store the adapter validates, not the ref itself.
+                let stat_path = if tool == SourceTool::OpenCode {
+                    match opencode::native_reference(&path) {
+                        Ok(Some((database, _))) => database,
+                        Ok(None) | Err(_) => continue,
+                    }
+                } else {
+                    path.clone()
+                };
+                let metadata = match std::fs::symlink_metadata(&stat_path) {
                     Ok(metadata) if metadata.is_file() => metadata,
                     Ok(_) => continue,
                     Err(error) => {
@@ -338,7 +545,7 @@ impl Catalog {
                         continue;
                     }
                 };
-                let (modified_epoch, size) = session_file_stats(tool, &path, &metadata);
+                let (physical_epoch, size) = session_file_stats(tool, &stat_path, &metadata);
                 let session = match self.parse(tool, &path) {
                     Ok(session) => session,
                     Err(error) if is_expected_skip(&error) => continue,
@@ -358,6 +565,10 @@ impl Catalog {
                 if !predicate(&session) {
                     continue;
                 }
+                // Session-native `time_updated` orders rows meaningfully; the
+                // shared database mtime only falls back when a parser didn't
+                // supply per-session metadata.
+                let modified_epoch = session.modified_epoch.unwrap_or(physical_epoch);
                 rows.push(SessionRow {
                     modified_epoch,
                     tool,
@@ -383,6 +594,17 @@ impl Catalog {
     fn matching_paths(&self, tool: SourceTool, input: &str) -> Vec<PathBuf> {
         let mut matches = Vec::new();
         for path in self.discover(tool) {
+            // OpenCode refs are `database/<session-id>`: the final component
+            // already is the session id, so match it directly without parsing.
+            if tool == SourceTool::OpenCode {
+                let Some(session_id) = path.file_name().and_then(OsStr::to_str) else {
+                    continue;
+                };
+                if input == session_id || session_id.starts_with(input) {
+                    matches.push(path);
+                }
+                continue;
+            }
             let Some(file_stem) = path.file_stem().and_then(OsStr::to_str) else {
                 continue;
             };
@@ -662,6 +884,7 @@ fn root_spec(tool: SourceTool) -> (&'static Path, &'static str) {
         SourceTool::Grok => (Path::new(".grok/sessions"), "summary.json"),
         SourceTool::Agent => (Path::new(".cursor/chats"), "store.db"),
         SourceTool::Antigravity => (Path::new(".gemini/antigravity-cli/conversations"), "*.db"),
+        SourceTool::OpenCode => (Path::new(".local/share/opencode"), "opencode*.db"),
     }
 }
 
@@ -705,7 +928,29 @@ fn matches_pattern(tool: SourceTool, path: &Path) -> bool {
         SourceTool::Grok => file_name == OsStr::new("summary.json"),
         SourceTool::Agent => file_name == OsStr::new("store.db"),
         SourceTool::Antigravity => path.extension() == Some(OsStr::new("db")),
+        SourceTool::OpenCode => is_opencode_database_name(file_name),
     }
+}
+
+/// Whether `file_name` is a real OpenCode store name: `opencode.db` or a
+/// channel-specific `opencode-<channel>.db`. Anything else in the data root
+/// (auth, settings, plugin state) is never enumerated.
+fn is_opencode_database_name(file_name: &OsStr) -> bool {
+    let Some(name) = file_name.to_str() else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".db") else {
+        return false;
+    };
+    if stem == "opencode" {
+        return true;
+    }
+    stem.strip_prefix("opencode-").is_some_and(|channel| {
+        !channel.is_empty()
+            && channel
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-._".contains(character))
+    })
 }
 
 /// Validates an Antigravity conversation database at `root/<session-uuid>.db`.
@@ -780,9 +1025,11 @@ fn missing_user_home_message() -> &'static str {
 }
 
 /// Catalog row stats for a session file. The SQLite stores (Agent store.db,
-/// Antigravity <uuid>.db) also count their WAL/SHM siblings and Cursor's
-/// meta.json sidecar — an uncheckpointed write changes those without touching
-/// the main file, and they're physically part of the store's footprint.
+/// Antigravity <uuid>.db, OpenCode opencode*.db) also count their WAL/SHM
+/// siblings and Cursor's meta.json sidecar — an uncheckpointed write changes
+/// those without touching the main file, and they're physically part of the
+/// store's footprint. For OpenCode `path` is the physical database of a
+/// virtual reference; rows still order by per-session `time_updated`.
 fn session_file_stats(tool: SourceTool, path: &Path, metadata: &Metadata) -> (f64, u64) {
     let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
         return (metadata_epoch(metadata), metadata.len());
@@ -793,7 +1040,9 @@ fn session_file_stats(tool: SourceTool, path: &Path, metadata: &Metadata) -> (f6
             "store.db-shm".to_owned(),
             "meta.json".to_owned(),
         ],
-        SourceTool::Antigravity => vec![format!("{file_name}-wal"), format!("{file_name}-shm")],
+        SourceTool::Antigravity | SourceTool::OpenCode => {
+            vec![format!("{file_name}-wal"), format!("{file_name}-shm")]
+        }
         _ => return (metadata_epoch(metadata), metadata.len()),
     };
     let mut modified = metadata_epoch(metadata);
@@ -944,6 +1193,8 @@ mod tests {
             Some(OsString::from("~/catalog")),
             Some(OsString::from("/workspace/user")),
             None,
+            None,
+            None,
         )
         .expect("catalog");
         assert_eq!(
@@ -963,6 +1214,14 @@ mod tests {
             catalog.root_for_tool(SourceTool::Grok).path,
             Path::new("/workspace/user/catalog/.grok/sessions")
         );
+        assert_eq!(
+            catalog.root_for_tool(SourceTool::OpenCode).path,
+            Path::new("/workspace/user/catalog/.local/share/opencode")
+        );
+        assert_eq!(
+            catalog.root_for_tool(SourceTool::OpenCode).pattern,
+            "opencode*.db"
+        );
     }
 
     #[test]
@@ -971,6 +1230,8 @@ mod tests {
             None,
             Some(OsString::from("/workspace/preferred")),
             Some(OsString::from("/workspace/fallback")),
+            None,
+            None,
         )
         .expect("catalog");
         assert_eq!(catalog.user_home(), Path::new("/workspace/preferred"));
@@ -979,15 +1240,22 @@ mod tests {
 
     #[test]
     fn from_environment_uses_fallback_when_home_missing_or_empty() {
-        let missing_home =
-            Catalog::from_environment(None, None, Some(OsString::from("/workspace/fallback")))
-                .expect("catalog from fallback");
+        let missing_home = Catalog::from_environment(
+            None,
+            None,
+            Some(OsString::from("/workspace/fallback")),
+            None,
+            None,
+        )
+        .expect("catalog from fallback");
         assert_eq!(missing_home.user_home(), Path::new("/workspace/fallback"));
 
         let empty_home = Catalog::from_environment(
             Some(OsString::from("~/sessions")),
             Some(OsString::from("")),
             Some(OsString::from("/workspace/fallback")),
+            None,
+            None,
         )
         .expect("catalog from empty HOME");
         assert_eq!(empty_home.user_home(), Path::new("/workspace/fallback"));
@@ -999,14 +1267,16 @@ mod tests {
 
     #[test]
     fn from_environment_rejects_missing_home_with_platform_message() {
-        let err =
-            Catalog::from_environment(None, None, None).expect_err("missing home should fail");
+        let err = Catalog::from_environment(None, None, None, None, None)
+            .expect_err("missing home should fail");
         assert_eq!(err.to_string(), missing_user_home_message());
 
         let err = Catalog::from_environment(
             Some(OsString::from("/sessions")),
             Some(OsString::from("")),
             Some(OsString::from("")),
+            None,
+            None,
         )
         .expect_err("empty homes should fail");
         assert_eq!(err.to_string(), missing_user_home_message());
@@ -2159,5 +2429,403 @@ mod tests {
             &directory,
             &home.path().join("encoded/other/summary.json")
         ));
+    }
+    // ---- OpenCode (virtual database/session references) -------------------
+
+    #[cfg(feature = "catalog")]
+    /// Synthetic OpenCode 1.19.6 store: `session`, `message`, `part` tables
+    /// with the documented columns; `data` holds the payload JSON without the
+    /// authoritative relational IDs. All values are invented.
+    fn write_opencode_db(
+        catalog: &Catalog,
+        name: &str,
+        sessions: &[(&str, &str, &str, i64)],
+    ) -> PathBuf {
+        let root = catalog.root_for_tool(SourceTool::OpenCode).path;
+        fs::create_dir_all(&root).expect("create opencode root");
+        let database = root.join(name);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session(
+                     id TEXT PRIMARY KEY, project_id TEXT, workspace_id TEXT,
+                     parent_id TEXT, slug TEXT, directory TEXT, path TEXT,
+                     title TEXT, version TEXT, agent TEXT, model TEXT,
+                     metadata TEXT, cost REAL, tokens_input INTEGER,
+                     tokens_output INTEGER, tokens_reasoning INTEGER,
+                     tokens_cache_read INTEGER, tokens_cache_write INTEGER,
+                     share_url TEXT, summary_additions INTEGER,
+                     summary_deletions INTEGER, summary_files INTEGER,
+                     summary_diffs TEXT, revert TEXT, permission TEXT,
+                     time_created INTEGER, time_updated INTEGER,
+                     time_compacting INTEGER, time_archived INTEGER);
+                 CREATE TABLE message(
+                     id TEXT PRIMARY KEY, session_id TEXT,
+                     time_created INTEGER, time_updated INTEGER, data TEXT);
+                 CREATE TABLE part(
+                     id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                     time_created INTEGER, time_updated INTEGER, data TEXT);",
+            )
+            .unwrap();
+        for (index, (id, title, text, updated_ms)) in sessions.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO session(
+                         id, project_id, slug, directory, title, version,
+                         time_created, time_updated)
+                     VALUES(?1, 'global', ?2, '/synthetic-project', ?2, '1.19.6',
+                            1000, ?3)",
+                    rusqlite::params![id, title, updated_ms],
+                )
+                .unwrap();
+            let message_id = format!("msg_000000000000synthetic{index:04}");
+            let part_id = format!("prt_000000000000synthetic{index:04}");
+            connection
+                .execute(
+                    "INSERT INTO message(id, session_id, time_created, time_updated, data)
+                     VALUES(?1, ?2, 1000, 1000,
+                            '{\"role\":\"user\",\"time\":{\"created\":1000},\"agent\":\"build\"}')",
+                    rusqlite::params![message_id, id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO part(id, message_id, session_id, time_created,
+                                     time_updated, data)
+                     VALUES(?1, ?2, ?3, 1000, 1000, ?4)",
+                    rusqlite::params![
+                        part_id,
+                        message_id,
+                        id,
+                        format!(r#"{{"type":"text","text":{}}}"#, serde_json::to_string(text).unwrap())
+                    ],
+                )
+                .unwrap();
+        }
+        database
+    }
+
+    #[cfg(feature = "catalog")]
+    fn write_opencode_export(path: &Path) -> PathBuf {
+        fs::create_dir_all(path.parent().expect("export parent"))
+            .expect("create export parent");
+        let export = serde_json::json!({
+            "info": {
+                "id": "ses_exportSynthetic0001",
+                "slug": "exported",
+                "projectID": "global",
+                "directory": "/synthetic-project",
+                "title": "Exported",
+                "version": "1.19.6",
+                "time": {"created": 0, "updated": 0}
+            },
+            "messages": [{
+                "info": {
+                    "id": "msg_000000000000Exported0001",
+                    "sessionID": "ses_exportSynthetic0001",
+                    "role": "user",
+                    "time": {"created": 0},
+                    "agent": "build",
+                    "model": {"providerID": "p", "modelID": "m"}
+                },
+                "parts": [{
+                    "id": "prt_000000000000Exported0001",
+                    "sessionID": "ses_exportSynthetic0001",
+                    "messageID": "msg_000000000000Exported0001",
+                    "type": "text",
+                    "text": "exported text"
+                }]
+            }]
+        });
+        fs::write(path, export.to_string()).expect("write export");
+        path.to_path_buf()
+    }
+
+    #[cfg(feature = "catalog")]
+    #[test]
+    fn opencode_discovery_enumerates_virtual_refs_not_the_store() {
+        let (_home, catalog) = catalog();
+        let database = write_opencode_db(
+            &catalog,
+            "opencode.db",
+            &[
+                ("ses_alphaSynthetic0001", "Alpha", "needle alpha", 2_000),
+                ("ses_betaSynthetic0002", "Beta", "other beta", 5_000),
+            ],
+        );
+        // A real WAL keeps the store consistent; keep a writer open so the
+        // sibling exists while the catalog scans.
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO session(id, project_id, slug, directory, title,
+                                    version, time_created, time_updated)
+                 VALUES('ses_walSynthetic0003', 'global', 'Wal', '/synthetic-project',
+                        'Wal', '1.19.6', 3000, 8000)",
+                [],
+            )
+            .unwrap();
+        // Decoys: wrong names, wrong depth, and a managed export copy that
+        // must never duplicate the native row in the catalog.
+        for name in ["auth.db", "opencode-.db", "settings.db"] {
+            fs::write(database.with_file_name(name), b"ignored").expect("write decoy");
+        }
+        let nested = database.with_file_name("nested/opencode.db");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"ignored").unwrap();
+        let export = write_opencode_export(
+            &database.with_file_name("al-exports/ses_alphaSynthetic0001.json"),
+        );
+        assert!(
+            catalog.is_session_path(SourceTool::OpenCode, &export),
+            "explicit export file resolves structurally"
+        );
+
+        let refs = catalog.discover(SourceTool::OpenCode);
+        assert_eq!(
+            refs,
+            vec![
+                database.join("ses_alphaSynthetic0001"),
+                database.join("ses_betaSynthetic0002"),
+                database.join("ses_walSynthetic0003"),
+            ]
+        );
+
+        let rows = catalog.list(&ListOptions {
+            show_all: true,
+            tools: vec![SourceTool::OpenCode],
+            ..ListOptions::default()
+        });
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["ses_walSynthetic0003", "ses_betaSynthetic0002", "ses_alphaSynthetic0001"],
+            "rows order by per-session time_updated, not database mtime"
+        );
+        // `time_updated` is milliseconds; the WAL row orders first.
+        assert_eq!(rows[0].modified_epoch, 8.0);
+        // WAL bytes committed through the real journal count toward the row's
+        // physical store footprint.
+        assert!(rows[0].size > fs::metadata(&database).unwrap().len());
+        assert_eq!(rows[0].cwd, Path::new("/synthetic-project"));
+        assert_eq!(rows[0].path, database.join("ses_walSynthetic0003"));
+        drop(writer);
+    }
+
+    #[cfg(feature = "catalog")]
+    #[test]
+    fn opencode_search_and_resolves_cover_ids_refs_and_exports() {
+        let (_home, catalog) = catalog();
+        let database = write_opencode_db(
+            &catalog,
+            "opencode.db",
+            &[
+                ("ses_alphaSynthetic0001", "Alpha", "needle alpha", 2_000),
+                ("ses_betaSynthetic0002", "Beta", "other beta", 5_000),
+            ],
+        );
+
+        let hits = catalog
+            .search(
+                "needle",
+                &SearchOptions {
+                    tools: vec![SourceTool::OpenCode],
+                    ..SearchOptions::default()
+                },
+            )
+            .expect("search");
+        assert_eq!(
+            hits.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["ses_alphaSynthetic0001"]
+        );
+
+        // Exact id, unambiguous prefix, virtual ref, resolve-any.
+        let resolved = catalog
+            .resolve_for_tool(SourceTool::OpenCode, "ses_alphaSynthetic0001")
+            .expect("exact id");
+        assert_eq!(resolved.path, database.join("ses_alphaSynthetic0001"));
+        assert_eq!(resolved.summary, "Alpha");
+        let by_prefix = catalog
+            .resolve_path_for_tool(SourceTool::OpenCode, "ses_beta")
+            .expect("unique prefix");
+        assert_eq!(by_prefix, database.join("ses_betaSynthetic0002"));
+        let by_ref = catalog
+            .resolve_path_for_tool(
+                SourceTool::OpenCode,
+                database.join("ses_alphaSynthetic0001").as_os_str(),
+            )
+            .expect("virtual ref");
+        assert_eq!(by_ref, database.join("ses_alphaSynthetic0001"));
+        let (tool, path) = catalog
+            .resolve_any_path(database.join("ses_betaSynthetic0002").as_os_str())
+            .expect("resolve-any ref");
+        assert_eq!((tool, path), (SourceTool::OpenCode, by_prefix.clone()));
+
+        // Bare physical store: ambiguous container, never a silent first row.
+        let bare = catalog
+            .resolve_path_for_tool(SourceTool::OpenCode, database.as_os_str())
+            .expect_err("physical database alone is not a session");
+        assert!(format!("{bare:#}").contains("not a session"));
+
+        // Ambiguous prefix across rows, missing id, foreign id in the store.
+        let ambiguous = catalog
+            .resolve_path_for_tool(SourceTool::OpenCode, "ses_")
+            .expect_err("shared prefix is ambiguous");
+        assert!(format!("{ambiguous:#}").contains("ambiguous"));
+        let missing = catalog
+            .resolve_path_for_tool(
+                SourceTool::OpenCode,
+                database.join("ses_absentSynthetic0009").as_os_str(),
+            )
+            .expect_err("absent row must fail");
+        assert!(format!("{missing:#}").contains("not found"));
+
+        // A ref's parent must be a real store, not an arbitrary directory.
+        let fake_root = database.with_file_name("nested");
+        let bad = catalog
+            .resolve_path_for_tool(
+                SourceTool::OpenCode,
+                fake_root.join("ses_alphaSynthetic0001").as_os_str(),
+            )
+            .expect_err("refs only resolve under an enumerated store");
+        assert!(format!("{bad:#}").contains("not found"));
+
+        // Explicit export files resolve for this tool but not another tool.
+        let export = write_opencode_export(&_home.path().join("export.json"));
+        let parsed = catalog
+            .resolve_for_tool(SourceTool::OpenCode, export.as_os_str())
+            .expect("export parses");
+        assert_eq!(parsed.session_id, "ses_exportSynthetic0001");
+        assert!(
+            catalog
+                .resolve_for_tool(SourceTool::Pi, export.as_os_str())
+                .is_err(),
+            "opencode exports never resolve as another tool"
+        );
+
+        // Arbitrary JSON is not an export.
+        let junk = _home.path().join("random.json");
+        fs::write(&junk, r#"{"info":{"id":"not-a-session"},"messages":[]}"#).unwrap();
+        assert!(!catalog.is_session_path(SourceTool::OpenCode, &junk));
+        assert!(
+            catalog
+                .resolve_for_tool(SourceTool::OpenCode, junk.as_os_str())
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "catalog")]
+    #[test]
+    fn opencode_env_overrides_and_missing_schema_are_safe() {
+        // Hermetic sessions_home ignores XDG_DATA_HOME/OPENCODE_DB entirely.
+        let hermetic = Catalog::from_environment(
+            Some(OsString::from("/sessions")),
+            Some(OsString::from("/workspace/user")),
+            None,
+            Some(OsString::from("/real/xdg")),
+            Some(OsString::from("/real/leaked.db")),
+        )
+        .expect("hermetic catalog");
+        assert_eq!(
+            hermetic.root_for_tool(SourceTool::OpenCode).path,
+            Path::new("/sessions/.local/share/opencode")
+        );
+        assert!(
+            hermetic
+                .is_session_path(
+                    SourceTool::OpenCode,
+                    &Path::new("/real/leaked.db").join("ses_alphaSynthetic0001")
+                )
+                == false
+        );
+        assert!(hermetic.discover(SourceTool::OpenCode).is_empty());
+        assert_eq!(
+            hermetic.opencode_database().expect("default target"),
+            Path::new("/sessions/.local/share/opencode/opencode.db")
+        );
+
+        // OPENCODE_DB: absolute honored, relative resolved inside the data
+        // root, :memory: yields no stores at all.
+        let absolute = Catalog::from_environment(
+            None,
+            Some(OsString::from("/workspace/user")),
+            None,
+            None,
+            Some(OsString::from("/custom/dir/my.db")),
+        )
+        .expect("absolute override");
+        assert!(
+            absolute.is_session_path(
+                SourceTool::OpenCode,
+                &Path::new("/custom/dir/my.db").join("ses_alphaSynthetic0001")
+            ) || !absolute.opencode_databases().is_empty()
+        );
+        assert_eq!(
+            absolute.opencode_databases(),
+            vec![PathBuf::from("/custom/dir/my.db")]
+        );
+        assert_eq!(
+            absolute.opencode_database().expect("override target"),
+            Path::new("/custom/dir/my.db")
+        );
+        let relative = Catalog::from_environment(
+            None,
+            Some(OsString::from("/workspace/user")),
+            None,
+            Some(OsString::from("/xdg-data")),
+            Some(OsString::from("channel/my.db")),
+        )
+        .expect("relative override");
+        assert_eq!(
+            relative.opencode_databases(),
+            vec![PathBuf::from("/xdg-data/opencode/channel/my.db")]
+        );
+        assert_eq!(
+            relative.opencode_database().expect("relative override target"),
+            Path::new("/xdg-data/opencode/channel/my.db")
+        );
+        let memory = Catalog::from_environment(
+            None,
+            Some(OsString::from("/workspace/user")),
+            None,
+            None,
+            Some(OsString::from(":memory:")),
+        )
+        .expect(":memory: override");
+        assert!(memory.opencode_databases().is_empty());
+        let error = memory
+            .opencode_database()
+            .expect_err(":memory: has no filesystem target");
+        assert!(format!("{error:#}").contains(":memory:"));
+
+        // A store without the required schema contributes no rows instead of
+        // failing the whole catalog; explicit resolution stays an error.
+        let (_home, catalog) = catalog();
+        let database = catalog
+            .root_for_tool(SourceTool::OpenCode)
+            .path
+            .join("opencode.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE unsupported(id TEXT)")
+            .unwrap();
+        drop(connection);
+        assert!(catalog.discover(SourceTool::OpenCode).is_empty());
+        assert!(catalog.scan(&[SourceTool::OpenCode]).is_empty());
+        assert!(
+            catalog
+                .resolve_for_tool(
+                    SourceTool::OpenCode,
+                    database.join("ses_anySynthetic0001").as_os_str()
+                )
+                .is_err()
+        );
     }
 }

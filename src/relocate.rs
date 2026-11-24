@@ -42,6 +42,11 @@ struct PlannedMove {
 }
 
 pub fn move_sessions(catalog: &Catalog, options: &MoveOptions) -> Result<Vec<MovedSession>> {
+    // Explicitly requested unsupported tools fail before any path validation,
+    // regardless of the fixture directories involved.
+    if options.tools.iter().any(|tool| *tool == SourceTool::OpenCode) {
+        reject_opencode_move()?;
+    }
     let from = catalog.absolute_path(&options.from);
     let to = catalog.absolute_path(&options.to);
     if path_key(&from).as_os_str().is_empty() || path_key(&to).as_os_str().is_empty() {
@@ -101,8 +106,14 @@ fn movable_tools(filters: &[SourceTool]) -> Vec<SourceTool> {
     };
     selected
         .into_iter()
-        .filter(|tool| *tool != SourceTool::Agent)
+        .filter(|tool| !matches!(tool, SourceTool::Agent | SourceTool::OpenCode))
         .collect()
+}
+
+fn reject_opencode_move() -> Result<()> {
+    bail!(
+        "OpenCode sessions cannot be moved: the shared SQLite store is not a per-session file. Export and import the session instead."
+    )
 }
 
 fn is_too_broad(from: &Path, catalog: &Catalog) -> bool {
@@ -206,6 +217,10 @@ fn native_session_path(catalog: &Catalog, session: &Session, cwd: &Path) -> Resu
             .join(crate::emit::encode_grok_cwd(cwd_text))
             .join(grok_session_dir_name(session)?)
             .join("summary.json"),
+        SourceTool::OpenCode => {
+            reject_opencode_move()?;
+            unreachable!("OpenCode move rejected before a destination exists")
+        }
         SourceTool::Agent => bail!("Agent sessions cannot be moved"),
     };
     Ok(path)
@@ -392,7 +407,11 @@ fn companion_pairs(session: &Session, destination: &Path) -> Vec<(PathBuf, PathB
                 pairs.push((source, dest));
             }
         }
-        SourceTool::Grok | SourceTool::Codex | SourceTool::Claude | SourceTool::Agent => {}
+        SourceTool::Grok
+        | SourceTool::Codex
+        | SourceTool::Claude
+        | SourceTool::Agent
+        | SourceTool::OpenCode => {}
     }
     pairs
         .into_iter()
@@ -1402,4 +1421,26 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("no sessions found"));
     }
+    #[test]
+    fn explicit_opencode_move_is_rejected_without_touching_files() {
+        let home = TempDir::new().unwrap();
+        let database = home.path().join(".local/share/opencode/opencode.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"shared-store").unwrap();
+        let catalog = Catalog::new(home.path());
+        let error = move_sessions(
+            &catalog,
+            &MoveOptions {
+                from: home.path().join(".local/share/opencode"),
+                to: home.path().join("dump"),
+                tools: vec![SourceTool::OpenCode],
+                dry_run: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("OpenCode sessions cannot be moved"));
+        assert_eq!(fs::read(&database).unwrap(), b"shared-store");
+        assert!(!home.path().join("dump").exists());
+    }
+
 }

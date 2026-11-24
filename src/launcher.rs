@@ -78,6 +78,7 @@ pub enum LauncherKind {
     Claude,
     Agent,
     Antigravity,
+    OpenCode,
 }
 
 impl LauncherKind {
@@ -92,13 +93,14 @@ impl LauncherKind {
             Self::Claude => "cclo",
             Self::Agent => "agentlo",
             Self::Antigravity => "agyo",
+            Self::OpenCode => "oclo",
         }
     }
 
     const fn argument_error_code(self) -> i32 {
         match self {
             Self::Grok | Self::Claude => 2,
-            Self::Omp | Self::Pi | Self::Rpi | Self::Droid | Self::Codex | Self::Agent | Self::Antigravity => 1,
+            Self::Omp | Self::Pi | Self::Rpi | Self::Droid | Self::Codex | Self::Agent | Self::Antigravity | Self::OpenCode => 1,
         }
     }
 
@@ -292,6 +294,12 @@ pub fn native_resume(
         TargetTool::Antigravity => {
             command("agy", [os("--conversation"), os(session_id)])
         }
+        TargetTool::OpenCode => {
+            let mut spec =
+                command("opencode", [os("--session"), os(session_id)]);
+            opencode_database_env(&mut spec, session_path);
+            spec
+        }
     }
 }
 
@@ -323,6 +331,14 @@ pub fn native_fork(
         TargetTool::Antigravity => {
             command("agy", [os("--conversation"), os(session_id)])
         }
+        TargetTool::OpenCode => {
+            let mut spec = command(
+                "opencode",
+                [os("--session"), os(session_id), os("--fork")],
+            );
+            opencode_database_env(&mut spec, session_path);
+            spec
+        }
     }
 }
 
@@ -338,6 +354,7 @@ pub fn resolve_tool_executable(target: TargetTool, home: &Path) -> Result<OsStri
         TargetTool::Grok => OsString::from("grok"),
         TargetTool::Agent => OsString::from("agent"),
         TargetTool::Antigravity => OsString::from("agy"),
+        TargetTool::OpenCode => OsString::from("opencode"),
     };
     resolve_executable(&program)
         .map(PathBuf::into_os_string)
@@ -722,6 +739,7 @@ fn build_local(
         LauncherKind::Claude => build_claude(args),
         LauncherKind::Agent => build_agent(args),
         LauncherKind::Antigravity => build_antigravity(args, home, cwd),
+        LauncherKind::OpenCode => build_opencode(args),
     }
     .map(|mut plan| {
         if let LaunchPlan::Command(command) = &mut plan {
@@ -1125,6 +1143,58 @@ fn build_antigravity(args: &[OsString], home: &Path, cwd: &Path) -> Result<Launc
         command("agy", args.iter().cloned())
     };
     Ok(LaunchPlan::Command(command))
+}
+
+/// Build the raw, native argv for OpenCode's `opencode` CLI.
+///
+/// With no tool args the launcher runs `opencode --continue` to resume the
+/// latest session. A `--session ID` selector (normalized by `parse_common` from
+/// `--session ID` or `--session=ID`) maps to the native `--session ID` flag;
+/// a trailing `--fork`/`fork` adds the native `--fork` flag. `--fork [ID]`
+/// without `--session` either continues and forks the latest session (`--fork`)
+/// or forks the selected session (`--session ID --fork`). Native options,
+/// subcommands, and a positional project path are forwarded verbatim — the
+/// positional is never reinterpreted as a session ID.
+fn build_opencode(args: &[OsString]) -> Result<LaunchPlan> {
+    let command = if args.is_empty() {
+        command("opencode", [os("--continue")])
+    } else if args[0] == "--session" {
+        let id = required_selector(LauncherKind::OpenCode, args, "--session")?;
+        let remaining = &args[2..];
+        if remaining
+            .first()
+            .is_some_and(|arg| arg == "--fork" || arg == "fork")
+        {
+            command_with_tail(
+                "opencode",
+                [os("--session"), id.clone(), os("--fork")],
+                &remaining[1..],
+            )
+        } else {
+            command_with_tail("opencode", [os("--session"), id.clone()], remaining)
+        }
+    } else if args[0] == "--fork" {
+        let (session, tail) = optional_selector(args, 1);
+        let prefix = match session {
+            Some(session) => vec![os("--session"), session.clone(), os("--fork")],
+            None => vec![os("--continue"), os("--fork")],
+        };
+        command_with_tail("opencode", prefix, tail)
+    } else {
+        command("opencode", args.iter().cloned())
+    };
+    Ok(LaunchPlan::Command(command))
+}
+
+/// Pin `OPENCODE_DB` to the physical store of a native virtual ref
+/// (`<db>/<ses_id>`) so the resumed/forked session lands in the same database
+/// regardless of the caller's ambient environment. Non-virtual paths leave the
+/// command untouched.
+fn opencode_database_env(spec: &mut CommandSpec, session_path: &Path) {
+    if let Some(database) = session_path.parent() {
+        spec.env_set
+            .push((os("OPENCODE_DB"), database.as_os_str().to_owned()));
+    }
 }
 
 /// Clone a native Antigravity conversation into a fresh carrier and return the
@@ -1881,6 +1951,14 @@ mod tests {
             native_resume(TargetTool::Antigravity, path, "conv-id", home),
             command("agy", strings(&["--conversation", "conv-id"]))
         );
+        let resume = native_resume(TargetTool::OpenCode, path, "ses_1", home);
+        assert_eq!(resume.program, "opencode");
+        assert_eq!(resume.args, strings(&["--session", "ses_1"]));
+        assert_eq!(
+            resume.env_set,
+            [(os("OPENCODE_DB"), os("/tmp"))],
+            "virtual ref parent pins OPENCODE_DB"
+        );
     }
 
     #[test]
@@ -1907,6 +1985,10 @@ mod tests {
             native_fork(TargetTool::Antigravity, path, "conv-id", home),
             command("agy", strings(&["--conversation", "conv-id"]))
         );
+        let fork = native_fork(TargetTool::OpenCode, path, "ses_1", home);
+        assert_eq!(fork.program, "opencode");
+        assert_eq!(fork.args, strings(&["--session", "ses_1", "--fork"]));
+        assert_eq!(fork.env_set, [(os("OPENCODE_DB"), os("/tmp"))]);
     }
 
     #[test]
@@ -2760,6 +2842,152 @@ mod tests {
     }
 
     #[test]
+    fn oclo_bare_continues_latest_session() {
+        let command = assert_command(
+            build_launcher(LauncherKind::OpenCode, &[], &test_home(), Path::new("/tmp"))
+                .unwrap(),
+        );
+        assert_eq!(command.program, "opencode");
+        assert_eq!(command.args, strings(&["--continue"]));
+    }
+
+    #[test]
+    fn oclo_session_uses_native_session_flag() {
+        for args in [
+            strings(&["--session", "ses_1", "prompt"]),
+            strings(&["--session=ses_1", "prompt"]),
+        ] {
+            let command = assert_command(
+                build_launcher(LauncherKind::OpenCode, &args, &test_home(), Path::new("/tmp"))
+                    .unwrap(),
+            );
+            assert_eq!(command.program, "opencode");
+            assert_eq!(command.args, strings(&["--session", "ses_1", "prompt"]));
+        }
+    }
+
+    #[test]
+    fn oclo_session_fork_uses_native_flags() {
+        for marker in ["--fork", "fork"] {
+            let command = assert_command(
+                build_launcher(
+                    LauncherKind::OpenCode,
+                    &strings(&["--session", "ses_1", marker, "prompt"]),
+                    &test_home(),
+                    Path::new("/tmp"),
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                command.args,
+                strings(&["--session", "ses_1", "--fork", "prompt"]),
+            );
+        }
+    }
+
+    #[test]
+    fn oclo_bare_fork_continues_and_forks() {
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::OpenCode,
+                &strings(&["--fork"]),
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(command.args, strings(&["--continue", "--fork"]));
+    }
+
+    #[test]
+    fn oclo_fork_with_id_uses_native_flags() {
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::OpenCode,
+                &strings(&["--fork", "ses_2", "prompt"]),
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            command.args,
+            strings(&["--session", "ses_2", "--fork", "prompt"]),
+        );
+    }
+
+    #[test]
+    fn oclo_subcommands_flags_and_project_path_forward_verbatim() {
+        for args in [
+            strings(&["--help"]),
+            strings(&["run", "do a thing"]),
+            strings(&["export", "ses_9"]),
+            strings(&["import", "session.json"]),
+            strings(&["session", "list"]),
+            strings(&["/tmp/project", "--port", "4096"]),
+        ] {
+            let command = assert_command(
+                build_launcher(LauncherKind::OpenCode, &args, &test_home(), Path::new("/tmp"))
+                    .unwrap(),
+            );
+            assert_eq!(command.program, "opencode");
+            assert_eq!(command.args, args, "verbatim forwarding for {args:?}");
+        }
+    }
+
+    #[test]
+    fn oclo_session_without_id_errors_with_normal_exit_code() {
+        for args in [
+            vec![os("--session")],
+            strings(&["--session="]),
+            strings(&["--session", "--model"]),
+        ] {
+            let error = build_launcher(
+                LauncherKind::OpenCode,
+                &args,
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 1, "{args:?} exits 1");
+        }
+    }
+
+    #[test]
+    fn oclo_protected_tail_forwards_controls_as_tool_args() {
+        let command = assert_command(
+            build_launcher(
+                LauncherKind::OpenCode,
+                &strings(&["--session", "ses_3", "--", "--tmux", "--host", "x"]),
+                &test_home(),
+                Path::new("/tmp"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            command.args,
+            strings(&["--session", "ses_3", "--tmux", "--host", "x"]),
+        );
+    }
+
+    #[test]
+    fn oclo_remote_argv_retains_oclo_subcommand() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join(".git")).unwrap();
+        let plan = build_launcher(
+            LauncherKind::OpenCode,
+            &strings(&["--host", "host-a", "--session", "ses_4", "prompt"]),
+            &test_home(),
+            temp.path(),
+        )
+        .unwrap();
+        let LaunchPlan::Remote { argv, .. } = plan else {
+            panic!("expected remote plan, got {plan:?}");
+        };
+        assert_eq!(argv, strings(&["al", "oclo", "--session", "ses_4", "prompt"]));
+    }
+
+    #[test]
     fn dash_dash_stops_option_parsing_for_every_launcher() {
         for kind in [
             LauncherKind::Omp,
@@ -2771,6 +2999,7 @@ mod tests {
             LauncherKind::Claude,
             LauncherKind::Agent,
             LauncherKind::Antigravity,
+            LauncherKind::OpenCode,
         ] {
             let plan = build_launcher(
                 kind,
@@ -2811,6 +3040,7 @@ mod tests {
             LauncherKind::Claude,
             LauncherKind::Agent,
             LauncherKind::Antigravity,
+            LauncherKind::OpenCode,
         ] {
             let plan = build_launcher(
                 kind,
@@ -3640,7 +3870,8 @@ mod tests {
                     | TargetTool::Codex
                     | TargetTool::Claude
                     | TargetTool::Grok
-                    | TargetTool::Agent => home.join("bin").join(target.as_str()).into_os_string(),
+                    | TargetTool::Agent
+                    | TargetTool::OpenCode => home.join("bin").join(target.as_str()).into_os_string(),
                     TargetTool::Antigravity => home.join("bin").join("agy").into_os_string(),
                     TargetTool::Rpi => home.join(".rpi/bin/rpi").into_os_string(),
                 };
@@ -3659,7 +3890,7 @@ mod tests {
         let home = temp.path();
         let bin = home.join("bin");
         fs::create_dir(&bin).unwrap();
-        for program in ["pi", "omp", "droid", "codex", "claude", "grok", "agent", "agy"] {
+        for program in ["pi", "omp", "droid", "codex", "claude", "grok", "agent", "agy", "opencode"] {
             let executable = bin.join(program);
             fs::write(&executable, b"#!/bin/sh\n").unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();

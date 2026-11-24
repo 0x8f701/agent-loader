@@ -51,6 +51,50 @@ pub mod grok;
 pub mod omp;
 pub mod pi;
 pub mod tree;
+#[cfg(feature = "catalog")]
+pub mod opencode;
+#[cfg(not(feature = "catalog"))]
+pub mod opencode {
+    use std::path::{Path, PathBuf};
+
+    use anyhow::Result;
+
+    use crate::domain::Session;
+
+    pub fn discover(_database: &Path) -> Result<Vec<PathBuf>> {
+        anyhow::bail!("OpenCode session discovery requires the `catalog` feature")
+    }
+
+    pub fn parse(_path: &Path) -> Result<Session> {
+        anyhow::bail!("OpenCode session parsing requires the `catalog` feature")
+    }
+
+    pub fn native_reference(path: &Path) -> Result<Option<(PathBuf, String)>> {
+        anyhow::bail!(
+            "invalid OpenCode session reference: {}",
+            path.display()
+        )
+    }
+
+    pub fn database_path(reference: &Path) -> Result<PathBuf> {
+        anyhow::bail!(
+            "invalid OpenCode session reference: {}",
+            reference.display()
+        )
+    }
+
+    pub fn is_export(_path: &Path) -> bool {
+        false
+    }
+
+    pub fn write_export(_session: &Session, _path: &Path, _id: &str) -> Result<()> {
+        anyhow::bail!("OpenCode export writing requires the `catalog` feature")
+    }
+
+    pub fn import_export(_export: &Path, _cwd: &Path, _database: &Path) -> Result<PathBuf> {
+        anyhow::bail!("OpenCode export importing requires the `catalog` feature")
+    }
+}
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};

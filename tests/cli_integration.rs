@@ -590,6 +590,421 @@ fn search_hides_workflow_children_until_requested() {
     );
 }
 
+/// Create the native OpenCode 1.19.6 `session`/`message`/`part` store under
+/// the hermetic HOME with one synthetic conversation. Returns the physical
+/// database path and its virtual `db/ses_id` reference.
+fn write_opencode_native_store(home: &Path) -> (PathBuf, String) {
+    let session = "ses_000000000000Synthetic00010";
+    let db = home.join(".local/share/opencode/opencode.db");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE session(
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                workspace_id TEXT,
+                parent_id TEXT,
+                slug TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                path TEXT,
+                title TEXT NOT NULL,
+                version TEXT NOT NULL,
+                agent TEXT,
+                model TEXT,
+                metadata TEXT,
+                cost REAL NOT NULL DEFAULT 0,
+                tokens_input INTEGER NOT NULL DEFAULT 0,
+                tokens_output INTEGER NOT NULL DEFAULT 0,
+                tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+                tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+                tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+                share_url TEXT,
+                summary_additions INTEGER,
+                summary_deletions INTEGER,
+                summary_files INTEGER,
+                summary_diffs TEXT,
+                revert TEXT,
+                permission TEXT,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                time_compacting INTEGER,
+                time_archived INTEGER
+            );
+            CREATE TABLE message(
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE part(
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+    let created = 1_757_000_000_000i64;
+    connection
+        .execute(
+            "INSERT INTO session(id, project_id, slug, directory, title, version, model, time_created, time_updated)
+             VALUES(?1, 'synthetic-project', 'synthetic', '/workspace/project', 'Synthetic OpenCode session', '1.19.6', ?2, ?3, ?4)",
+            rusqlite::params![
+                session,
+                r#"{"id":"synthetic-model","providerID":"synthetic-provider"}"#,
+                created,
+                created + 4_000,
+            ],
+        )
+        .unwrap();
+    let user_message = "msg_000000000000Synthetic00011";
+    let assistant_message = "msg_000000000000Synthetic00013";
+    connection
+        .execute(
+            "INSERT INTO message(id, session_id, time_created, time_updated, data) VALUES(?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                user_message,
+                session,
+                created,
+                created,
+                serde_json::json!({
+                    "role": "user",
+                    "time": {"created": created},
+                    "agent": "build",
+                    "model": {"providerID": "synthetic-provider", "modelID": "synthetic-model"},
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO message(id, session_id, time_created, time_updated, data) VALUES(?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                assistant_message,
+                session,
+                created + 2_000,
+                created + 2_000,
+                serde_json::json!({
+                    "role": "assistant",
+                    "time": {"created": created + 2_000, "completed": created + 3_000},
+                    "parentID": user_message,
+                    "modelID": "synthetic-model",
+                    "providerID": "synthetic-provider",
+                    "mode": "build",
+                    "agent": "build",
+                    "path": {"cwd": "/workspace/project", "root": "/workspace/project"},
+                    "cost": 0,
+                    "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+    for (id, message, at, text) in [
+        (
+            "prt_000000000000Synthetic00012",
+            user_message,
+            created,
+            "opencode native needle",
+        ),
+        (
+            "prt_000000000000Synthetic00014",
+            assistant_message,
+            created + 2_000,
+            "native answer",
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO part(id, message_id, session_id, time_created, time_updated, data) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    id,
+                    message,
+                    session,
+                    at,
+                    at,
+                    serde_json::json!({"type": "text", "text": text}).to_string(),
+                ],
+            )
+            .unwrap();
+    }
+    drop(connection);
+    let reference = format!("{}/{}", db.display(), session);
+    (db, reference)
+}
+
+/// A native store row is listed/searchable through its virtual reference, and
+/// opening it resumes the same session ID without copying the shared database.
+/// The physical `.db` file alone is not a session reference.
+#[test]
+fn opencode_native_store_lists_searches_and_opens_virtual_reference() {
+    let home = TempDir::new().unwrap();
+    let (db, reference) = write_opencode_native_store(home.path());
+    let before = fs::read(&db).unwrap();
+
+    let listed = run(home.path(), &["sessions", "--all", "--paths"]);
+    assert!(
+        listed.status.success(),
+        "opencode list failed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let stdout = String::from_utf8(listed.stdout).unwrap();
+    let lines: Vec<&str> = stdout.split('\n').filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "expected one native row: {stdout:?}");
+    let fields: Vec<&str> = lines[0].split('\t').collect();
+    assert_eq!(fields.len(), 5, "unexpected --paths row: {fields:?}");
+    assert_eq!(fields[0], "opencode");
+    assert_eq!(fields[2], "ses_000000000000Synthetic00010");
+    assert_eq!(fields[3], "Synthetic OpenCode session");
+    let printed_reference = Path::new(fields[4]);
+    assert_eq!(
+        printed_reference.file_name().and_then(OsStr::to_str),
+        Some("ses_000000000000Synthetic00010"),
+        "path column must be the per-row virtual reference: {stdout:?}"
+    );
+    assert_eq!(
+        printed_reference.parent(),
+        Some(db.as_path()),
+        "virtual reference must point at the physical database: {stdout:?}"
+    );
+
+    let searched = run(home.path(), &["sessions", "search", "native needle"]);
+    assert!(
+        searched.status.success(),
+        "opencode search failed: {}",
+        String::from_utf8_lossy(&searched.stderr)
+    );
+    let search_stdout = String::from_utf8(searched.stdout).unwrap();
+    assert!(
+        search_stdout.contains("ses_000000000000Synthetic00010")
+            && search_stdout.contains("Synthetic OpenCode session"),
+        "native message body must be searchable: {search_stdout:?}"
+    );
+
+    let opened = run(
+        home.path(),
+        &[
+            "sessions",
+            "open",
+            "--print-command",
+            &reference,
+            "opencode",
+        ],
+    );
+    assert!(
+        opened.status.success(),
+        "opencode open failed: {}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let printed = String::from_utf8_lossy(&opened.stdout);
+    let printed = printed.trim();
+    let expected = format!(
+        "'env' 'OPENCODE_DB={}' 'opencode' '--session' 'ses_000000000000Synthetic00010'",
+        db.display()
+    );
+    assert_eq!(
+        printed, expected,
+        "native resume must pin the physical store through OPENCODE_DB and pass only the session id to opencode"
+    );
+    assert!(
+        !printed.contains(&format!("'{}'", db.display())),
+        "the physical database must never be a positional opencode argument: {printed:?}"
+    );
+
+    let physical = run(
+        home.path(),
+        &[
+            "sessions",
+            "open",
+            "--print-command",
+            db.to_str().unwrap(),
+            "opencode",
+        ],
+    );
+    assert!(
+        !physical.status.success(),
+        "a shared database file must not be accepted as one session"
+    );
+    assert!(
+        physical.stdout.is_empty(),
+        "no command may be printed for a physical database: {:?}",
+        String::from_utf8_lossy(&physical.stdout)
+    );
+    assert!(
+        !physical.stderr.is_empty(),
+        "rejecting the shared database must explain why"
+    );
+    let stderr = String::from_utf8_lossy(&physical.stderr);
+    assert!(
+        stderr.contains("not a session"),
+        "shared database rejection must state it is not a session: {stderr}"
+    );
+    assert_eq!(fs::read(&db).unwrap(), before, "the database was mutated");
+}
+
+/// An SQLite file at the OpenCode store path without the supported
+/// `session`/`message`/`part` schema is isolated: list/search emit no rows and
+/// an explicit row reference fails instead of launching a native prompt.
+#[test]
+fn opencode_unknown_schema_is_not_exposed_or_launched() {
+    let home = TempDir::new().unwrap();
+    let db = home.path().join(".local/share/opencode/opencode.db");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch("CREATE TABLE session_message(session_id TEXT, message_id TEXT)")
+        .unwrap();
+    drop(connection);
+    let before = fs::read(&db).unwrap();
+
+    let listed = run(home.path(), &["sessions", "--all", "--paths"]);
+    assert!(
+        listed.status.success(),
+        "an unsupported store must not break listing: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        !stdout.contains("opencode") && !stdout.contains("ses_"),
+        "unsupported schema must not yield a native row: {stdout:?}"
+    );
+
+    let searched = run(home.path(), &["sessions", "search", "native needle"]);
+    assert!(
+        searched.status.success(),
+        "an unsupported store must not break search: {}",
+        String::from_utf8_lossy(&searched.stderr)
+    );
+    assert!(
+        searched.stdout.is_empty(),
+        "unsupported schema must not yield a search hit: {:?}",
+        String::from_utf8_lossy(&searched.stdout)
+    );
+
+    let source = format!("{}/ses_000000000000Synthetic00010", db.display());
+    for reference in [source.as_str(), db.to_str().unwrap()] {
+        let opened = run(
+            home.path(),
+            &["sessions", "open", "--print-command", reference, "opencode"],
+        );
+        assert!(
+            !opened.status.success(),
+            "unsupported/fabricated store reference {reference:?} must fail"
+        );
+        assert!(
+            opened.stdout.is_empty(),
+            "no native command may be printed for {reference:?}: {:?}",
+            String::from_utf8_lossy(&opened.stdout)
+        );
+        assert!(
+            !opened.stderr.is_empty(),
+            "failure for {reference:?} must be explained"
+        );
+    }
+    assert_eq!(fs::read(&db).unwrap(), before, "the database was mutated");
+}
+
+/// A shared SQLite store is not a per-session file: asking to move OpenCode
+/// must fail before any database read/write/remove, and the default move path
+/// must skip OpenCode while still relocating other tools.
+#[test]
+fn opencode_shared_database_cannot_be_moved() {
+    let home = TempDir::new().unwrap();
+    let (db, _) = write_opencode_native_store(home.path());
+    let before = fs::read(&db).unwrap();
+    let from = home.path().join("workspace");
+    let to = home.path().join("moved");
+    fs::create_dir_all(&from).unwrap();
+    fs::create_dir_all(&to).unwrap();
+
+    let output = run(
+        home.path(),
+        &[
+            "sessions",
+            "move",
+            from.to_str().unwrap(),
+            to.to_str().unwrap(),
+            "--tool",
+            "opencode",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "moving the shared OpenCode store must fail"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no destination may be printed: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("OpenCode sessions cannot be moved"),
+        "move rejection must name OpenCode: {stderr}"
+    );
+    assert!(
+        stderr.contains("shared SQLite"),
+        "move rejection must explain the shared store: {stderr}"
+    );
+    assert_eq!(fs::read(&db).unwrap(), before, "the database was mutated");
+    assert!(
+        !to.join("opencode.db").exists(),
+        "the shared database must not be copied to the destination"
+    );
+}
+
+#[test]
+fn default_move_skips_opencode_but_moves_other_tools() {
+    let home = TempDir::new().unwrap();
+    let (db, _) = write_opencode_native_store(home.path());
+    let before = fs::read(&db).unwrap();
+    let cwd = "/workspace/project";
+    let file = "2026-09-04T10-00-00-aaaaaaaa-0000-4000-8000-000000000077.jsonl";
+    let pi = write_pi_session(
+        home.path(),
+        "--workspace-project--",
+        file,
+        &[
+            header("aaaaaaaa-0000-4000-8000-000000000077", cwd),
+            message("m1", None, "user", "movable pi session"),
+        ],
+    );
+
+    let output = run(
+        home.path(),
+        &["sessions", "move", "/workspace", "/workspace/rehome"],
+    );
+    assert!(
+        output.status.success(),
+        "default move must not fail because OpenCode is present: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("rehome"),
+        "the non-OpenCode session was not moved: {stdout}"
+    );
+    assert!(!pi.exists(), "the pi source session must be moved");
+    assert_eq!(fs::read(&db).unwrap(), before, "the database was mutated");
+    let mut databases: Vec<PathBuf> = fs::read_dir(home.path().join(".local/share/opencode"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(OsStr::to_str) == Some("db"))
+        .collect();
+    databases.sort();
+    assert_eq!(
+        databases,
+        vec![db.clone()],
+        "default move must not copy the shared database"
+    );
+}
+
 #[test]
 fn list_paths_zero_emits_nothing_and_exits_zero() {
     let home = TempDir::new().unwrap();
@@ -1426,7 +1841,7 @@ fn expected_launcher_args(alias: &str, mode: &str, home: &Path, token: &str) -> 
     let mut agent = agent_prefix();
     match (alias, mode) {
         ("omlo", "empty") => vec!["--continue".to_owned()],
-        ("pilo" | "rpilo" | "agyo", "empty") => vec!["--continue".to_owned()],
+        ("pilo" | "rpilo" | "agyo" | "oclo", "empty") => vec!["--continue".to_owned()],
         ("grolo", "empty") => Vec::new(),
         ("dolo", "empty") => {
             droid.push("--resume".to_owned());
@@ -1467,7 +1882,8 @@ fn expected_launcher_args(alias: &str, mode: &str, home: &Path, token: &str) -> 
             agent
         }
         ("agyo", "session") => vec!["--conversation".to_owned(), token.to_owned()],
-        ("agyo", "tail") => vec![token.to_owned()],
+        ("agyo" | "oclo", "tail") => vec![token.to_owned()],
+        ("oclo", "session") => vec!["--session".to_owned(), token.to_owned()],
         _ => panic!("unexpected launcher case {alias} {mode}"),
     }
 }
@@ -1485,8 +1901,9 @@ fn every_launcher_alias_keeps_its_exact_argv() {
         ("cclo", "claude"),
         ("agentlo", "agent"),
         ("agyo", "agy"),
+        ("oclo", "opencode"),
     ];
-    assert_eq!(aliases.len(), 9, "launcher argv matrix must cover every alias");
+    assert_eq!(aliases.len(), 10, "launcher argv matrix must cover every alias");
     let session = "11111111-1111-4111-8111-111111111111";
     let payload = "arg with $HOME; echo pwned --continue";
     for (alias, binary) in aliases {
@@ -1517,6 +1934,153 @@ fn every_launcher_alias_keeps_its_exact_argv() {
                 );
             }
         }
+    }
+}
+
+/// OpenCode's native `--fork` is a modifier on `--session`/`--continue`, not
+/// a standalone resume selector. Each documented launcher form must emit the
+/// native pairing rather than a bare `--fork`.
+#[cfg(unix)]
+#[test]
+fn opencode_launcher_forks_selected_or_continued_session() {
+    let session = "ses_000000000000Synthetic00001";
+    let payload = "arg with $HOME; echo pwned --continue";
+    let cases: [(Vec<&str>, Vec<&str>); 4] = [
+        (
+            vec!["--session", session, "--fork"],
+            vec!["--session", session, "--fork"],
+        ),
+        (
+            vec!["--fork", session],
+            vec!["--session", session, "--fork"],
+        ),
+        (vec!["--fork"], vec!["--continue", "--fork"]),
+        (
+            vec!["--fork", session, "--", payload],
+            vec!["--session", session, "--fork", payload],
+        ),
+    ];
+    for (args, expected) in cases {
+        let (output, recorded, _) = run_recorded_launcher("oclo", "opencode", &args, 0);
+        assert!(
+            output.status.success(),
+            "oclo {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Vec<String> = expected.iter().map(|arg| (*arg).to_owned()).collect();
+        assert_eq!(
+            recorded,
+            bracketed(&expected),
+            "oclo {args:?} argv drifted"
+        );
+    }
+}
+
+/// Leading native flags and subcommands pass through untouched. A positional
+/// value is OpenCode's project path, never an implicit session selector. A
+/// missing `--session` value is rejected before any tool process starts.
+#[cfg(unix)]
+#[test]
+fn opencode_launcher_passes_raw_arguments_and_rejects_missing_selector() {
+    let session = "ses_000000000000Synthetic00002";
+    let payload = "arg with $HOME; echo pwned --continue";
+    for (args, expected) in [
+        (vec!["--help"], vec!["--help"]),
+        (vec!["run", "explain"], vec!["run", "explain"]),
+        (vec![session], vec![session]),
+        (
+            vec!["--session=ses_x"],
+            vec!["--session", "ses_x"],
+        ),
+    ] {
+        let (output, recorded, _) = run_recorded_launcher("oclo", "opencode", &args, 0);
+        assert!(
+            output.status.success(),
+            "oclo {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Vec<String> = expected.iter().map(|arg| (*arg).to_owned()).collect();
+        assert_eq!(
+            recorded,
+            bracketed(&expected),
+            "oclo {args:?} argv drifted"
+        );
+    }
+
+    let (output, recorded, _) = run_recorded_launcher(
+        "oclo",
+        "opencode",
+        &["--fork", session, "--", payload],
+        0,
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        recorded,
+        bracketed(&[
+            "--session".to_owned(),
+            session.to_owned(),
+            "--fork".to_owned(),
+            payload.to_owned(),
+        ]),
+        "protected tail must survive byte-for-byte after native fork args"
+    );
+
+    let (output, recorded, _) =
+        run_recorded_launcher("oclo", "opencode", &["--session", "--fork"], 0);
+    assert!(
+        !output.status.success(),
+        "a missing --session value must not launch opencode"
+    );
+    assert!(
+        recorded.is_empty(),
+        "no opencode process may start before selector validation: {recorded}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("oclo"), "{stderr}");
+    assert!(stderr.contains("--session"), "{stderr}");
+}
+
+/// A fresh batch launch must be a bare `opencode`: `--auto` would approve
+/// permissions that OpenCode denies by default.
+#[cfg(unix)]
+#[test]
+fn opencode_fresh_batch_launch_is_bare_and_never_auto_approved() {
+    for executor in ["oclo", "opencode"] {
+        let home = TempDir::new().unwrap();
+        let output = run(
+            home.path(),
+            &[
+                "new",
+                "~/Projects/oc-sample",
+                "ship the parser",
+                "--executor",
+                executor,
+                "--print-command",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "new --executor {executor} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("window\toclo-oc-sample\topencode\n"),
+            "fresh {executor} launch must be bare opencode: {stdout}"
+        );
+        assert!(
+            stdout.contains("goal\toclo-oc-sample\tGOAL.md only (oclo has no /goal)\n"),
+            "oclo must not claim a native /goal recipe: {stdout}"
+        );
+        assert!(
+            !stdout.contains("--auto"),
+            "auto-approval must not be a default launch flag: {stdout}"
+        );
+        assert!(
+            !stdout.contains("--continue"),
+            "a fresh batch launch must not continue an old session: {stdout}"
+        );
+        assert!(!home.path().join("Projects/oc-sample").exists());
     }
 }
 

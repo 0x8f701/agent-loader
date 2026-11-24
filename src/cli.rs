@@ -44,6 +44,7 @@ fn restore_raw_tail(cli: &mut Cli, arguments: &[OsString]) {
             | "cclo"
             | "agentlo"
             | "agyo"
+            | "oclo"
     ) {
         return;
     }
@@ -56,7 +57,8 @@ fn restore_raw_tail(cli: &mut Cli, arguments: &[OsString]) {
         | Some(Command::Colo(tail))
         | Some(Command::Cclo(tail))
         | Some(Command::Agentlo(tail))
-        | Some(Command::Agyo(tail)) => tail,
+        | Some(Command::Agyo(tail))
+        | Some(Command::Oclo(tail)) => tail,
         _ => return,
     };
     tail.argv = arguments[2..].to_vec();
@@ -73,7 +75,7 @@ pub enum Command {
     Cclo(RawTail),
     Agentlo(RawTail),
     Agyo(RawTail),
-    /// Create or update a git project, optionally make a worktree, then open it.
+    Oclo(RawTail),
     New(NewProjectArgs),
     /// Launch one or more coding agents, optionally inside a new tmux session.
     Launch(LaunchArgs),
@@ -182,6 +184,10 @@ pub struct SessionMoveArgs {
 
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct SessionForkArgs {
+    /// Print the launch plan instead of executing it. Converting to a native
+    /// OpenCode session still imports the fresh clone into the store first —
+    /// the printed `opencode --session` command only works once the session
+    /// row exists.
     #[arg(long)]
     pub print_command: bool,
     pub session_ref: OsString,
@@ -191,6 +197,10 @@ pub struct SessionForkArgs {
 
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct SessionOpenArgs {
+    /// Print the launch plan instead of executing it. Converting to a native
+    /// OpenCode session still imports the fresh clone into the store first —
+    /// the printed `opencode --session` command only works once the session
+    /// row exists.
     #[arg(long)]
     pub print_command: bool,
     pub session_ref: OsString,
@@ -510,6 +520,9 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         }
         Command::Agyo(args) => {
             dispatch_launcher(crate::launcher::LauncherKind::Antigravity, args.argv)
+        }
+        Command::Oclo(args) => {
+            dispatch_launcher(crate::launcher::LauncherKind::OpenCode, args.argv)
         }
         Command::New(args) => dispatch_new(args),
         Command::Launch(args) => dispatch_launch(args),
@@ -833,11 +846,31 @@ fn exit_with(code: i32) -> anyhow::Result<()> {
 fn dispatch_convert(args: SessionConvertArgs) -> anyhow::Result<()> {
     let home = sessions_home()?;
     let session = crate::sessions::resolve_input_session(args.source_tool, &args.input)?;
-    let emitted = match args.output {
-        Some(output) => crate::emit::emit_to_default(&session, args.target_tool, &home, &output)?,
-        None => crate::emit::emit_default(&session, args.target_tool, &home)?,
-    };
+    let emitted = emit_session(&session, args.target_tool, &home, args.output.as_deref())?;
     write_stdout_line(&emitted.path.display().to_string())
+}
+
+/// Emit a session through the environment-aware CLI pipeline.
+///
+/// `emit::emit` contexts stay hermetic to `home`; a native OpenCode destination
+/// instead resolves its physical database through the real catalog so an active
+/// `OPENCODE_DB`/`XDG_DATA_HOME` picks the store the imported session lands in.
+/// An explicit `--output` writes a portable export file and never imports, so
+/// the database is not resolved at all (`:memory:` is fine there).
+fn emit_session(
+    session: &crate::domain::Session,
+    target: TargetTool,
+    home: &std::path::Path,
+    output: Option<&std::path::Path>,
+) -> anyhow::Result<crate::emit::EmittedSession> {
+    let mut context = crate::emit::EmitContext::new(home);
+    if let Some(output) = output {
+        context = context.with_output(output);
+    }
+    if target == TargetTool::OpenCode && output.is_none() {
+        context.roots.opencode = crate::sessions::Catalog::from_env()?.opencode_database()?;
+    }
+    crate::emit::emit(session, target, &context)
 }
 
 fn dispatch_move(args: SessionMoveArgs) -> anyhow::Result<()> {
@@ -880,7 +913,7 @@ fn dispatch_session_launch(
         prepare_session_launch(&session, target, same_format, print_command, fork, &home)?;
 
     let mut plan = if fork && !same_format {
-        if target == TargetTool::Claude {
+        if matches!(target, TargetTool::Claude | TargetTool::OpenCode) {
             crate::launcher::LaunchPlan::Command(crate::launcher::native_resume(
                 target,
                 &path,
@@ -897,7 +930,7 @@ fn dispatch_session_launch(
                 TargetTool::Codex | TargetTool::Grok => {
                     vec![OsString::from("--session"), OsString::from(&session_id)]
                 }
-                TargetTool::Claude => unreachable!(),
+                TargetTool::Claude | TargetTool::OpenCode => unreachable!(),
                 TargetTool::Agent => unreachable!("Agent cross-format launch rejected"),
                 TargetTool::Antigravity => {
                     vec![OsString::from("--session"), OsString::from(&session_id)]
@@ -908,8 +941,13 @@ fn dispatch_session_launch(
     } else {
         // Antigravity forks arrive through an emitted clone with a fresh ID and
         // resume it; every other tool keeps its native fork flag, including on
-        // rematerialized legacy copies.
-        let command = if fork && target != TargetTool::Antigravity {
+        // rematerialized legacy copies. An OpenCode launch that emitted and
+        // imported a fresh-ID clone resumes that clone — forking it again would
+        // double-fork.
+        let command = if fork
+            && target != TargetTool::Antigravity
+            && !(target == TargetTool::OpenCode && created_output.is_some())
+        {
             crate::launcher::native_fork(target, &path, &session_id, &home)
         } else {
             crate::launcher::native_resume(target, &path, &session_id, &home)
@@ -960,13 +998,27 @@ fn prepare_session_launch(
     // Antigravity has no native fork flag: a same-format fork emits a cloned
     // conversation with a fresh ID, then resumes it like any emitted copy.
     if same_format && !rematerialize_legacy && !(fork && target == TargetTool::Antigravity) {
+        // OpenCode export JSON is a portable file, not a catalog session:
+        // emitting produces a fresh-ID clone imported into the native store.
+        // A virtual database ref already is a native session and resumes/forks
+        // by ID directly, never through another import.
+        if target == TargetTool::OpenCode
+            && session.tool == SourceTool::OpenCode
+            && crate::formats::opencode::native_reference(&session.path)?.is_none()
+        {
+            crate::launcher::resolve_tool_executable(target, home)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let emitted = emit_session(session, target, &sessions_home()?, None)?;
+            let created_output = emitted.path.clone();
+            return Ok((emitted.path, emitted.session_id, Some(created_output)));
+        }
         return Ok((session.path.clone(), session.session_id.clone(), None));
     }
     if !fork {
         crate::launcher::resolve_tool_executable(target, home)
             .map_err(|error| anyhow::anyhow!(error))?;
     }
-    let emitted = crate::emit::emit_default(session, target, &sessions_home()?)?;
+    let emitted = emit_session(session, target, &sessions_home()?, None)?;
     let created_output = emitted.path.clone();
     Ok((emitted.path, emitted.session_id, Some(created_output)))
 }
@@ -1021,6 +1073,7 @@ fn launcher_kind_for_target(target: TargetTool) -> crate::launcher::LauncherKind
         TargetTool::Grok => crate::launcher::LauncherKind::Grok,
         TargetTool::Agent => crate::launcher::LauncherKind::Agent,
         TargetTool::Antigravity => crate::launcher::LauncherKind::Antigravity,
+        TargetTool::OpenCode => crate::launcher::LauncherKind::OpenCode,
     }
 }
 
@@ -1731,6 +1784,7 @@ mod tests {
     fn compatibility_command_spellings_parse() {
         let cases = [
             "omlo", "pilo", "rpilo", "grolo", "dolo", "colo", "cclo", "agentlo", "agyo",
+            "oclo",
         ];
         for spelling in cases {
             let parsed = Cli::try_parse_from(["al", spelling, "--unknown", "value"]).unwrap();
@@ -1743,7 +1797,8 @@ mod tests {
                 | Command::Colo(tail)
                 | Command::Cclo(tail)
                 | Command::Agentlo(tail)
-                | Command::Agyo(tail) => tail.argv,
+                | Command::Agyo(tail)
+                | Command::Oclo(tail) => tail.argv,
                 other => panic!("unexpected command: {other:?}"),
             };
             assert_eq!(argv, [OsString::from("--unknown"), OsString::from("value")]);
@@ -1815,6 +1870,53 @@ mod tests {
                 OsString::from("literal"),
             ]
         );
+    }
+
+    #[test]
+    fn oclo_tail_restores_full_argv_including_controls() {
+        let parsed = Cli::try_parse_from([
+            "al",
+            "oclo",
+            "--tmux",
+            "--session=ses_1",
+            "--",
+            "--host",
+            "literal",
+        ])
+        .unwrap();
+        let Some(Command::Oclo(tail)) = parsed.command else {
+            panic!("expected oclo command");
+        };
+        assert_eq!(
+            tail.argv,
+            [
+                OsString::from("--tmux"),
+                OsString::from("--session=ses_1"),
+                OsString::from("--"),
+                OsString::from("--host"),
+                OsString::from("literal"),
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_parses_as_session_target() {
+        for subcommand in ["open", "fork"] {
+            let parsed =
+                Cli::try_parse_from(["al", "sessions", subcommand, "ref", "opencode"]).unwrap();
+            let Some(Command::Sessions(sessions)) = parsed.command else {
+                panic!("expected sessions command");
+            };
+            match sessions.command {
+                Some(SessionsCommand::Open(open)) => {
+                    assert_eq!(open.target_tool, TargetTool::OpenCode)
+                }
+                Some(SessionsCommand::Fork(fork)) => {
+                    assert_eq!(fork.target_tool, TargetTool::OpenCode)
+                }
+                _ => panic!("expected {subcommand}"),
+            }
+        }
     }
 
     #[test]
