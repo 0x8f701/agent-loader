@@ -222,6 +222,7 @@ mod platform {
     pub struct NamedWindow {
         pub name: String,
         pub spec: crate::launcher::CommandSpec,
+        pub fallback: Option<crate::launcher::CommandSpec>,
     }
 
     /// Create a session with one window per spec, then optionally attach.
@@ -241,6 +242,24 @@ mod platform {
             process_id: std::process::id(),
         };
         run_named_windows_with(&request, windows, &environment, &mut SystemExecutor)
+    }
+
+    /// Create a uniquely named session without replacing any existing session.
+    /// Failed windows never remove successful windows; every launch is attempted once.
+    pub fn run_batch_windows(session: &str, windows: &[NamedWindow], attach: bool) -> Result<i32> {
+        if windows.is_empty() {
+            bail!("tmux-run: at least one window is required");
+        }
+        let mut request = exact_request(session, &windows[0].spec, None)?;
+        request.no_attach = !attach;
+        let environment = RunEnvironment {
+            inside_tmux: inside_requested_tmux(&request),
+            executable: tmux_child_executable()?,
+            shell: login_shell(),
+            startup_timeout: startup_timeout()?,
+            process_id: std::process::id(),
+        };
+        run_batch_windows_with(request, windows, &environment, &mut SystemExecutor)
     }
 
     /// Attach or switch to an existing session.
@@ -491,67 +510,13 @@ mod platform {
         }
 
         for (index, window) in windows.iter().enumerate() {
-            let argv = ExactCommand::from_spec(&window.spec).into_argv();
-            let launch = ChildLaunch::create(&environment.shell, CommandMode::Argv, &argv, None)?;
-            let mut command = if index == 0 {
-                vec![
-                    os("new-session"),
-                    os("-d"),
-                    os("-s"),
-                    request.session.clone(),
-                    os("-n"),
-                    os(&window.name),
-                ]
-            } else {
-                vec![
-                    os("new-window"),
-                    os("-d"),
-                    os("-t"),
-                    exact_session_target(&request.session),
-                    os("-n"),
-                    os(&window.name),
-                ]
-            };
-            command.extend([
-                os("-c"),
-                window
-                    .spec
-                    .cwd
-                    .clone()
-                    .unwrap_or_else(|| request.cwd.clone())
-                    .into_os_string(),
-                os("-e"),
-                os("TERM=tmux-256color"),
-                os("-e"),
-                os("COLORTERM=truecolor"),
-                environment.executable.as_os_str().to_owned(),
-                os("__tmux-child"),
-                os("--payload"),
-                launch.payload.as_os_str().to_owned(),
-                os("--ready"),
-                launch.ready.as_os_str().to_owned(),
-            ]);
-            let status = tmux_status(request, executor, command)?;
+            let mut created = index > 0;
+            let status = launch_named_window(request, window, environment, executor, &mut created, true)?;
             if status != 0 {
                 if index > 0 {
                     kill_session(request, executor, &request.session);
                 }
                 return Ok(status);
-            }
-            let mut target = exact_session_target(&request.session);
-            target.push(":");
-            target.push(&window.name);
-            target.push(".0");
-            match wait_for_startup(
-                request,
-                executor,
-                &request.session,
-                &target,
-                &launch.ready,
-                environment.startup_timeout,
-            )? {
-                StartupResult::Ready => {}
-                StartupResult::Failed(status) => return Ok(status),
             }
         }
 
@@ -578,6 +543,95 @@ mod platform {
                 exact_session_target(&request.session),
             ],
         )
+    }
+
+    fn run_batch_windows_with<E: Executor>(
+        mut request: Request,
+        windows: &[NamedWindow],
+        environment: &RunEnvironment,
+        executor: &mut E,
+    ) -> Result<i32> {
+        let base = request.session.clone();
+        let mut suffix = 0_u64;
+        let mut created = false;
+        let mut failed = false;
+        for window in windows {
+            if created && !has_session(&request, executor, &request.session)? {
+                created = false;
+            }
+            if !created {
+                loop {
+                    request.session = base.clone();
+                    if suffix > 0 {
+                        request.session.push(format!("-{suffix}"));
+                    }
+                    suffix += 1;
+                    if !has_session(&request, executor, &request.session)? {
+                        break;
+                    }
+                }
+            }
+            match launch_named_window(&request, window, environment, executor, &mut created, false) {
+                Ok(0) => {}
+                Ok(status) => {
+                    failed = true;
+                    eprintln!("al launch: {} failed during startup (exit {status})", window.name);
+                }
+                Err(error) => {
+                    failed = true;
+                    eprintln!("al launch: {} failed during startup: {error:#}", window.name);
+                }
+            }
+        }
+        if created {
+            eprintln!("al launch: tmux session {}", request.session.to_string_lossy());
+        }
+        if created && !request.no_attach {
+            let action = if environment.inside_tmux { "switch-client" } else { "attach-session" };
+            let status = tmux_status(&request, executor, [os(action), os("-t"), exact_session_target(&request.session)])?;
+            if status != 0 {
+                return Ok(status);
+            }
+        }
+        Ok(i32::from(failed))
+    }
+
+    fn launch_named_window<E: Executor>(
+        request: &Request,
+        window: &NamedWindow,
+        environment: &RunEnvironment,
+        executor: &mut E,
+        created: &mut bool,
+        cleanup_session: bool,
+    ) -> Result<i32> {
+        let argv = ExactCommand::from_spec(&window.spec).into_argv();
+        let fallback = window.fallback.as_ref().map(ExactCommand::from_spec);
+        let launch = ChildLaunch::create(&environment.shell, CommandMode::Argv, &argv, fallback.as_ref())?;
+        let mut command = if *created {
+            vec![os("new-window"), os("-d"), os("-t"), exact_session_target(&request.session), os("-n"), os(&window.name)]
+        } else {
+            vec![os("new-session"), os("-d"), os("-s"), request.session.clone(), os("-n"), os(&window.name)]
+        };
+        command.extend([
+            os("-c"), window.spec.cwd.as_ref().unwrap_or(&request.cwd).as_os_str().to_owned(),
+            os("-e"), os("TERM=tmux-256color"), os("-e"), os("COLORTERM=truecolor"),
+            environment.executable.as_os_str().to_owned(), os("__tmux-child"),
+            os("--payload"), launch.payload.as_os_str().to_owned(),
+            os("--ready"), launch.ready.as_os_str().to_owned(),
+        ]);
+        let status = tmux_status(request, executor, command)?;
+        if status != 0 {
+            return Ok(status);
+        }
+        *created = true;
+        let mut target = exact_session_target(&request.session);
+        target.push(":");
+        target.push(&window.name);
+        target.push(".0");
+        match wait_for_startup(request, executor, &request.session, &target, &launch.ready, environment.startup_timeout, cleanup_session, &argv)? {
+            StartupResult::Ready => Ok(0),
+            StartupResult::Failed(status) => Ok(status),
+        }
     }
 
     fn run_with<E: Executor>(
@@ -694,6 +748,8 @@ mod platform {
                 &target,
                 &launch.ready,
                 environment.startup_timeout,
+                true,
+                &request.command,
             )? {
                 StartupResult::Ready => {}
                 StartupResult::Failed(status) => return Ok(status),
@@ -864,6 +920,8 @@ mod platform {
         target: &OsStr,
         ready: &Path,
         timeout: Duration,
+        cleanup_session: bool,
+        command: &[OsString],
     ) -> Result<StartupResult> {
         let interval_nanos = STARTUP_POLL_INTERVAL.as_nanos();
         let samples = timeout.as_nanos().div_ceil(interval_nanos).max(1);
@@ -874,10 +932,12 @@ mod platform {
                     return Ok(StartupResult::Ready);
                 }
                 if let Some(status) = parse_early_status(&state) {
-                    kill_session(request, executor, create_session);
+                    if cleanup_session {
+                        kill_session(request, executor, create_session);
+                    }
                     eprintln!(
                         "tmux-run: command exited during startup (status {status}): {}",
-                        display_command(&request.command)
+                        display_command(command)
                     );
                     return Ok(StartupResult::Failed(status));
                 }
@@ -896,20 +956,24 @@ mod platform {
             )?;
             let pane_state = trim_line_end(&pane.stdout);
             if pane.status != 0 || pane_state.is_empty() || pane_state == b"1" {
-                kill_session(request, executor, create_session);
+                if cleanup_session {
+                    kill_session(request, executor, create_session);
+                }
                 eprintln!(
                     "tmux-run: pane exited during startup: {}",
-                    display_command(&request.command)
+                    display_command(command)
                 );
                 return Ok(StartupResult::Failed(1));
             }
             executor.sleep(STARTUP_POLL_INTERVAL);
         }
 
-        kill_session(request, executor, create_session);
+        if cleanup_session {
+            kill_session(request, executor, create_session);
+        }
         eprintln!(
             "tmux-run: command did not become ready: {}",
-            display_command(&request.command)
+            display_command(command)
         );
         Ok(StartupResult::Failed(1))
     }
@@ -1685,6 +1749,8 @@ mod platform {
             rename_fail_status: i32,
             sleeps: usize,
             child_paths: Option<(PathBuf, PathBuf)>,
+            fail_window: Option<OsString>,
+            exit_window: Option<OsString>,
         }
 
         impl Default for Recorder {
@@ -1701,6 +1767,8 @@ mod platform {
                     rename_fail_source: None,
                     rename_fail_status: 1,
                     sleeps: 0,
+                    fail_window: None,
+                    exit_window: None,
                 }
             }
         }
@@ -1772,9 +1840,15 @@ mod platform {
                             stdout: Vec::new(),
                         })
                     }
-                    "new-session" => {
-                        let target = option_after(&command, "-s").unwrap_or_default();
-                        self.sessions.insert(target);
+                    "new-session" | "new-window" => {
+                        let window = option_after(&command, "-n");
+                        if window.is_some() && window == self.fail_window {
+                            return Ok(ExecuteOutput { status: 19, stdout: Vec::new() });
+                        }
+                        if name == "new-session" {
+                            let target = option_after(&command, "-s").unwrap_or_default();
+                            self.sessions.insert(target);
+                        }
                         if let (Some(payload), Some(ready)) = (
                             option_after(&command, "--payload"),
                             option_after(&command, "--ready"),
@@ -1782,7 +1856,9 @@ mod platform {
                             let payload = PathBuf::from(payload);
                             let ready = PathBuf::from(ready);
                             self.child_paths = Some((payload, ready.clone()));
-                            if let Some(state) = &self.startup_state {
+                            if window.is_some() && window == self.exit_window {
+                                fs::write(&ready, b"exit 23")?;
+                            } else if let Some(state) = &self.startup_state {
                                 fs::write(&ready, state)?;
                             }
                         }
@@ -1836,6 +1912,61 @@ mod platform {
             fn sleep(&mut self, _duration: Duration) {
                 self.sleeps += 1;
             }
+        }
+
+        fn batch_windows() -> Vec<NamedWindow> {
+            (1..=3).map(|index| NamedWindow {
+                name: format!("pi-{index}"),
+                spec: crate::launcher::CommandSpec::new("fixture-agent", vec![]),
+                fallback: None,
+            }).collect()
+        }
+
+        #[test]
+        fn batch_uses_unique_session_without_touching_existing_sessions() {
+            let request = request(&["--no-attach", "-s", "fixture-batch", "--", "fixture-agent"]);
+            let mut recorder = Recorder {
+                sessions: HashSet::from([os("fixture-batch"), os("fixture-batch-1")]),
+                ..Default::default()
+            };
+            assert_eq!(run_batch_windows_with(request, &batch_windows(), &environment(false), &mut recorder).unwrap(), 0);
+            assert!(recorder.sessions.contains(&os("fixture-batch")));
+            assert!(recorder.sessions.contains(&os("fixture-batch-1")));
+            assert!(recorder.sessions.contains(&os("fixture-batch-2")));
+            let commands: Vec<_> = recorder.tmux_records().collect();
+            assert!(!commands.iter().any(|args| args[0] == "kill-session" || args[0] == "rename-session"));
+            assert_eq!(commands.iter().filter(|args| args[0] == "new-window").count(), 2);
+        }
+
+        #[test]
+        fn batch_preserves_prior_windows_and_attempts_after_window_failure() {
+            for startup_exit in [false, true] {
+                let request = request(&["--no-attach", "-s", "fixture-batch", "--", "fixture-agent"]);
+                let mut recorder = Recorder::default();
+                if startup_exit {
+                    recorder.exit_window = Some(os("pi-2"));
+                } else {
+                    recorder.fail_window = Some(os("pi-2"));
+                }
+                assert_eq!(run_batch_windows_with(request, &batch_windows(), &environment(false), &mut recorder).unwrap(), 1);
+                assert!(recorder.sessions.contains(&os("fixture-batch")));
+                let names: Vec<_> = recorder.tmux_records()
+                    .filter(|args| args[0] == "new-session" || args[0] == "new-window")
+                    .map(|args| option_after(args, "-n").unwrap()).collect();
+                assert_eq!(names, strings(&["pi-1", "pi-2", "pi-3"]));
+                assert!(!recorder.tmux_records().any(|args| args[0] == "kill-session"));
+            }
+        }
+
+        #[test]
+        fn batch_first_failure_still_attempts_remaining_agents_once() {
+            let request = request(&["--no-attach", "-s", "fixture-batch", "--", "fixture-agent"]);
+            let mut recorder = Recorder { fail_window: Some(os("pi-1")), ..Default::default() };
+            assert_eq!(run_batch_windows_with(request, &batch_windows(), &environment(false), &mut recorder).unwrap(), 1);
+            let names: Vec<_> = recorder.tmux_records()
+                .filter(|args| args[0] == "new-session" || args[0] == "new-window")
+                .map(|args| option_after(args, "-n").unwrap()).collect();
+            assert_eq!(names, strings(&["pi-1", "pi-2", "pi-3"]));
         }
 
         fn option_after(command: &[OsString], option: &str) -> Option<OsString> {
@@ -3020,9 +3151,18 @@ mod platform {
     pub struct NamedWindow {
         pub name: String,
         pub spec: crate::launcher::CommandSpec,
+        pub fallback: Option<crate::launcher::CommandSpec>,
     }
 
     pub fn run_named_windows(
+        _session: &str,
+        _windows: &[NamedWindow],
+        _attach: bool,
+    ) -> Result<i32> {
+        unsupported()
+    }
+
+    pub fn run_batch_windows(
         _session: &str,
         _windows: &[NamedWindow],
         _attach: bool,
@@ -3051,5 +3191,5 @@ mod platform {
 
 pub use platform::{
     CommandMode, NamedWindow, Request, attach_session, run, run_argv, run_child, run_exact,
-    run_exact_fallback, run_named_windows,
+    run_batch_windows, run_exact_fallback, run_named_windows,
 };

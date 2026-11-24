@@ -625,6 +625,7 @@ fn tmux_windows(
         return Ok(vec![crate::tmux::NamedWindow {
             name: session_name(destination),
             spec,
+            fallback: None,
         }]);
     }
     Ok(launches
@@ -635,6 +636,7 @@ fn tmux_windows(
             crate::tmux::NamedWindow {
                 name: role.window.clone(),
                 spec,
+                fallback: None,
             }
         })
         .collect())
@@ -693,7 +695,7 @@ fn unique_window_name(
     name
 }
 
-fn launch_argv(tool: Option<LauncherKind>) -> Vec<OsString> {
+pub(crate) fn launch_argv(tool: Option<LauncherKind>) -> Vec<OsString> {
     match tool {
         None => vec![OsString::from("fish"), OsString::from("-li")],
         Some(LauncherKind::Pi) => vec![OsString::from("pi")],

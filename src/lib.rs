@@ -19,6 +19,8 @@ pub mod sessions;
 #[cfg(feature = "cli")]
 pub(crate) mod cli;
 #[cfg(feature = "cli")]
+pub(crate) mod launch;
+#[cfg(feature = "cli")]
 pub(crate) mod launcher;
 #[cfg(feature = "cli")]
 pub(crate) mod live;

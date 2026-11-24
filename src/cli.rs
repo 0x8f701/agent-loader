@@ -75,6 +75,8 @@ pub enum Command {
     Agyo(RawTail),
     /// Create or update a git project, optionally make a worktree, then open it.
     New(NewProjectArgs),
+    /// Launch one or more coding agents, optionally inside a new tmux session.
+    Launch(LaunchArgs),
     /// List live tmux coding-agent panes, not saved sessions.
     #[command(about = "List live tmux coding-agent panes, not saved sessions")]
     List(LiveListArgs),
@@ -377,6 +379,30 @@ pub struct NewProjectArgs {
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
+pub struct LaunchArgs {
+    /// Coding agents to launch (`omlo`, `pilo`, `agyo`, ...). Repeatable; more than
+    /// one tool requires `--tmux`.
+    #[arg(required = true, value_name = "TOOL", value_parser = crate::new::parse_launcher_tool)]
+    pub tools: Vec<crate::launcher::LauncherKind>,
+    /// Wrap the launch in tmux (Unix only; required with more than one TOOL).
+    #[arg(long)]
+    pub tmux: bool,
+    /// Continue each tool's previous session instead of starting fresh (the default).
+    /// Rejects duplicate tools; repeats are only allowed for fresh launches.
+    #[arg(long = "continue")]
+    pub continue_session: bool,
+    /// Run the agents on a remote host.
+    #[arg(long, value_name = "HOST", value_parser = nonempty_host)]
+    pub host: Option<String>,
+    /// Give each agent its own git worktree (requires git).
+    #[arg(long)]
+    pub worktree: bool,
+    /// Create the tmux session without attaching to it.
+    #[arg(long, requires = "tmux")]
+    pub no_attach: bool,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
 pub struct TmuxChildArgs {
     #[arg(long)]
     pub payload: PathBuf,
@@ -486,6 +512,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             dispatch_launcher(crate::launcher::LauncherKind::Antigravity, args.argv)
         }
         Command::New(args) => dispatch_new(args),
+        Command::Launch(args) => dispatch_launch(args),
         Command::List(args) => dispatch_live_list(args),
         Command::Attach(args) => dispatch_attach(args),
         Command::Watch(args) => dispatch_watch(args, "watch"),
@@ -1037,6 +1064,20 @@ fn dispatch_new(args: NewProjectArgs) -> anyhow::Result<()> {
         tmux: !args.no_tmux && (args.tmux || has_role),
         print_command: args.print_command,
     })
+}
+
+fn dispatch_launch(args: LaunchArgs) -> anyhow::Result<()> {
+    if args.tools.len() > 1 && !args.tmux {
+        anyhow::bail!("al: launching multiple agents requires --tmux");
+    }
+    exit_with(crate::launch::run(crate::launch::LaunchOptions {
+        tools: args.tools,
+        continue_session: args.continue_session,
+        host: args.host,
+        worktree: args.worktree,
+        tmux: args.tmux,
+        no_attach: args.no_attach,
+    })?)
 }
 
 fn dispatch_live_list(args: LiveListArgs) -> anyhow::Result<()> {
@@ -1968,6 +2009,43 @@ mod tests {
         assert_eq!(fleet.orchestrator, Some(LauncherKind::Pi));
         assert_eq!(fleet.executor, Some(LauncherKind::Omp));
         assert_eq!(fleet.reviewer, Some(LauncherKind::Grok));
+    }
+
+    #[test]
+    fn launch_parses_tools_and_flags() {
+        let parsed = Cli::try_parse_from([
+            "al", "launch", "omp", "agyo", "--tmux", "--host", "host-a", "--worktree",
+            "--no-attach",
+        ])
+        .unwrap();
+        let Some(Command::Launch(launch)) = parsed.command else {
+            panic!("expected launch command");
+        };
+        assert_eq!(launch.tools, [LauncherKind::Omp, LauncherKind::Antigravity]);
+        assert!(launch.tmux);
+        assert!(!launch.continue_session);
+        assert_eq!(launch.host.as_deref(), Some("host-a"));
+        assert!(launch.worktree);
+        assert!(launch.no_attach);
+
+        let repeated = Cli::try_parse_from(["al", "launch", "pilo", "pi", "--tmux"]).unwrap();
+        let Some(Command::Launch(repeated)) = repeated.command else {
+            panic!("expected launch command");
+        };
+        assert_eq!(repeated.tools, [LauncherKind::Pi, LauncherKind::Pi]);
+
+        let continued = Cli::try_parse_from(["al", "launch", "colo", "--continue"]).unwrap();
+        let Some(Command::Launch(continued)) = continued.command else {
+            panic!("expected launch command");
+        };
+        assert_eq!(continued.tools, [LauncherKind::Codex]);
+        assert!(continued.continue_session);
+        assert!(!continued.tmux);
+
+        assert!(Cli::try_parse_from(["al", "launch"]).is_err());
+        assert!(Cli::try_parse_from(["al", "launch", "not-a-tool"]).is_err());
+        assert!(Cli::try_parse_from(["al", "launch", "omp", "--no-attach"]).is_err());
+        assert!(Cli::try_parse_from(["al", "launch", "omp", "--host", " "]).is_err());
     }
 
     #[cfg(unix)]

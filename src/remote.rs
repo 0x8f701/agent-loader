@@ -157,7 +157,7 @@ pub fn shell_argv(host: &str, words: &[&str], tty: bool) -> Vec<String> {
     shell_argv_with(preferred_for(host), host, words, tty)
 }
 
-fn shell_argv_with(tool: RemoteTool, host: &str, words: &[&str], tty: bool) -> Vec<String> {
+pub(crate) fn shell_argv_with(tool: RemoteTool, host: &str, words: &[&str], tty: bool) -> Vec<String> {
     match tool {
         RemoteTool::Mosh => argv_with(tool, host, words, tty),
         RemoteTool::Ssh => {
