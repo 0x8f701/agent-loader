@@ -291,9 +291,14 @@ pub fn native_resume(
                 os(session_id),
             ],
         ),
-        TargetTool::Antigravity => {
-            command("agy", [os("--conversation"), os(session_id)])
-        }
+        TargetTool::Antigravity => command(
+            "agy",
+            [
+                os("--dangerously-skip-permissions"),
+                os("--conversation"),
+                os(session_id),
+            ],
+        ),
         TargetTool::OpenCode => {
             let mut spec =
                 command("opencode", [os("--session"), os(session_id)]);
@@ -328,9 +333,14 @@ pub fn native_fork(
             [os("--fork-session"), os("--resume"), os(session_id)],
         ),
         TargetTool::Agent => unreachable!("Agent fork is rejected before launcher dispatch"),
-        TargetTool::Antigravity => {
-            command("agy", [os("--conversation"), os(session_id)])
-        }
+        TargetTool::Antigravity => command(
+            "agy",
+            [
+                os("--dangerously-skip-permissions"),
+                os("--conversation"),
+                os(session_id),
+            ],
+        ),
         TargetTool::OpenCode => {
             let mut spec = command(
                 "opencode",
@@ -1106,19 +1116,44 @@ fn build_agent(args: &[OsString]) -> Result<LaunchPlan> {
 
 /// Build the raw, native argv for Antigravity's `agy` CLI.
 ///
+/// Interactive launches prepend `--dangerously-skip-permissions` (the same
+/// base flag `al new` uses) unless the user supplied it before any `--`.
 /// With no tool args the launcher runs `agy --continue` to resume the last
 /// conversation directly. A `--session ID` selector (normalized by
 /// `parse_common` from `--session ID` or `--session=ID`) maps to
-/// `--conversation ID`; everything else — native options and subcommands —
-/// is forwarded verbatim. `agy` is resolved through `PATH` at execution time.
+/// `--conversation ID`; native options follow the base flag, while a
+/// non-option first argument is a maintenance subcommand forwarded verbatim
+/// without it. `agy` is resolved through `PATH` at execution time.
 ///
 /// `agy` has no native fork flag, so `--fork` (optionally selecting a
 /// conversation ID, or the conversation cached for the current workspace)
 /// and `--session ID --fork` clone the native conversation by re-emitting a
 /// fresh carrier with a new conversation ID, then resume that ID.
 fn build_antigravity(args: &[OsString], home: &Path, cwd: &Path) -> Result<LaunchPlan> {
+    // Base auto-approve flag for interactive launches, matching `al new`'s
+    // fresh argv. An explicit `--dangerously-skip-permissions` (or the Go
+    // `--flag=value` opt-out such as `=false`) in the user's option args is
+    // respected, never duplicated. A literal `--` ends the option region, so
+    // tail payload occurrences do not count as the user providing the flag.
+    const SKIP_PERMISSIONS: &str = "--dangerously-skip-permissions";
+    let flag = os(SKIP_PERMISSIONS);
+    let option_end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let provided = args[..option_end].iter().any(|arg| {
+        arg == &flag
+            || arg
+                .to_str()
+                .is_some_and(|arg| arg.starts_with("--dangerously-skip-permissions="))
+    });
+    let mut base = Vec::with_capacity(3);
+    if !provided {
+        base.push(flag);
+    }
     let command = if args.is_empty() {
-        command("agy", [os("--continue")])
+        base.push(os("--continue"));
+        command("agy", base)
     } else if args[0] == "--session" {
         let id = required_selector(LauncherKind::Antigravity, args, "--session")?;
         let remaining = &args[2..];
@@ -1127,19 +1162,22 @@ fn build_antigravity(args: &[OsString], home: &Path, cwd: &Path) -> Result<Launc
             .is_some_and(|arg| arg == "--fork" || arg == "fork")
         {
             let new_id = fork_antigravity(home, Some(id.as_os_str()), cwd)?;
-            command_with_tail(
-                "agy",
-                [os("--conversation"), os(&new_id)],
-                &remaining[1..],
-            )
+            base.extend([os("--conversation"), os(&new_id)]);
+            command_with_tail("agy", base, &remaining[1..])
         } else {
-            command_with_tail("agy", [os("--conversation"), id.clone()], remaining)
+            base.extend([os("--conversation"), id.clone()]);
+            command_with_tail("agy", base, remaining)
         }
     } else if args[0] == "--fork" || args[0] == "fork" {
         let (selector, tail) = optional_selector(args, 1);
         let new_id = fork_antigravity(home, selector.map(OsString::as_os_str), cwd)?;
-        command_with_tail("agy", [os("--conversation"), os(&new_id)], tail)
+        base.extend([os("--conversation"), os(&new_id)]);
+        command_with_tail("agy", base, tail)
+    } else if starts_with_hyphen(&args[0]) {
+        command_with_tail("agy", base, args)
     } else {
+        // Non-option first argument: a maintenance subcommand (`models`,
+        // `mcp`, `update`, ...). Forward verbatim without the base flag.
         command("agy", args.iter().cloned())
     };
     Ok(LaunchPlan::Command(command))
@@ -1949,7 +1987,10 @@ mod tests {
         );
         assert_eq!(
             native_resume(TargetTool::Antigravity, path, "conv-id", home),
-            command("agy", strings(&["--conversation", "conv-id"]))
+            command(
+                "agy",
+                strings(&["--dangerously-skip-permissions", "--conversation", "conv-id"])
+            )
         );
         let resume = native_resume(TargetTool::OpenCode, path, "ses_1", home);
         assert_eq!(resume.program, "opencode");
@@ -1983,7 +2024,10 @@ mod tests {
         );
         assert_eq!(
             native_fork(TargetTool::Antigravity, path, "conv-id", home),
-            command("agy", strings(&["--conversation", "conv-id"]))
+            command(
+                "agy",
+                strings(&["--dangerously-skip-permissions", "--conversation", "conv-id"])
+            )
         );
         let fork = native_fork(TargetTool::OpenCode, path, "ses_1", home);
         assert_eq!(fork.program, "opencode");
@@ -2532,7 +2576,10 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(command.program, "agy");
-        assert_eq!(command.args, strings(&["--continue"]));
+        assert_eq!(
+            command.args,
+            strings(&["--dangerously-skip-permissions", "--continue"])
+        );
     }
 
     #[test]
@@ -2554,7 +2601,10 @@ mod tests {
         };
         assert_eq!(session, "agyo-project");
         assert_eq!(command.program, "agy");
-        assert_eq!(command.args, strings(&["--continue"]));
+        assert_eq!(
+            command.args,
+            strings(&["--dangerously-skip-permissions", "--continue"])
+        );
         assert!(fallback.is_none());
     }
 
@@ -2571,7 +2621,12 @@ mod tests {
             assert_eq!(command.program, "agy");
             assert_eq!(
                 command.args,
-                strings(&["--conversation", "conv-1", "fix it"]),
+                strings(&[
+                    "--dangerously-skip-permissions",
+                    "--conversation",
+                    "conv-1",
+                    "fix it"
+                ]),
             );
         }
     }
@@ -2595,13 +2650,28 @@ mod tests {
     }
 
     #[test]
-    fn agyo_native_args_and_subcommands_forward_verbatim() {
+    fn agyo_native_options_forward_after_base_flag() {
         for args in [
             strings(&["--conversation", "conv-9"]),
             strings(&["--model", "gemini-3-pro", "prompt"]),
-            strings(&["models"]),
-            strings(&["mcp", "list"]),
             strings(&["--help"]),
+        ] {
+            let command = assert_command(
+                build_launcher(LauncherKind::Antigravity, &args, &test_home(), Path::new("/tmp"))
+                    .unwrap(),
+            );
+            assert_eq!(command.program, "agy");
+            let mut expected = vec![os("--dangerously-skip-permissions")];
+            expected.extend(args);
+            assert_eq!(command.args, expected, "base flag prefix for {expected:?}");
+        }
+    }
+
+    #[test]
+    fn agyo_user_flag_and_opt_out_are_not_duplicated() {
+        for args in [
+            strings(&["--dangerously-skip-permissions", "--conversation", "conv-9"]),
+            strings(&["--dangerously-skip-permissions=false"]),
         ] {
             let command = assert_command(
                 build_launcher(LauncherKind::Antigravity, &args, &test_home(), Path::new("/tmp"))
@@ -2612,6 +2682,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn agyo_maintenance_subcommands_forward_verbatim_without_flag() {
+        for args in [
+            strings(&["models"]),
+            strings(&["mcp", "list"]),
+            strings(&["update"]),
+            strings(&["help"]),
+        ] {
+            let command = assert_command(
+                build_launcher(LauncherKind::Antigravity, &args, &test_home(), Path::new("/tmp"))
+                    .unwrap(),
+            );
+            assert_eq!(command.program, "agy");
+            assert_eq!(command.args, args, "verbatim forwarding for {args:?}");
+        }
+    }
     fn antigravity_fixture(home: &Path, conversation_id: &str, cwd: &Path) {
         let path = home
             .join(".gemini/antigravity-cli/conversations")
@@ -2637,8 +2723,9 @@ mod tests {
 
     fn conversation_id(command: &CommandSpec) -> String {
         assert_eq!(command.program, "agy");
-        assert_eq!(command.args.first().unwrap(), "--conversation");
-        command.args[1].to_str().unwrap().to_owned()
+        assert_eq!(command.args[0], "--dangerously-skip-permissions");
+        assert_eq!(command.args[1], "--conversation");
+        command.args[2].to_str().unwrap().to_owned()
     }
 
     #[test]
@@ -2658,7 +2745,7 @@ mod tests {
                 build_launcher(LauncherKind::Antigravity, &args, home, &cwd).unwrap(),
             );
             assert_eq!(command.program, "agy");
-            assert_eq!(command.args.len(), 2);
+            assert_eq!(command.args.len(), 3);
             let new_id = conversation_id(&command);
             assert_ne!(new_id, source_id);
             assert!(crate::domain::is_canonical_uuid(&new_id));
@@ -2798,7 +2885,14 @@ mod tests {
         );
         assert_eq!(
             command.args,
-            strings(&["--conversation", "conv-2", "--tmux", "--host", "x"]),
+            strings(&[
+                "--dangerously-skip-permissions",
+                "--conversation",
+                "conv-2",
+                "--tmux",
+                "--host",
+                "x"
+            ]),
         );
     }
 

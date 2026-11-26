@@ -1823,6 +1823,10 @@ fn claude_prefix() -> Vec<String> {
 }
 
 #[cfg(unix)]
+fn agy_prefix() -> Vec<String> {
+    vec!["--dangerously-skip-permissions".to_owned()]
+}
+
 fn agent_prefix() -> Vec<String> {
     ["--force", "--trust", "--approve-mcps"]
         .into_iter()
@@ -1839,9 +1843,14 @@ fn expected_launcher_args(alias: &str, mode: &str, home: &Path, token: &str) -> 
     let mut codex = codex_prefix();
     let mut claude = claude_prefix();
     let mut agent = agent_prefix();
+    let mut agy = agy_prefix();
     match (alias, mode) {
         ("omlo", "empty") => vec!["--continue".to_owned()],
-        ("pilo" | "rpilo" | "agyo" | "oclo", "empty") => vec!["--continue".to_owned()],
+        ("pilo" | "rpilo" | "oclo", "empty") => vec!["--continue".to_owned()],
+        ("agyo", "empty") => {
+            agy.push("--continue".to_owned());
+            agy
+        }
         ("grolo", "empty") => Vec::new(),
         ("dolo", "empty") => {
             droid.push("--resume".to_owned());
@@ -1881,7 +1890,10 @@ fn expected_launcher_args(alias: &str, mode: &str, home: &Path, token: &str) -> 
             agent.extend(["--resume".to_owned(), token.to_owned()]);
             agent
         }
-        ("agyo", "session") => vec!["--conversation".to_owned(), token.to_owned()],
+        ("agyo", "session") => {
+            agy.extend(["--conversation".to_owned(), token.to_owned()]);
+            agy
+        }
         ("agyo" | "oclo", "tail") => vec![token.to_owned()],
         ("oclo", "session") => vec!["--session".to_owned(), token.to_owned()],
         _ => panic!("unexpected launcher case {alias} {mode}"),
@@ -2165,7 +2177,7 @@ fn antigravity_sessions_list_search_open_and_fork_use_native_conversations() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        format!("'agy' '--conversation' '{session_id}'")
+        format!("'agy' '--dangerously-skip-permissions' '--conversation' '{session_id}'")
     );
     assert_eq!(fs::read(&source).unwrap(), before, "open mutated source db");
 
@@ -2200,7 +2212,7 @@ fn antigravity_sessions_list_search_open_and_fork_use_native_conversations() {
         .expect("conversation db stem");
     assert_eq!(
         lines.next().map(str::trim_end),
-        Some(format!("'agy' '--conversation' '{new_id}'").as_str()),
+        Some(format!("'agy' '--dangerously-skip-permissions' '--conversation' '{new_id}'").as_str()),
         "fork did not resume the fresh conversation id"
     );
     let parsed = Catalog::new(home.path())

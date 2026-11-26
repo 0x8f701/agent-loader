@@ -36,7 +36,7 @@ The installer verifies every download against the release's `SHA256SUMS` and ins
 Pin a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.12.0
+curl -fsSL https://raw.githubusercontent.com/0x8f701/agent-loader/main/install.sh | bash -s -- --version v0.12.1
 ```
 
 If `al` is not on PATH after installation, open a new terminal or use the full path printed during install.
@@ -313,18 +313,26 @@ Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 ### Artifacts
 
 | Asset | Example |
-| macOS arm64 | `al-0.12.0-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `al-0.12.0-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc 2.31+) | `al-0.12.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc 2.31+) | `al-0.12.0-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `al-0.12.0-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `al-0.12.1-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `al-0.12.1-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 (glibc 2.31+) | `al-0.12.1-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc 2.31+) | `al-0.12.1-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `al-0.12.1-x86_64-pc-windows-msvc.zip` |
 | Checksums | `SHA256SUMS` |
 
-The tag must match `Cargo.toml` version exactly (`v0.12.0` ↔ `0.12.0`) or the build fails.
+The tag must match `Cargo.toml` version exactly (`v0.12.1` ↔ `0.12.1`) or the build fails.
+
+### 0.12.1
+
+Local preparation only. This version is not tagged or published; do not treat these notes as a GitHub Release.
+
+- Interactive Antigravity launches now include `agy --dangerously-skip-permissions`: `al agyo` (bare `--continue`, `--session`, and `--fork` paths, locally and under `--tmux`) and `al launch agyo|antigravity` (fresh and `--continue`). The flag is added once; a user-supplied copy is not duplicated. `al new --executor agyo` already launched `agy --dangerously-skip-permissions` and is unchanged. Native `agy` maintenance subcommands (for example `al agyo models`) still pass through without the flag, and `agy --mode`/`sandbox` settings are untouched.
+- **Security warning:** `--dangerously-skip-permissions` makes `agy` auto-approve all tool permission requests; there are no per-command prompts. Interactive launches now run without Antigravity's approval gate — use them only in workspaces you trust.
+- OpenCode support (catalog source, conversion target, and `al oclo`/`al launch opencode` launcher for the installed 1.19.6 schema) is included in this release; it was committed after 0.12.0 and had not shipped before.
 
 ### 0.12.0
 
-Local preparation only. This version is not tagged or published. `origin/main` was already current; do not treat these notes as a GitHub Release.
+Published as a GitHub Release.
 
 Antigravity (`agy`) is a catalog source, conversion target, and launcher.
 
